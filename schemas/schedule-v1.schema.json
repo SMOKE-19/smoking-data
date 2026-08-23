@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smoking-data.schedule.v1",
+  "title": "Smoking Data Schedule v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["yaml", "schedule", "targets"],
+  "properties": {
+    "yaml": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version"],
+      "properties": {
+        "schema_version": {"const": "smoking-data.schedule.v1"}
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "timezone", "cron"],
+      "properties": {
+        "alias": {"type": "string", "minLength": 1},
+        "enabled": {"type": "boolean", "default": true},
+        "timezone": {"type": "string", "minLength": 1},
+        "cron": {
+          "type": "string",
+          "pattern": "^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+$",
+          "description": "숫자 기반 5-field cron: minute hour day month weekday"
+        }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["alias", "kind", "definition"],
+        "properties": {
+          "alias": {"type": "string", "minLength": 1},
+          "kind": {"type": "string", "enum": ["asset", "chain"]},
+          "definition": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "misfire": {"type": "string", "enum": ["skip", "catch_up_once"], "default": "catch_up_once"},
+        "timeout_minutes": {"type": "integer", "minimum": 1, "default": 180}
+      }
+    }
+  }
+}

@@ -1,0 +1,138 @@
+yaml:
+  schema_version: smoking-data.pipeline.v6
+  asset_code: "0301"
+
+job:
+  name: sample_0301_multi_right_post_ops
+
+output:
+  artifact:
+    type: joined_dataset
+    root_dir: f"{data_root}/{asset_code}/{job_name}"
+    format: parquet
+    compression: zstd
+    write_policy: atomic_replace
+    physical_layout:
+      profile: joined_reuse_v1
+      adaptation_scope: generation_fixed
+      row_group_rows: 1000
+  logging:
+    root_dir: f"{log_root}/{asset_code}"
+
+operations:
+- op: define_dataset
+  alias: left
+  paths:
+    - DATA/0301/left
+  format: parquet
+  union_by_name: true
+  missing_columns: insert_null
+  incompatible_dtypes: error
+# 관리형 upstream이면 위 define_dataset을 주석 처리하고 아래를 활성화한다.
+# - op: define_asset
+#   alias: left
+#   definition: 0201.pipeline_curated_pivot.0201.yaml
+
+- op: define_dataset
+  alias: right_a
+  paths:
+    - DATA/0301/right_a
+  format: parquet
+  union_by_name: true
+  missing_columns: insert_null
+  incompatible_dtypes: error
+# 관리형 upstream이면 위 define_dataset을 주석 처리하고 아래를 활성화한다.
+# - op: define_asset
+#   alias: right_a
+#   definition: 0201.right_a.0201.yaml
+
+- op: define_dataset
+  alias: right_b
+  paths:
+    - DATA/0301/right_b
+  format: parquet
+  union_by_name: true
+  missing_columns: insert_null
+  incompatible_dtypes: error
+# 관리형 upstream이면 위 define_dataset을 주석 처리하고 아래를 활성화한다.
+# - op: define_asset
+#   alias: right_b
+#   definition: 0201.right_b.0201.yaml
+
+- op: materialize
+  alias: materialize_left_parts
+  inputs: {source: left}
+  partition_by: [partition]
+  part_boundary:
+    target_rows: 20000
+    target_key_groups: 500
+    preserve_groups: [partition, join_key]
+  workers: 1
+  max_tasks_per_child: 4
+
+- op: join
+  alias: join_right_a
+  inputs: {left: materialize_left_parts, right: right_a}
+  how: left
+  left_on: [join_key]
+  right_on: [join_key_r]
+  right_partition_column: partition_r
+
+- op: join
+  alias: join_right_b
+  inputs: {left: join_right_a, right: right_b}
+  how: full
+  left_on: [join_key]
+  right_on: [join_key_r]
+  right_partition_column: partition_r
+
+- op: rename_columns
+  alias: rename_joined
+  inputs: {data: join_right_b}
+  mapping:
+    right_value: right_value_a
+
+- op: include_columns
+  alias: select_join_output
+  inputs: {data: rename_joined}
+  columns:
+  - partition
+  - join_key
+  - right_value_a
+  - measure_a
+  - measure_b
+
+- op: unpivot
+  alias: joined_unpivot
+  inputs: {data: select_join_output}
+  id_columns: [partition, join_key, right_value_a]
+  value_columns: [measure_a, measure_b]
+  name_column: metric_name
+  value_column: metric_value
+  coercion: strict
+  preserve_nulls: true
+
+- op: data_assertion
+  alias: validate_join_output
+  inputs: {data: joined_unpivot}
+  rules:
+  - id: partition_required
+    kind: not_null
+    column: partition
+  - id: metric_name_required
+    kind: not_null
+    column: metric_name
+
+- op: save_dataset
+  alias: write_output
+  inputs: {data: validate_join_output}
+  partition_by: [partition]
+
+execution:
+  memory_budget_mb: 4096
+  max_source_files_per_task: 40
+  reset_before_run: false
+  # left/right index와 physical plan은 전체 입력으로 만들고 최종 join task만 제한한다.
+  # 같은 root_dir의 전체 결과를 부분 dataset으로 대체하므로 테스트 전용 경로 사용을 권장한다.
+  # test_run:
+  #   final_task_limit: 1

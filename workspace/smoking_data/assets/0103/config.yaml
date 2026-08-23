@@ -1,0 +1,29 @@
+config:
+  schema_version: smoking-data.asset-config.v3
+  scope: "0103"
+
+paths:
+  asset_data_root: f"{data_root}/{asset_code}"
+  asset_log_root: f"{log_root}/{asset_code}"
+
+execution:
+  target_rows_per_part: 100000
+
+output:
+  artifact:
+    type: source_dataset
+    root_dir: f"{asset_data_root}/{job_name}"
+    format: parquet
+    compression: zstd
+    write_policy: atomic_replace
+    file_name_rule:
+      dataset: "{run_date}_{source_file_flat}_{job_id}.{job_name}_{route_name}"
+      parquet: "data_{source_file_flat}_{part_index:04d}_{transform_revision16}.parquet"
+      relative_path_token:
+        posix_separator_replacement: "_"
+        windows_separator_replacement: "_"
+        collision_hash_length: 8
+    parquet_writer:
+      row_group_size: 100000
+  logging:
+    root_dir: f"{asset_log_root}"

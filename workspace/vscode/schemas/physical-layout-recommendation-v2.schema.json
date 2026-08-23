@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smoking-data.physical-layout-recommendation.v2",
+  "title": "Smoking Data Physical Layout Recommendation",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["yaml", "edge", "upstream", "downstream", "current", "recommendation", "recommendation_id", "canonical_hash"],
+  "properties": {
+    "yaml": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "asset_code"],
+      "properties": {
+        "schema_version": {"const": "smoking-data.physical-layout-recommendation.v2"},
+        "asset_code": {"enum": ["0101", "0201", "0301"]}
+      }
+    },
+    "recommendation_id": {"type": "string", "pattern": "^layout-[0-9a-f]{16}$"},
+    "canonical_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "confidence": {"enum": ["low", "medium", "high"]},
+    "recommendation_source": {"enum": ["candidate_experiment", "telemetry_heuristic", "current_value_retained"]},
+    "current": {"type": "object"},
+    "recommendation": {"type": "object"},
+    "rationale": {"type": "object"},
+    "fixed_constraints": {"type": "object"}
+  }
+}

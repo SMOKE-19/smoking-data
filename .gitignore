@@ -1,0 +1,70 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+*.pyd
+*.dll
+*.dylib
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+wheels/
+target/
+
+# Local repository/editor metadata
+.codex/
+.idea/
+.vscode/
+/docs/
+/tests/
+
+# Local virtual environments
+.venv/
+.venv*/
+venv/
+
+# Runtime data and local configuration
+.tmp/
+.TEMP/
+/data/
+/DATA/
+/output/
+.smoking-data/
+.agent/
+for_agents/
+*.parquet
+*.sbdf
+*.log
+*.zip
+*.tar.gz
+*.whl
+*.download
+*.part
+.smoking-data/adapters.yaml
+
+# Credentials and local environment files
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+credentials
+credentials.*
+config.local.*
+settings.local.*
+
+# Editor/OS noise
+.vscode/
+!examples/.init/.vscode/
+!examples/.init/.vscode/**
+.DS_Store
+Thumbs.db

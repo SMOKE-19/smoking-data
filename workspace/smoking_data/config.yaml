@@ -1,0 +1,35 @@
+config:
+  schema_version: smoking-data.asset-config.v3
+  scope: common
+
+paths:
+  data_root: DATA
+  temp_root: .temp
+  metadata_root: f"{temp_root}/metadata"
+  log_root: f"{temp_root}/logs"
+  schedule_root: schedules
+
+execution:
+  workers: 1
+  max_tasks_per_child: 1
+  target_rows_per_part: 20000
+  target_key_groups_per_part: 500
+  memory_budget_mb: 4096
+  max_source_files_per_task: 40
+  max_source_row_groups_per_task: 512
+  sidecar_target_bytes_mb: 128
+  sidecar_workers: 1
+  sidecar_worker_recycle_mode: adaptive
+  sidecar_max_source_files: 16
+  sidecar_max_projected_bytes_mb: 512
+  optimizer_enabled: true
+  reset_before_run: false
+  range_merge_gap_bytes: 65536
+  max_range_bytes: 8388608
+  max_ranges_per_task: 512
+  minimum_range_savings_ratio: 0.0
+
+contract:
+  partition_grid:
+    anchor_date: "2021-07-26"
+    step_days: 28

@@ -1,0 +1,34 @@
+yaml:
+  schema_version: smoking-data.asset-chain.v2
+
+chain:
+  name: daily_analysis_assets
+
+# inputs는 Asset 실행 의존관계다. 실제 dataset 경로는 각 definition YAML이 소유한다.
+assets:
+- id: source_dataset
+  asset_code: "0101"
+  definition: 0101.source.0101.yaml
+
+- id: curated_dataset
+  asset_code: "0201"
+  definition: 0201.pipeline_curated_pivot.0201.yaml
+  inputs:
+    source: source_dataset
+
+- id: joined_dataset
+  asset_code: "0301"
+  definition: 0301.pipeline_multi_right_join.0301.yaml
+  inputs:
+    left: curated_dataset
+
+- id: analysis_snapshot
+  asset_code: "0401"
+  definition: 0401.pipeline_analysis_snapshot.0401.yaml
+  inputs:
+    source: joined_dataset
+
+execution:
+  failure_policy: stop_downstream
+  unchanged_policy: skip
+  max_parallel_assets: 1

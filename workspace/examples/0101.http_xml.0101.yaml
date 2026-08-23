@@ -1,0 +1,33 @@
+yaml:
+  schema_version: smoking-data.source.v4
+  asset_code: "0101"
+job:
+  name: public_api_xml
+source:
+  table_id: public_api_xml
+  api_request:
+    query_mode: http_xml
+    http:
+      url: https://example.go.kr/openapi/items
+      query:
+        serviceKey: ${DATA_GO_KR_SERVICE_KEY}
+        from: "{date_from}"
+        to: "{date_to}"
+      timeout_sec: 60
+      batch_rows: 10000
+      pagination:
+        strategy: page_number
+        page_parameter: pageNo
+        size_parameter: numOfRows
+        page_size: 1000
+        max_pages: 10000
+      xml:
+        item_path: response.body.items.item
+        total_count_path: response.body.totalCount
+        result_code_path: response.header.resultCode
+        result_message_path: response.header.resultMsg
+        success_codes: ["00"]
+    date_window:
+      step: 1
+      date_window: ['(2025-01-01, 2025-01-01)']
+output: {}

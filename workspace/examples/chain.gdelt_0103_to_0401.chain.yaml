@@ -1,0 +1,24 @@
+yaml:
+  schema_version: smoking-data.asset-chain.v2
+chain:
+  name: gdelt_0103_to_0401
+assets:
+- id: gdelt_source
+  asset_code: "0103"
+  definition: 0103.gdelt_latest_events.0103.yaml
+- id: gdelt_truth
+  asset_code: "0201"
+  definition: 0201.gdelt_event_truth.0201.yaml
+  inputs: {source: gdelt_source}
+- id: gdelt_enriched
+  asset_code: "0301"
+  definition: 0301.gdelt_event_enriched.0301.yaml
+  inputs: {left: gdelt_truth}
+- id: gdelt_snapshot
+  asset_code: "0401"
+  definition: 0401.gdelt_event_snapshot.0401.yaml
+  inputs: {source: gdelt_enriched}
+execution:
+  failure_policy: stop_downstream
+  unchanged_policy: skip
+  max_parallel_assets: 1

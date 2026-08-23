@@ -1,0 +1,37 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Smoking Data: 현재 Definition 검증",
+      "type": "shell",
+      "command": "${workspaceFolder}/../../.venv/bin/python",
+      "args": ["-m", "smoking_data.cli", "validate", "${file}", "--project-root", "${workspaceFolder}/../..", "--json"],
+      "options": {"cwd": "${workspaceFolder}/../.."},
+      "problemMatcher": []
+    },
+    {
+      "label": "Smoking Data: 현재 Definition 실행",
+      "type": "shell",
+      "command": "${workspaceFolder}/../../.venv/bin/python",
+      "args": ["-m", "smoking_data.cli", "run", "${file}", "--project-root", "${workspaceFolder}/../..", "--json"],
+      "options": {"cwd": "${workspaceFolder}/../.."},
+      "problemMatcher": []
+    },
+    {
+      "label": "Smoking Data: 현재 Schedule 폴더 검증",
+      "type": "shell",
+      "command": "${workspaceFolder}/../../.venv/bin/python",
+      "args": ["-m", "smoking_data.cli", "schedule", "validate", "${fileDirname}", "--project-root", "${workspaceFolder}/../..", "--json"],
+      "options": {"cwd": "${workspaceFolder}/../.."},
+      "problemMatcher": []
+    },
+    {
+      "label": "Smoking Data: Schedule Tick",
+      "type": "shell",
+      "command": "${workspaceFolder}/../../.venv/bin/python",
+      "args": ["-m", "smoking_data.cli", "schedule", "tick", "${fileDirname}", "--project-root", "${workspaceFolder}/../..", "--json"],
+      "options": {"cwd": "${workspaceFolder}/../.."},
+      "problemMatcher": []
+    }
+  ]
+}

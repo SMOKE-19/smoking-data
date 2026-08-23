@@ -1,0 +1,91 @@
+yaml:
+  schema_version: smoking-data.source.v4
+  asset_code: "0101"
+
+job:
+  name: source_0101_passthrough_structured
+
+source:
+  table_id: basic_source
+  api_request:
+    query_mode: structured
+    payload:
+      select:
+      - name: text_1
+      - name: text_2
+      - name: int_1_alias
+        expr: int_1
+      - name: text_3
+      - name: event_date
+        expr: CAST(timestamp_1 AS DATE)
+      filters:
+        common:
+        - text_2 IS NOT NULL
+        sub_job:
+        - sub_job_name: text_1_a
+          sub_job_filtering:
+          - text_1 LIKE 'A%'
+        - sub_job_name: text_1_b
+          sub_job_filtering:
+          - text_1 LIKE 'B%'
+    date_window:
+      column: CAST(timestamp_1 AS DATE)
+      step: 1
+      date_window:
+      - '(2025-01-01, 2025-01-01)'
+      - '(2025-01-02, 2025-01-02)'
+execution:
+  reset_before_run: false
+  write_source_profile_json: false
+  retryable_error_substrings: []
+  data_api_print_capture:
+    rules:
+      enabled: false
+      fields:
+      - field: api_print_full_text
+        enabled: true
+        capture: full_text
+      - field: api_execution_time_sec
+        enabled: true
+        capture: regex
+        regex: '(?im)>>time:\\s*(?:(\\d+)\\s*min\\s+)?([0-9]+(?:\\.[0-9]+)?)s'
+      - field: api_rows
+        enabled: true
+        capture: regex
+        regex: '(?im)(?:rows:\\s*|the\\s+total\\s+number\\s+of\\s+rows\\s+in\\s+exported\\s+output:\\s*)([0-9]+)'
+      - field: api_dataset_parts
+        enabled: true
+        capture: regex
+        regex: '(?im)count\\s+of\\s+output:\\s*([0-9]+)'
+  workers: 1
+  warmup_first_task: false
+  worker_start_delay_sec: 5.0
+  max_retries: 5
+  retry_backoff_sec: 1.0
+  # 테스트 시 전체 window를 계획한 뒤 첫 source task 하나만 실행한다.
+  # 같은 root_dir의 전체 결과를 대체할 수 있으므로 테스트 전용 경로 사용을 권장한다.
+  # test_run:
+  #   final_task_limit: 1
+output:
+  artifact:
+    type: source_dataset
+    root_dir: f"{data_root}/{asset_code}/{table_id}_{job_name}"
+    format: parquet
+    write_policy: atomic_replace
+    file_name_rule:
+      raw_dataset: "<job_name>_<sub_job_suffix>__<date_from>-<date_to>"
+    parquet_writer:
+      index: false
+      engine: pyarrow
+      compression: zstd
+      row_group_size: 1000
+      write_page_index: true
+      write_statistics: true
+      data_page_size: 1048576
+      max_rows_per_page: 1000
+      # 카디널리티가 낮은 칼럼만 선택하려면 예: [text_1, text_2]
+      use_dictionary: false
+  logging:
+    root_dir: f"{log_root}/{asset_code}/{table_id}"
+    file_name_rule:
+      logging: f"{job_name}.jsonl"

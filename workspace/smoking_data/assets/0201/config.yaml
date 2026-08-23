@@ -1,0 +1,21 @@
+config:
+  schema_version: smoking-data.asset-config.v3
+  scope: "0201"
+
+paths:
+  asset_data_root: f"{data_root}/{asset_code}"
+  asset_log_root: f"{log_root}/{asset_code}"
+
+output:
+  artifact:
+    type: curated_dataset
+    root_dir: f"{asset_data_root}/{job_name}"
+    format: parquet
+    compression: zstd
+    write_policy: atomic_replace
+    physical_layout:
+      profile: curated_reuse_v1
+      adaptation_scope: generation_fixed
+      row_group_rows: auto
+  logging:
+    root_dir: f"{asset_log_root}"

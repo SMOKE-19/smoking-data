@@ -1,0 +1,40 @@
+[package]
+name = "smoking_data_engine_rs"
+version = "2.1.0"
+edition = "2021"
+
+[lib]
+name = "smoking_data_engine_rs"
+crate-type = ["cdylib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+polars-join-experiment = ["dep:polars-arrow", "dep:polars-core", "dep:polars-ops"]
+
+[dependencies]
+pyo3 = { version = "0.27.1" }
+parquet = { version = "56.2.0", features = ["object_store", "async"] }
+arrow-array = { version = "56.2.0", features = ["ffi"] }
+arrow-buffer = "56.2.0"
+arrow-arith = "56.2.0"
+arrow-cast = "56.2.0"
+arrow-ipc = "56.2.0"
+arrow-select = "56.2.0"
+arrow-ord = "56.2.0"
+arrow-row = "56.2.0"
+arrow-schema = { version = "56.2.0", features = ["ffi"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.11"
+chrono = "0.4"
+base64 = "0.22"
+libc = "0.2"
+bytes = "1"
+polars-arrow = { version = "0.55.2", default-features = false, optional = true }
+polars-core = { version = "0.55.2", default-features = false, features = ["algorithm_group_by", "dtype-date", "dtype-datetime", "dtype-duration", "dtype-time"], optional = true }
+polars-ops = { version = "0.55.2", default-features = false, features = ["cross_join"], optional = true }
+object_store = { version = "0.12.4", features = ["aws"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"

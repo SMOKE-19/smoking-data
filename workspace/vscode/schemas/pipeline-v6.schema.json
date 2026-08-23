@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smoking-data.pipeline.v6",
+  "title": "Smoking Data Operation DAG Pipeline v6",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["yaml", "job", "operations", "output"],
+  "properties": {
+    "yaml": {
+      "type": "object",
+      "description": "YAML Definition 식별 정보",
+      "additionalProperties": false,
+      "required": ["schema_version", "asset_code"],
+      "properties": {
+        "schema_version": {"const": "smoking-data.pipeline.v6"},
+        "asset_code": {"type": "string", "enum": ["0301", "0401"]}
+      }
+    },
+    "job": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}}},
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/operation"}
+    },
+    "output": {"$ref": "#/$defs/output"},
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workers": {"type": "integer", "minimum": 1},
+        "max_tasks_per_child": {"type": ["integer", "null"], "minimum": 1},
+        "memory_budget_mb": {"type": "integer", "minimum": 1},
+        "target_rows_per_part": {"type": "integer", "minimum": 1},
+        "target_key_groups_per_part": {"type": "integer", "minimum": 1},
+        "max_source_files_per_task": {"type": "integer", "minimum": 1},
+        "max_source_row_groups_per_task": {"type": "integer", "minimum": 1},
+        "reset_before_run": {"type": "boolean"},
+        "test_run": {"$ref": "#/$defs/testRun"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"yaml": {"properties": {"asset_code": {"const": "0301"}}}}},
+      "then": {"properties": {"output": {"properties": {"artifact": {"properties": {"type": {"const": "joined_dataset"}, "physical_layout": {"properties": {"adaptation_scope": {"const": "generation_fixed"}}}}}}}}}
+    },
+    {
+      "if": {"properties": {"yaml": {"properties": {"asset_code": {"const": "0401"}}}}},
+      "then": {"properties": {"output": {"properties": {"artifact": {"properties": {"type": {"const": "analysis_snapshot"}}}}}, "execution": {"not": {"required": ["test_run"]}}}}
+    }
+  ],
+  "$defs": {
+    "stringArray": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "testRun": {
+      "type": "object",
+      "description": "전역 sidecar와 physical plan은 완성하고 최종 materialize/join task만 제한하는 테스트 모드",
+      "additionalProperties": false,
+      "required": ["final_task_limit"],
+      "properties": {"final_task_limit": {"type": "integer", "minimum": 1, "default": 1}}
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "alias"],
+      "properties": {
+        "op": {"type": "string", "enum": ["define_asset", "define_dataset", "build_sidecar", "active_row_selection", "materialize", "filter", "type_cast", "add_calc", "reference_replace", "list_restore", "include_columns", "exclude_columns", "rename_columns", "data_assertion", "unpivot", "pivot", "join", "save_dataset"]},
+        "alias": {"type": "string", "minLength": 1, "description": "사람이 편집하는 operation 표시명이며 inputs에서 참조한다."},
+        "inputs": {"type": "object", "additionalProperties": {"type": "string"}},
+        "definition": {"type": "string", "minLength": 1},
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "format": {"const": "parquet"},
+        "union_by_name": {"const": true},
+        "missing_columns": {"const": "insert_null"},
+        "incompatible_dtypes": {"const": "error"},
+        "columns": {},
+        "sql": {"type": "string"},
+        "spotfire_expression": {"type": "string"},
+        "expressions": {"type": "array", "items": {"type": "object"}},
+        "method": {"type": "string"},
+        "group_keys": {"type": "array", "items": {"type": "object"}},
+        "sort": {"type": "array", "items": {"type": "object"}},
+        "partition_by": {"$ref": "#/$defs/stringArray"},
+        "part_boundary": {"type": "object"},
+        "workers": {"type": "integer", "minimum": 1},
+        "max_tasks_per_child": {"type": "integer", "minimum": 1},
+        "mapping": {"type": "object"},
+        "regex": {"type": "array"},
+        "case_sensitive": {"type": "boolean"},
+        "unmatched": {"type": "string"},
+        "rules": {"type": "array", "items": {"type": "object"}},
+        "sample_limit": {"type": "integer", "minimum": 1},
+        "id_columns": {"$ref": "#/$defs/stringArray"},
+        "value_columns": {"$ref": "#/$defs/stringArray"},
+        "name_column": {"type": "string"},
+        "value_column": {"type": "string"},
+        "coercion": {"type": "string", "enum": ["strict", "string"]},
+        "preserve_nulls": {"type": "boolean"},
+        "row_keys": {"$ref": "#/$defs/stringArray"},
+        "column_keys": {"$ref": "#/$defs/stringArray"},
+        "value_keys": {"type": "array", "items": {"type": "object"}},
+        "value_keys_without_column": {"type": "array", "items": {"type": "object"}},
+        "null_column_key_policy": {"type": "string", "enum": ["error", "label"]},
+        "column_key_separator": {"type": "string"},
+        "first_duplicate_policy": {"type": "string", "enum": ["error", "allow"]},
+        "how": {"type": "string", "enum": ["inner", "left", "right", "full", "cross"]},
+        "left_on": {"$ref": "#/$defs/stringArray"},
+        "right_on": {"$ref": "#/$defs/stringArray"},
+        "right_partition_column": {"type": "string"},
+        "suffix": {"type": "string"},
+        "reference_parquet": {"type": "string"},
+        "source_column": {"type": "string"},
+        "reference_input_column": {"type": "string"},
+        "reference_output_column": {"type": "string"},
+        "output_column": {"type": "string"},
+        "missing_policy": {"type": "string"},
+        "duplicate_policy": {"type": "string"},
+        "lookup_path": {"type": "string"},
+        "schema": {"type": "object"},
+        "config": {"type": "object"},
+        "batch_size": {"type": "integer", "minimum": 1},
+        "drop_cache_hint": {"type": "boolean"},
+        "print_timing": {"type": "boolean"},
+        "path": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"op": {"const": "define_asset"}}, "required": ["op"]},
+          "then": {
+            "required": ["definition"],
+            "not": {"anyOf": [{"required": ["paths"]}, {"required": ["format"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"op": {"const": "define_dataset"}}, "required": ["op"]},
+          "then": {
+            "required": ["paths"],
+            "not": {"required": ["definition"]}
+          }
+        },
+        {
+          "if": {"properties": {"op": {"const": "filter"}}, "required": ["op"]},
+          "then": {
+            "oneOf": [
+              {"required": ["sql"], "not": {"required": ["spotfire_expression"]}},
+              {"required": ["spotfire_expression"], "not": {"required": ["sql"]}}
+            ]
+          }
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Asset 게시 및 로그 경로 계약. 성공 metadata는 artifact/_smoking_data에 저장된다.",
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {"type": "string", "enum": ["curated_dataset", "joined_dataset", "analysis_snapshot"]},
+            "root_dir": {"type": "string", "minLength": 1},
+            "format": {"const": "parquet"},
+            "compression": {"type": "string", "enum": ["snappy", "zstd", "uncompressed"], "default": "zstd"},
+            "write_policy": {"type": "string", "enum": ["atomic_replace", "error_if_exists"]},
+            "physical_layout": {"$ref": "#/$defs/physicalLayout"},
+            "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
+          }
+        },
+        "logging": {"$ref": "#/$defs/outputAuxiliary"}
+      }
+    },
+    "outputAuxiliary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"root_dir": {"type": "string", "minLength": 1}}
+    },
+    "physicalLayout": {
+      "type": "object",
+      "description": "게시 Parquet의 재사용 프로필과 row-group 결정 범위",
+      "additionalProperties": false,
+      "required": ["profile", "adaptation_scope", "row_group_rows"],
+      "properties": {
+        "profile": {"type": "string", "minLength": 1},
+        "adaptation_scope": {"type": "string", "enum": ["generation_fixed", "task_adaptive"]},
+        "row_group_rows": {
+          "description": "auto이면 planner가 결정하고, 정수이면 해당 행 수를 명시적으로 고정한다.",
+          "oneOf": [{"const": "auto"}, {"type": "integer", "minimum": 1}]
+        }
+      }
+    }
+  }
+}

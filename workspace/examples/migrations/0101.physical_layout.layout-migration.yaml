@@ -1,0 +1,27 @@
+yaml:
+  schema_version: smoking-data.layout-migration.v1
+  asset_code: "0101"
+
+job:
+  name: migrate_source_physical_layout
+
+define_upstream:
+- op: define_dataset
+  alias: source
+  path: DATA/0101/<table_id>_<job_name>
+
+migrate_layout:
+  op: rewrite_parquet_layout
+  source: source
+  recommendation: .smoking-data/reports/physical-layout/<report>.layout-recommendation.yaml
+
+execution:
+  # 최초 검토 후 in_place로 변경합니다.
+  mode: dry_run
+  # part 파일을 병렬 재작성하는 subprocess 수입니다.
+  workers: 2
+  # parent reserve + workers * 파일별 예상 peak가 이 예산을 넘으면 실행 전에 차단합니다.
+  memory_budget_mb: 4096
+  batch_size: 4096
+  # 각 child가 이 개수의 파일을 처리한 뒤 교체됩니다.
+  max_files_per_worker: 8

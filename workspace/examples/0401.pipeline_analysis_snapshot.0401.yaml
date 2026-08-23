@@ -1,0 +1,96 @@
+yaml:
+  schema_version: smoking-data.pipeline.v6
+  asset_code: "0401"
+
+job:
+  name: analysis_snapshot_0401
+
+output:
+  artifact:
+    type: analysis_snapshot
+    root_dir: f"{data_root}/{asset_code}/{job_name}"
+    format: parquet
+    compression: zstd
+    write_policy: atomic_replace
+    physical_layout:
+      profile: analysis_snapshot_adaptive_v1
+      adaptation_scope: task_adaptive
+      row_group_rows: 1000
+  logging:
+    root_dir: f"{log_root}/{asset_code}"
+
+operations:
+- op: define_asset
+  alias: joined_metrics
+  definition: 0301.pipeline_multi_right_join.0301.yaml
+# 외부 dataset을 작업 대상으로 지정하려면 위 define_asset 블록을 주석 처리하고 아래를 활성화한다.
+# - op: define_dataset
+#   alias: joined_metrics
+#   paths: [DATA/input/analysis/joined_metrics]
+#   format: parquet
+#   union_by_name: true
+#   missing_columns: insert_null
+#   incompatible_dtypes: error
+
+# 최종 분석 축을 한 part 안에서 완결시킨 뒤 wide snapshot으로 변환한다.
+- op: materialize
+  alias: materialize_snapshot_input
+  inputs: {source: joined_metrics}
+  partition_by: [partition]
+  part_boundary:
+    target_rows: 20000
+    preserve_groups: [partition, join_key, right_value_a]
+  workers: 1
+  max_tasks_per_child: 1
+
+- op: include_columns
+  alias: select_snapshot_columns
+  inputs: {data: materialize_snapshot_input}
+  columns:
+  - partition
+  - join_key
+  - right_value_a
+  - metric_name
+  - metric_value
+  - latest_updated_at.max
+
+- op: pivot
+  alias: pivot_analysis_metrics
+  inputs: {data: select_snapshot_columns}
+  row_keys: [partition, join_key, right_value_a]
+  column_keys: [metric_name]
+  value_keys:
+  - name: value
+    source_column: metric_value
+    aggregation: first
+    column_name_rule: <column_key_value>__<value_key_name>
+  value_keys_without_column:
+  - name: latest_updated_at
+    source_column: latest_updated_at.max
+    aggregation: max
+    column_name_rule: <value_key_name>.<agg>
+  first_duplicate_policy: error
+  null_column_key_policy: error
+  column_key_separator: __
+
+# 게시 전에 분석 행의 필수 키와 최종 grain을 검증한다.
+- op: data_assertion
+  alias: validate_snapshot
+  inputs: {data: pivot_analysis_metrics}
+  rules:
+  - id: snapshot_key_required
+    kind: not_null
+    columns: [partition, join_key, latest_updated_at.max]
+  - id: snapshot_grain_unique
+    kind: unique
+    columns: [partition, join_key, right_value_a]
+
+- op: save_dataset
+  alias: write_analysis_snapshot
+  inputs: {data: validate_snapshot}
+  partition_by: [partition]
+
+execution:
+  memory_budget_mb: 4096
+  max_source_files_per_task: 40
+  reset_before_run: false

@@ -1,0 +1,2 @@
+Column Name,Spotfire Expression
+adjusted_value,CASE WHEN [measured_value] > 10 THEN [measured_value] * 2 ELSE 0 END

@@ -1,0 +1,101 @@
+yaml:
+  schema_version: smoking-data.pipeline.v6
+  asset_code: "0301"
+
+job:
+  name: parity_multi_right_full
+
+output:
+  artifact:
+    type: joined_dataset
+    root_dir: DATA/parity/join/output
+    format: parquet
+    compression: zstd
+    write_policy: atomic_replace
+    physical_layout:
+      profile: joined_reuse_v1
+      adaptation_scope: generation_fixed
+      row_group_rows: auto
+  logging:
+    root_dir: f"{log_root}/{asset_code}"
+
+operations:
+- op: define_dataset
+  alias: main
+  paths: [DATA/parity/join/left]
+  format: parquet
+  union_by_name: true
+# 관리형 upstream이면 위 define_dataset을 주석 처리하고 아래를 활성화한다.
+# - op: define_asset
+#   alias: main
+#   definition: 0201.pipeline_curated_pivot.0201.yaml
+
+- op: define_dataset
+  alias: profile
+  paths: [DATA/parity/join/right_profile]
+  format: parquet
+  union_by_name: true
+# 관리형 upstream이면 위 define_dataset을 주석 처리하고 아래를 활성화한다.
+# - op: define_asset
+#   alias: profile
+#   definition: 0201.profile.0201.yaml
+
+- op: define_dataset
+  alias: category
+  paths: [DATA/parity/join/right_category]
+  format: parquet
+  union_by_name: true
+# 관리형 upstream이면 위 define_dataset을 주석 처리하고 아래를 활성화한다.
+# - op: define_asset
+#   alias: category
+#   definition: 0201.category.0201.yaml
+
+- op: materialize
+  alias: materialize_left_parts
+  inputs: {source: main}
+  partition_by: [partition]
+  part_boundary:
+    target_rows: 20000
+    target_key_groups: 2
+    preserve_groups: [partition, join_key]
+  workers: 1
+  max_tasks_per_child: 4
+
+- op: join
+  alias: join_profile
+  inputs: {left: materialize_left_parts, right: profile}
+  how: full
+  left_on: [join_key]
+  right_on: [right_key]
+  right_partition_column: right_partition
+  suffix: _profile
+  columns:
+    include: [right_partition, right_key, profile_code, amount]
+    exclude: [unused]
+    regex: []
+
+- op: join
+  alias: join_category
+  inputs: {left: join_profile, right: category}
+  how: left
+  left_on: [profile_code]
+  right_on: [code_key]
+  right_partition_column: right_partition
+  suffix: _category
+  columns:
+    include: [code_key, label]
+    exclude: [debug]
+    regex: []
+
+- op: save_dataset
+  alias: write_joined
+  inputs: {data: join_category}
+  partition_by: [partition]
+
+execution:
+  memory_budget_mb: 4096
+  reset_before_run: true
+  # left/right index와 physical plan은 전체 입력으로 만들고 최종 join task만 제한한다.
+  # 같은 root_dir의 전체 결과를 부분 dataset으로 대체하므로 테스트 전용 경로 사용을 권장한다.
+  # test_run:
+  #   final_task_limit: 1

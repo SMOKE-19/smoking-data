@@ -1,0 +1,20 @@
+schema_version: smoking-data.agent-guidance.v1
+managed_by: smoking-data init
+entrypoint: ../../AGENTS.md
+local_context: ../local/CONTEXT.md
+sandbox:
+  scripts: ../../for_agents/scripts
+  output: ../../for_agents/output
+read_only_cli:
+  - smoking-data inspect dataset <path> --project-root . --json
+  - smoking-data inspect failure <path> --project-root . --json
+  - smoking-data inspect missing <path> --project-root . --json
+  - smoking-data inspect profile <path> --project-root . --json
+documents:
+  - CLI.md
+  - METADATA_MAP.md
+  - PROFILE_ANALYSIS.md
+  - FAILURE_DIAGNOSIS.md
+  - MISSING_DATA_DIAGNOSIS.md
+  - REPORT_FORMAT.md
+  - SANDBOX.md

@@ -1,0 +1,22 @@
+yaml:
+  schema_version: smoking-data.schedule.v1
+
+schedule:
+  alias: daily_assets
+  enabled: false
+  timezone: Asia/Seoul
+  cron: "0 4 * * *"
+
+# init은 이 템플릿을 생성합니다. 실제 Definition 경로에 맞게 수정한 뒤
+# enabled를 true로 바꾸고 schedule validate를 실행하세요.
+targets:
+  - alias: curated
+    kind: asset
+    definition: ../examples/0201.pipeline_curated_pivot.0201.yaml
+  - alias: daily_chain
+    kind: chain
+    definition: ../examples/chain.0101_to_0401_asset_chain.chain.yaml
+
+policy:
+  misfire: catch_up_once
+  timeout_minutes: 180

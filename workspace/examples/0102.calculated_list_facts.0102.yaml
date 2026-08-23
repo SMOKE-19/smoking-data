@@ -1,0 +1,106 @@
+yaml:
+  schema_version: smoking-data.calculated-fact.v2
+  asset_code: "0102"
+
+job:
+  name: calculated_list_facts
+
+output:
+  artifact:
+    type: calculated_fact_dataset
+    root_dir: f"{data_root}/{asset_code}/{job_name}"
+    format: parquet
+    compression: zstd
+    write_policy: append_generation
+    physical_layout:
+      profile: fact_append_v1
+      adaptation_scope: generation_fixed
+      row_group_rows: auto
+  logging:
+    root_dir: f"{log_root}/{asset_code}/{job_name}"
+
+define_upstream:
+- op: define_asset
+  alias: upstream
+  definition: 0301.pipeline_basic.0301.yaml
+
+build_sidecar:
+  alias: select_calculation_targets
+  source: upstream
+  # receipt/manifest에서 신규·SHA-256 변경 source segment만 고른다.
+  # upstream에서 사라진 segment의 과거 FACT는 삭제하거나 tombstone 처리하지 않는다.
+  # downstream materialize 계산식 의존성을 분석해 identity와 실제 참조 칼럼만 투영한다.
+  operations:
+  - op: incremental_fact_selection
+    alias: select_changed_facts
+    identity_columns: [partition, row_key]
+  execution:
+    workers: 1
+    worker_recycle:
+      max_source_files: 16
+      max_projected_bytes_mb: 512
+
+materialize:
+  alias: materialize_calculated_facts
+  source: upstream
+  coordinates: select_calculation_targets
+  partition_by: [partition]
+  part_boundary:
+    target_rows: 20000
+    preserve_groups: [partition, row_key]
+  workers: 1
+  max_tasks_per_child: 1
+  operations:
+  # List 계산이 없거나 planner가 list-native 실행을 선택할 수 있으면
+  # expand/compact 두 operation은 함께 생략할 수 있다.
+  - op: expand_list_rows
+    alias: expand_measurement_lists
+    columns:
+    - source: measured_values
+      element_alias: measured_value
+
+  - op: add_calc_cols_from_file
+    alias: calculate_from_spotfire
+    expression_file:
+      path: resources/0102/list_expressions.csv
+      column_name_field: Column Name
+      expression_field: Spotfire Expression
+    lookup_files: []
+    column_alias_files: []
+
+  - op: compact_list_rows
+    alias: compact_calculated_lists
+    expansion: expand_measurement_lists
+    columns:
+    - source: adjusted_value
+      output: adjusted_values
+
+  - op: unpivot_0102
+    alias: emit_calculated_facts
+    contract: long_fact_v1
+    # add_calc_cols_from_file이 생성한 계산 결과만 long fact로 내린다.
+    columns: calculated
+
+save_dataset:
+  alias: append_calculated_facts
+  input: materialize_calculated_facts
+  partition_by: [partition]
+  operations: []
+
+execution:
+  memory:
+    hard_limit_mb: 4096
+    safety_ratio: 0.80
+    phases:
+      build_sidecar:
+        target_peak_memory_mb: 1024
+        workers: {min: 1, max: 2}
+      materialize:
+        target_peak_memory_mb: 3072
+        workers: {min: 1, max: 2}
+      save_dataset:
+        target_peak_memory_mb: 512
+        workers: {min: 1, max: 1}
+  max_source_files_per_task: 40
+  # 0102 내부 planner는 output lineage를 위해 실제 coordinate chunk를 source file 1개로 제한한다.
+  reset_before_run: false

@@ -1,0 +1,3 @@
+include Cargo.toml Cargo.lock
+recursive-include native *.toml *.rs
+recursive-include workspace *

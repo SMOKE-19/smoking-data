@@ -1,0 +1,46 @@
+yaml:
+  schema_version: smoking-data.pipeline.v6
+  asset_code: "0401"
+job:
+  name: gdelt_event_snapshot
+output:
+  artifact:
+    type: analysis_snapshot
+    root_dir: f"{data_root}/{asset_code}/{job_name}"
+    format: parquet
+    compression: zstd
+    write_policy: atomic_replace
+    physical_layout: {profile: analysis_snapshot_adaptive_v1, adaptation_scope: task_adaptive, row_group_rows: auto}
+  logging:
+    root_dir: f"{log_root}/{asset_code}"
+operations:
+- op: define_asset
+  alias: enriched_events
+  definition: 0301.gdelt_event_enriched.0301.yaml
+- op: materialize
+  alias: materialize_snapshot
+  inputs: {source: enriched_events}
+  partition_by: [partition]
+  part_boundary:
+    target_rows: 20000
+    preserve_groups: [partition, row_key]
+  workers: 1
+  max_tasks_per_child: 1
+- op: include_columns
+  alias: snapshot_columns
+  inputs: {data: materialize_snapshot}
+  columns: [partition, row_key, join_key, updated_at, category, value, SOURCEURL, file_name]
+- op: data_assertion
+  alias: validate_snapshot
+  inputs: {data: snapshot_columns}
+  rules:
+  - {id: snapshot_key_required, kind: not_null, columns: [partition, row_key, category]}
+  - {id: snapshot_metric_unique, kind: unique, columns: [partition, row_key, category]}
+- op: save_dataset
+  alias: save_snapshot
+  inputs: {data: validate_snapshot}
+  partition_by: [partition]
+execution:
+  memory_budget_mb: 2048
+  max_source_files_per_task: 40
+  reset_before_run: false

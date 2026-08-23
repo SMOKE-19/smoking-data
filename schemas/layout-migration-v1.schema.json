@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smoking-data.layout-migration.v1",
+  "title": "Smoking Data 0101 Physical Layout Migration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["yaml", "job", "define_upstream", "migrate_layout", "execution"],
+  "properties": {
+    "yaml": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "asset_code"],
+      "properties": {
+        "schema_version": {"const": "smoking-data.layout-migration.v1"},
+        "asset_code": {"const": "0101"}
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {"name": {"type": "string", "minLength": 1}}
+    },
+    "define_upstream": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "alias", "path"],
+      "properties": {
+        "op": {"const": "define_dataset"},
+        "alias": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1}
+      }
+      }
+    },
+    "migrate_layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "source", "recommendation"],
+      "properties": {
+        "op": {"const": "rewrite_parquet_layout"},
+        "source": {"type": "string", "minLength": 1},
+        "recommendation": {"type": "string", "minLength": 1}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"enum": ["dry_run", "in_place"]},
+        "workers": {"type": "integer", "minimum": 1},
+        "memory_budget_mb": {"type": "integer", "minimum": 1},
+        "batch_size": {"type": "integer", "minimum": 1},
+        "max_files_per_worker": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

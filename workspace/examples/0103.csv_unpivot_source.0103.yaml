@@ -1,0 +1,71 @@
+yaml:
+  schema_version: smoking-data.csv-source.v1
+  asset_code: "0103"
+
+job:
+  id: csv-001
+  name: csv_unpivot_source
+
+source:
+  directory: DATA/input/csv
+  glob: "*.csv"
+  recursive: true
+  ordering: path_asc
+  empty_directory_policy: error
+  csv:
+    encoding: utf8
+    delimiter: ","
+    quote_char: '"'
+    header: true
+    null_values: ["", "NULL"]
+    malformed_row_policy: error
+  source_file:
+    output_column: file_name
+    value: relative_path
+    dtype: STRING
+    existing_column_policy: replace_with_warning
+
+materialize:
+  operations:
+  - op: type_cast
+    alias: typed_csv
+    load_as: STRING
+    columns_by_type:
+      STRING: [row_key1, row_key2]
+      FLOAT64: [x, y]
+      DATETIME: [time]
+    default_type: FLOAT64
+    cast_failure_policy: error
+    missing_named_column_policy: error
+
+  - op: unpivot
+    alias: unpivoted
+    id_columns: [row_key1, row_key2, x, y, time, file_name]
+    value_columns: remaining
+    name_column: category
+    value_column: value
+    value_type: FLOAT64
+    preserve_nulls: false
+
+  - op: add_calc
+    alias: calculated
+    expressions:
+    - name: route_key
+      sql: "concat(file_name, '__', category)"
+
+routing:
+  input: calculated
+  routes:
+  - route_name: group_a
+    filtering:
+    - sql: "category LIKE 'A%'"
+  - route_name: group_b
+    filtering:
+    - sql: "category LIKE 'B%'"
+  overlap_policy: duplicate
+  unmatched_policy: drop
+
+output: {}
+
+execution:
+  target_rows_per_part: 100000

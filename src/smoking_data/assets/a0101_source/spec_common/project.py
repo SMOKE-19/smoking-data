@@ -94,7 +94,7 @@ def load_project_paths(yaml_path: str | Path) -> ProjectPaths:
 def infer_project_root(path: Path) -> Path:
     resolved = path.resolve()
     for parent in (resolved.parent, *resolved.parents):
-        if (parent / ".smoking-data" / "adapters.yaml").is_file():
+        if (parent / ".smoking-data" / "config.yaml").is_file():
             return parent
         if parent.name == "settings":
             return parent.parent

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from smoking_data.runtime.test_run import select_final_tasks
 
-from ..spi_hook import run_spi_prepare_hook
+from ..adapter_registry import load_source_adapter
 from .api_runner import DataApiResponse, call_data_api
 from .io import (
     SourcePathSet,
@@ -175,9 +175,10 @@ def execute_source_raw_stage(
     metadata_records: list[SourceMetadataRecord] = []
     log_records: list[SourceLogRecord] = []
     should_write_source_profile = bool(plan.spec.execution.write_source_profile_json)
-    if plan.spec.request.spi_prepare is not None:
-        run_spi_prepare_hook(
-            plan.spec.request.spi_prepare,
+    if transport is None:
+        adapter = load_source_adapter(plan.spec.request.adapter)
+        adapter.prepare_run(
+            options=plan.spec.request.adapter_options,
             project_root=plan.spec.project.project_root,
             temp_root=plan.spec.project.temp_root,
         )

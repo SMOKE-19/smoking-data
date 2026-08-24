@@ -22,14 +22,16 @@
 `smoking_data/object-stores.yaml`은 bucket·region·AWS profile 이름만 포함하는 비밀 없는 예시다.
 실제 AWS credential 파일은 작업공간 리소스에 포함하지 않는다.
 
-0101 SPI 인증 준비가 필요한 경우 Definition YAML의 `source.api_request.spi`에 프로젝트 루트
-기준 `pre_query_script`를 지정한다. 해당 `.py`는 실행당 한 번 query 전에 별도 프로세스로
-실행되며, 토큰 파일은 외부 SPI가 직접 관리한다.
+0101 SQL adapter 인증 준비가 필요한 경우 Definition YAML의
+`source.api_request.adapter_options.pre_query_script`에 프로젝트 루트 기준 스크립트 경로를
+지정한다. 코어는 adapter entry point만 호출하고, 실제 인증·query 계약은 설치된
+`smoking-data-spi` 패키지가 소유한다.
 
 ```yaml
 source:
   api_request:
-    spi:
+    adapter: spi
+    adapter_options:
       pre_query_script: auth/generate_token.py
       execution: once_per_run
       timeout_sec: 60

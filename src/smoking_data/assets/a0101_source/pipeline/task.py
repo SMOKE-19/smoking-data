@@ -24,9 +24,10 @@ class SourceTask:
     sub_job_name: str | None = None
     task_job_name: str | None = None
     parquet_writer_options: dict[str, Any] | None = None
-    adapter_config_path: str = ""
     query_mode: str = "structured"
     http_request: dict[str, Any] | None = None
+    adapter: str = "spi"
+    adapter_options: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

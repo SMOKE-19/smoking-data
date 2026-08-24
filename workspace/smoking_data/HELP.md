@@ -308,4 +308,5 @@ Python 탐색을 작성해야 하면 `for_agents/scripts/`만 사용하고 결�
 3. `redhat.vscode-yaml` 확장이 활성화됐는지 확인한다.
 4. `smoking-data init .`을 다시 실행하고 VS Code에서 `Developer: Reload Window`를 실행한다.
 
-`init`은 이 도움말과 사용자 소유 Asset config·adapter 설정이 이미 있으면 덮어쓰지 않는다.
+`init`은 이 도움말과 사용자 소유 Asset config가 이미 있으면 덮어쓰지 않는다. SQL Source adapter
+설정과 private SPI 호출 계약은 별도 설치 패키지에서 관리하며 작업공간에 생성하지 않는다.

@@ -6,11 +6,11 @@ from typing import Any
 from .template_resources import template_text
 
 
-def initialize_help(target: str | Path) -> dict[str, Any]:
+def initialize_help(target: str | Path, *, force: bool = False) -> dict[str, Any]:
     workspace_root = Path(target).expanduser().resolve()
     help_path = workspace_root / ".smoking-data" / "HELP.md"
     help_path.parent.mkdir(parents=True, exist_ok=True)
-    if help_path.exists():
+    if help_path.exists() and not force:
         return {
             "ok": True,
             "created": False,

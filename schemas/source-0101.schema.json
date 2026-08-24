@@ -30,7 +30,9 @@
           "properties": {
             "query_mode": {"type": "string", "enum": ["structured", "sql_file", "http_json", "http_ndjson", "http_xml"]},
             "http": {"$ref": "#/$defs/httpRequest"},
-            "spi": {"$ref": "#/$defs/spiPrepare"},
+            "adapter": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "default": "spi", "description": "설치된 SOURCE adapter entry point 식별자"},
+            "adapter_options": {"type": "object", "additionalProperties": true, "description": "선택한 adapter에 전달할 불투명 실행 옵션"},
+            "spi": {"type": "object", "additionalProperties": true, "description": "구버전 호환용 adapter 옵션 별칭. 신규 Definition에서는 adapter_options를 사용"},
             "payload": {
               "type": "object",
               "description": "structured query의 select와 canonical filters",
@@ -184,16 +186,6 @@
         "pagination": {"$ref": "#/$defs/httpPagination"},
         "json": {"$ref": "#/$defs/httpJson"},
         "xml": {"$ref": "#/$defs/httpXml"}
-      }
-    },
-    "spiPrepare": {
-      "type": "object", "additionalProperties": false,
-      "required": ["pre_query_script"],
-      "properties": {
-        "pre_query_script": {"type": "string", "minLength": 1, "description": "프로젝트 루트 내부에서 실행할 토큰/세션 준비 Python 스크립트"},
-        "execution": {"const": "once_per_run", "default": "once_per_run"},
-        "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "default": 60},
-        "lock_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "default": 60}
       }
     },
     "httpPagination": {

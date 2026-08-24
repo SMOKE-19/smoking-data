@@ -31,6 +31,7 @@ INTERNAL_ROOT_KEYS = frozenset(
     {
         "schema_version",
         "job",
+        "migration",
         "sources",
         "operations",
         "sinks",
@@ -323,9 +324,9 @@ def _validate_internal_pipeline_document(raw: dict[str, Any]) -> None:
             "joined_dataset": "0301",
             "analysis_snapshot": "0401",
         }.get(str(artifact.get("type") or ""), "")
-        if asset_code not in {"0201", "0301"}:
+        if asset_code not in {"0201", "0301", "0401"}:
             raise ValidationError(
-                "execution.test_run is supported only for 0201 and 0301 pipelines.",
+                "execution.test_run is supported only for 0201, 0301, and 0401 pipelines.",
                 code="execution.unsupported_test_run_asset",
                 context={"asset_code": asset_code},
             )

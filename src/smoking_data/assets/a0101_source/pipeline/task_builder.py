@@ -92,11 +92,10 @@ def build_source_tasks(
                     sub_job_name=sub_job_name,
                     task_job_name=task_job_name,
                     parquet_writer_options=dict(spec.storage.parquet_writer_options),
-                    adapter_config_path=str(
-                        project_root / ".smoking-data" / "adapters.yaml"
-                    ),
                     query_mode=spec.request.query_mode,
                     http_request=(dict(spec.request.http_request or {}) if is_http else None),
+                    adapter=spec.request.adapter,
+                    adapter_options=dict(spec.request.adapter_options),
                 )
             )
     return tasks

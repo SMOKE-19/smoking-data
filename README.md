@@ -116,11 +116,17 @@ init은 `.smoking-data/object-stores.yaml` 예시도 생성한다. AWS credentia
 게시 계약과 `publication inspect`·`publication retry`·dry-run 기본 `publication gc` 명령은
 `.smoking-data/HELP.md`를 참고한다.
 
-SPI가 홈 경로의 토큰 파일을 직접 확인하는 API라면 0101 Definition의
-`source.api_request.spi.pre_query_script`에 프로젝트 루트 기준 `.py` 경로를 지정할 수 있다.
-스크립트는 실행당 한 번, 기존 SPI query 전에 별도 Python 프로세스로 실행된다. Smoking Data는
-스크립트의 토큰 값과 출력 스트림을 읽거나 metadata에 기록하지 않으며, 스크립트가 실패하면
-데이터 query를 시작하지 않는다.
+설치된 adapter가 홈 경로의 토큰 파일을 직접 확인하는 API라면 0101 Definition의
+`source.api_request.adapter_options.pre_query_script`에 프로젝트 루트 기준 `.py` 경로를 지정할
+수 있다. 스크립트는 실행당 한 번, adapter query 전에 별도 Python 프로세스로 실행된다.
+Smoking Data 코어는 스크립트의 토큰 값과 출력 스트림을 읽거나 metadata에 기록하지 않으며,
+스크립트가 실패하면 데이터 query를 시작하지 않는다.
+
+0101의 SQL 기반 Source adapter 구현과 기본 query 옵션은 별도 설치 패키지인
+`smoking-data-spi`가 소유한다. 해당 adapter의 기본 Parquet writer 옵션은 adapter 패키지에서
+제공하고, Definition의 `output.artifact.parquet_writer`가 같은 키를 지정하면 Asset 값이
+최종 override한다. adapter별 실행 옵션은 Definition의 `source.api_request.adapter_options`에서
+관리한다. HTTP 기반 Source는 코어 런타임이 직접 처리한다.
 
 Asset 성공 결과의 `metadata.json`, 원본 `definition.yaml`, 실제 0101 `query.sql`과 실행 계획은 게시된
 dataset의 `_smoking_data/`에 저장된다. `_dataset.manifest.json`은 이 파일들의 checksum도 검증한다.

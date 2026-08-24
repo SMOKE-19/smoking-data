@@ -197,6 +197,7 @@ def run_pipeline_yaml(
             "topological_node_order": pipeline_spec.graph["topological_order"],
             "topological_alias_order": pipeline_spec.graph["topological_alias_order"],
             "logical_plan_hash": pipeline_spec.logical_plan.plan_hash,
+            "migration": pipeline_spec.raw.get("migration"),
             "operation_order": [
                 item["operation_id"] for item in initial_execution_plan["operations"]
             ],
@@ -630,6 +631,16 @@ def main(argv: list[str] | None = None) -> int:
         return _main_pwq_advise(argv[2:])
     if argv[:2] == ["pwq", "benchmark-dummy"]:
         return _main_pwq_benchmark_dummy(argv[2:])
+    if argv[:2] == ["migrate", "yaml"]:
+        return _main_migrate_yaml(argv[2:])
+    if argv[:2] == ["migrate", "parquet"]:
+        return _main_migrate_parquet(argv[2:])
+    if argv[:3] == ["migrate", "chain", "verify"]:
+        return _main_verify_migrated_chain(argv[3:])
+    if argv[:3] == ["migrate", "chain", "run"]:
+        return _main_migrate_chain_run(argv[3:])
+    if argv[:2] == ["smoke", "run"]:
+        return _main_smoke_run(argv[2:])
     if argv[:2] == ["layout", "report"]:
         return _main_layout_report(argv[2:])
     if argv[:2] == ["layout", "migrate"]:
@@ -808,21 +819,30 @@ def _main_init(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Initialize YAML authoring, the 0101 adapter, per-Asset configs, "
+            "Initialize YAML authoring, per-Asset configs, "
             "and workspace runtime directories."
         )
     )
     parser.add_argument("target", nargs="?", default=".")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Replace files managed by init, including examples, schedules, Asset configs, "
+            "HELP.md, and agent guidance. User runtime data, object-store settings, "
+            "AGENTS.md, and .agent/local are preserved."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         workspace = initialize_workspace(args.target)
         adapter = initialize_runtime_config(args.target)
-        asset_configs = initialize_asset_configs(args.target)
+        asset_configs = initialize_asset_configs(args.target, force=args.force)
         runtime_directories = initialize_runtime_directories(args.target)
-        examples = initialize_workspace_examples(args.target)
-        schedule_examples = initialize_schedule_examples(args.target)
-        help_document = initialize_help(args.target)
+        examples = initialize_workspace_examples(args.target, force=args.force)
+        schedule_examples = initialize_schedule_examples(args.target, force=args.force)
+        help_document = initialize_help(args.target, force=args.force)
         agent_workspace = initialize_agent_workspace(args.target)
         payload = {
             "ok": True,
@@ -834,6 +854,7 @@ def _main_init(argv: list[str]) -> int:
             "schedule_examples": schedule_examples,
             "help": help_document,
             "agent_workspace": agent_workspace,
+            "force": args.force,
         }
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
@@ -841,7 +862,10 @@ def _main_init(argv: list[str]) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     elif payload["ok"]:
         print(f"[smoking-data] workspace initialized: {payload['workspace']['vscode_dir']}")
-        print(f"[smoking-data] adapter config: {payload['adapter']['config_path']}")
+        print(
+            "[smoking-data] source adapter: "
+            f"{payload['adapter'].get('managed_by', 'installed adapter package')}"
+        )
         print(
             "[smoking-data] Asset configs: "
             f"created={len(payload['asset_configs']['created'])} "
@@ -1092,6 +1116,461 @@ def _main_source(argv: list[str]) -> int:
             f"job={result.job_name} datasets={len(result.dataset_paths)}"
         )
     return 0 if result.ok else 1
+
+
+def _main_migrate_yaml(argv: list[str]) -> int:
+    from smoking_data.runtime.yaml_migration import migrate_definition_yaml
+
+    parser = argparse.ArgumentParser(
+        description="Convert a supported legacy Definition YAML to the current contract."
+    )
+    parser.add_argument("yaml_path", help="Legacy Definition YAML path")
+    parser.add_argument("--output", required=True, help="Converted YAML output path")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        payload = migrate_definition_yaml(args.yaml_path, output_path=args.output)
+        exit_code = 0
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "yaml.migration_failed",
+            "error_message": str(exc),
+        }
+        exit_code = 1
+    if args.json:
+        print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+    elif payload["ok"]:
+        print(f"[smoking-data] yaml migrated output={payload['output']}")
+    else:
+        print(f"[smoking-data] yaml migration failed: {payload['error_message']}")
+    return exit_code
+
+
+def _main_migrate_parquet(argv: list[str]) -> int:
+    from smoking_data.runtime.yaml_migration import generate_parquet_migration_yaml
+
+    parser = argparse.ArgumentParser(
+        description="Generate a 0201 migration Definition for an existing Parquet dataset."
+    )
+    parser.add_argument("input_path", help="Parquet file or recursive dataset directory")
+    parser.add_argument("--output", required=True, help="Generated 0201 YAML path")
+    parser.add_argument("--source-asset", required=True, choices=["0101", "0102", "0103", "0201", "0301", "0401"])
+    parser.add_argument("--job-name", default="parquet_migration")
+    parser.add_argument("--output-root", default=None)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        payload = generate_parquet_migration_yaml(
+            args.input_path,
+            output_path=args.output,
+            source_asset=args.source_asset,
+            job_name=args.job_name,
+            output_root=args.output_root,
+        )
+        exit_code = 0
+    except (OSError, TypeError, ValueError) as exc:
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "yaml.parquet_migration_failed",
+            "error_message": str(exc),
+        }
+        exit_code = 1
+    if args.json:
+        print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+    elif payload["ok"]:
+        print(f"[smoking-data] parquet migration YAML generated output={payload['output']}")
+    else:
+        print(f"[smoking-data] parquet migration YAML failed: {payload['error_message']}")
+    return exit_code
+
+
+def _main_verify_migrated_chain(argv: list[str]) -> int:
+    """Validate and smoke-test each already-migrated Asset YAML in a Chain."""
+
+    parser = argparse.ArgumentParser(
+        description="Validate and run one smoke task for each Asset referenced by a migrated Chain."
+    )
+    parser.add_argument("chain_yaml", help="Current smoking-data.asset-chain.v2 YAML")
+    parser.add_argument("--tasks", type=int, default=1)
+    parser.add_argument("--isolated-root", default=".temp/chain-migration-smoke")
+    parser.add_argument("--project-root", default=None)
+    parser.add_argument("--config", dest="config_path", default=None)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    if args.tasks != 1:
+        parser.error("migrated Chain verification requires exactly one smoke task per Asset")
+    chain_path = Path(args.chain_yaml).expanduser().resolve()
+    project_root = Path(args.project_root or chain_path.parent).expanduser().resolve()
+    try:
+        document = yaml.safe_load(chain_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(document, dict):
+            raise ValueError("Chain YAML root must be an object.")
+        header = document.get("yaml")
+        if not isinstance(header, dict) or header.get("schema_version") != "smoking-data.asset-chain.v2":
+            raise ValueError("Chain verification requires smoking-data.asset-chain.v2.")
+        assets = document.get("assets")
+        if not isinstance(assets, list) or not assets:
+            raise ValueError("Chain assets must be a non-empty list.")
+        results: list[dict[str, Any]] = []
+        overall_ok = True
+        for index, item in enumerate(assets):
+            if not isinstance(item, dict):
+                raise ValueError(f"assets[{index}] must be an object.")
+            asset_id = str(item.get("id") or f"asset_{index + 1}")
+            definition = str(item.get("definition") or "")
+            if not definition:
+                raise ValueError(f"assets[{index}].definition is required.")
+            definition_path = (chain_path.parent / definition).resolve()
+            asset_result: dict[str, Any] = {
+                "id": asset_id,
+                "definition": str(definition_path),
+                "asset_code": item.get("asset_code"),
+            }
+            if not definition_path.is_file():
+                asset_result.update({"ok": False, "phase": "resolve", "error": "definition_missing"})
+                overall_ok = False
+                results.append(asset_result)
+                continue
+            validation_output = io.StringIO()
+            with contextlib.redirect_stdout(validation_output):
+                validation_code = main(
+                    [
+                        "validate",
+                        str(definition_path),
+                        "--project-root",
+                        str(project_root),
+                        "--json",
+                    ]
+                )
+            validation_payload = _parse_cli_json(validation_output.getvalue())
+            asset_result["validation"] = validation_payload
+            if validation_code != 0:
+                asset_result.update({"ok": False, "phase": "validate"})
+                overall_ok = False
+                results.append(asset_result)
+                continue
+            smoke_root = Path(args.isolated_root)
+            if not smoke_root.is_absolute():
+                smoke_root = project_root / smoke_root
+            smoke_root = smoke_root / asset_id
+            smoke_output = io.StringIO()
+            with contextlib.redirect_stdout(smoke_output):
+                smoke_code = main(
+                    [
+                        "smoke",
+                        "run",
+                        str(definition_path),
+                        "--tasks",
+                        "1",
+                        "--isolated-root",
+                        str(smoke_root),
+                        "--project-root",
+                        str(project_root),
+                        *(["--config", str(args.config_path)] if args.config_path else []),
+                        "--json",
+                    ]
+                )
+            asset_result["smoke"] = _parse_cli_json(smoke_output.getvalue())
+            asset_result["ok"] = smoke_code == 0
+            asset_result["phase"] = "smoke"
+            overall_ok = overall_ok and smoke_code == 0
+            results.append(asset_result)
+        result_payload = {
+            "ok": overall_ok,
+            "chain": str(chain_path),
+            "recursive_migration": False,
+            "task_limit": 1,
+            "assets": results,
+        }
+        exit_code = 0 if overall_ok else 1
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        result_payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "chain.migration_verification_failed",
+            "error_message": str(exc),
+            "recursive_migration": False,
+        }
+        exit_code = 1
+    if args.json:
+        print(json.dumps(to_json_safe(result_payload), ensure_ascii=False, indent=2))
+    elif result_payload["ok"]:
+        print(f"[smoking-data] migrated Chain verification passed assets={len(result_payload['assets'])}")
+    else:
+        print("[smoking-data] migrated Chain verification failed")
+    return exit_code
+
+
+def _main_migrate_chain_run(argv: list[str]) -> int:
+    """Smoke current Asset YAMLs, then generate and smoke 0201 migrations."""
+
+    from smoking_data.runtime.yaml_migration import generate_parquet_migration_yaml
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run one smoke task for each non-0101 Chain Asset, generate a 0201 migration "
+            "YAML per result, and smoke-test the migration."
+        )
+    )
+    parser.add_argument("chain_yaml", help="Current smoking-data.asset-chain.v2 YAML")
+    parser.add_argument("--migration-dir", default="migration")
+    parser.add_argument("--isolated-root", default=".temp/chain-migration")
+    parser.add_argument("--project-root", default=None)
+    parser.add_argument("--config", dest="config_path", default=None)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    chain_path = Path(args.chain_yaml).expanduser().resolve()
+    project_root = Path(args.project_root or chain_path.parent).expanduser().resolve()
+    migration_dir = Path(args.migration_dir)
+    if not migration_dir.is_absolute():
+        migration_dir = project_root / migration_dir
+    isolated_root = Path(args.isolated_root)
+    if not isolated_root.is_absolute():
+        isolated_root = project_root / isolated_root
+    try:
+        document = yaml.safe_load(chain_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(document, dict):
+            raise ValueError("Chain YAML root must be an object.")
+        header = document.get("yaml")
+        if not isinstance(header, dict) or header.get("schema_version") != "smoking-data.asset-chain.v2":
+            raise ValueError("Chain migration run requires smoking-data.asset-chain.v2.")
+        assets = document.get("assets")
+        if not isinstance(assets, list) or not assets:
+            raise ValueError("Chain assets must be a non-empty list.")
+        migration_dir.mkdir(parents=True, exist_ok=True)
+        results: list[dict[str, Any]] = []
+        overall_ok = True
+        for index, item in enumerate(assets):
+            if not isinstance(item, dict):
+                raise ValueError(f"assets[{index}] must be an object.")
+            asset_id = str(item.get("id") or f"asset_{index + 1}")
+            asset_code = str(item.get("asset_code") or "")
+            result: dict[str, Any] = {"id": asset_id, "asset_code": asset_code}
+            if asset_code == "0101":
+                result.update({"status": "skipped", "reason": "0101_excluded"})
+                results.append(result)
+                continue
+            if asset_code not in {"0201", "0301", "0401"}:
+                result.update(
+                    {
+                        "ok": False,
+                        "status": "unsupported",
+                        "reason": "task_smoke_supported_for_0201_0301_0401_only",
+                    }
+                )
+                overall_ok = False
+                results.append(result)
+                continue
+            definition = str(item.get("definition") or "")
+            definition_path = (chain_path.parent / definition).resolve()
+            result["definition"] = str(definition_path)
+            if not definition_path.is_file():
+                result.update({"ok": False, "status": "definition_missing"})
+                overall_ok = False
+                results.append(result)
+                continue
+            validation_output = io.StringIO()
+            with contextlib.redirect_stdout(validation_output):
+                validation_code = main(
+                    ["validate", str(definition_path), "--project-root", str(project_root), "--json"]
+                )
+            result["validation"] = _parse_cli_json(validation_output.getvalue())
+            if validation_code != 0:
+                result.update({"ok": False, "status": "validation_failed"})
+                overall_ok = False
+                results.append(result)
+                continue
+            asset_payload = yaml.safe_load(definition_path.read_text(encoding="utf-8")) or {}
+            job = asset_payload.get("job") if isinstance(asset_payload, dict) else {}
+            job_name = str(job.get("name") or definition_path.stem) if isinstance(job, dict) else definition_path.stem
+            asset_smoke_root = isolated_root / asset_id
+            asset_output_root = asset_smoke_root / asset_code / job_name
+            smoke_output = io.StringIO()
+            with contextlib.redirect_stdout(smoke_output):
+                smoke_code = main(
+                    [
+                        "smoke",
+                        "run",
+                        str(definition_path),
+                        "--tasks",
+                        "1",
+                        "--isolated-root",
+                        str(asset_smoke_root),
+                        "--project-root",
+                        str(project_root),
+                        *(["--config", str(args.config_path)] if args.config_path else []),
+                        "--json",
+                    ]
+                )
+            result["smoke"] = _parse_cli_json(smoke_output.getvalue())
+            if smoke_code != 0 or not list(asset_output_root.rglob("*.parquet")):
+                result.update({"ok": False, "status": "smoke_failed_or_empty_output"})
+                overall_ok = False
+                results.append(result)
+                continue
+            migration_yaml = migration_dir / f"{asset_id}.0201.yaml"
+            generated = generate_parquet_migration_yaml(
+                asset_output_root,
+                output_path=migration_yaml,
+                source_asset=asset_code,
+                job_name=f"{asset_id}_parquet_migration",
+                output_root=str(migration_dir / "output" / asset_id),
+            )
+            result["migration_yaml"] = str(migration_yaml)
+            result["migration_generation"] = generated
+            migration_validation_output = io.StringIO()
+            with contextlib.redirect_stdout(migration_validation_output):
+                migration_validation_code = main(
+                    [
+                        "validate",
+                        str(migration_yaml),
+                        "--project-root",
+                        str(project_root),
+                        "--json",
+                    ]
+                )
+            result["migration_validation"] = _parse_cli_json(migration_validation_output.getvalue())
+            if migration_validation_code != 0:
+                result.update({"ok": False, "status": "migration_validation_failed"})
+                overall_ok = False
+                results.append(result)
+                continue
+            migration_smoke_root = isolated_root / "migration" / asset_id
+            migration_smoke_output = io.StringIO()
+            with contextlib.redirect_stdout(migration_smoke_output):
+                migration_smoke_code = main(
+                    [
+                        "smoke",
+                        "run",
+                        str(migration_yaml),
+                        "--tasks",
+                        "1",
+                        "--isolated-root",
+                        str(migration_smoke_root),
+                        "--project-root",
+                        str(project_root),
+                        "--json",
+                    ]
+                )
+            result["migration_smoke"] = _parse_cli_json(migration_smoke_output.getvalue())
+            result["ok"] = migration_smoke_code == 0
+            result["status"] = "migrated_and_smoke_verified" if result["ok"] else "migration_smoke_failed"
+            overall_ok = overall_ok and result["ok"]
+            results.append(result)
+        result_payload = {
+            "ok": overall_ok,
+            "chain": str(chain_path),
+            "recursive_migration": False,
+            "excluded_asset_codes": ["0101"],
+            "task_limit": 1,
+            "migration_dir": str(migration_dir),
+            "assets": results,
+        }
+        exit_code = 0 if overall_ok else 1
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        result_payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "chain.migration_run_failed",
+            "error_message": str(exc),
+            "recursive_migration": False,
+        }
+        exit_code = 1
+    if args.json:
+        print(json.dumps(to_json_safe(result_payload), ensure_ascii=False, indent=2))
+    elif result_payload["ok"]:
+        print(f"[smoking-data] Chain migration completed migration_dir={migration_dir}")
+    else:
+        print("[smoking-data] Chain migration failed")
+    return exit_code
+
+
+def _parse_cli_json(value: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return {"ok": False, "error_message": value.strip() or "CLI returned no JSON."}
+    return payload if isinstance(payload, dict) else {"ok": False, "payload": payload}
+
+
+def _main_smoke_run(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run a bounded smoke task against an isolated output root."
+    )
+    parser.add_argument("yaml_path", help="Asset Definition YAML path")
+    parser.add_argument("--tasks", type=int, default=1)
+    parser.add_argument("--isolated-root", default=None)
+    parser.add_argument("--project-root", default=None)
+    parser.add_argument("--config", dest="config_path", default=None)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    if args.tasks < 1:
+        parser.error("--tasks must be >= 1")
+    try:
+        source_path = Path(args.yaml_path).expanduser().resolve()
+        project_root = Path(args.project_root or source_path.parent).expanduser().resolve()
+        payload = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("Smoke YAML root must be an object.")
+        asset_code = asset_code_from_definition_path(source_path)
+        if asset_code not in {"0101", "0201", "0301", "0401"}:
+            raise ValueError(
+                "smoke run currently supports 0101, 0201, 0301, and 0401 Asset Definitions; "
+                "Chain requires an explicit upstream smoke plan."
+            )
+        output_root = Path(args.isolated_root or ".temp/smoke")
+        if not output_root.is_absolute():
+            output_root = project_root / output_root
+        job_name = str((payload.get("job") or {}).get("name") or source_path.stem)
+        smoke_root = output_root / asset_code / job_name
+        _apply_smoke_output_root(payload, smoke_root)
+        execution = payload.setdefault("execution", {})
+        if not isinstance(execution, dict):
+            raise ValueError("execution must be an object.")
+        execution["test_run"] = {"final_task_limit": args.tasks}
+        smoke_dir = output_root / "_definitions"
+        smoke_dir.mkdir(parents=True, exist_ok=True)
+        smoke_path = smoke_dir / f"smoke_{source_path.name}"
+        smoke_path.write_text(
+            yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        namespace = argparse.Namespace(
+            yaml_path=str(smoke_path),
+            config_path=args.config_path,
+            project_root=str(project_root),
+            trigger_type="manual",
+            json=args.json,
+        )
+        return _run_definition_cli(namespace)
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "smoke.invalid_definition",
+            "error_message": str(exc),
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"[smoking-data] smoke failed: {payload['error_message']}")
+        return 1
+
+
+def _apply_smoke_output_root(payload: dict[str, Any], root: Path) -> None:
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        raise ValueError("Smoke Definition requires an output object.")
+    artifact = output.get("artifact")
+    if not isinstance(artifact, dict):
+        raise ValueError("Smoke Definition requires output.artifact.")
+    artifact["root_dir"] = str(root)
+    logging = output.get("logging")
+    if isinstance(logging, dict):
+        logging["root_dir"] = str(root / "_logs")
 
 
 def _main_chain_validate(argv: list[str]) -> int:

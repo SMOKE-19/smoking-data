@@ -170,7 +170,16 @@ def _validate_source_yaml_shape(raw: dict[str, object]) -> None:
     request = _mapping(source.get("api_request"), path="source.api_request")
     _reject_unknown_keys(
         request,
-        {"query_mode", "payload", "sql_file_path", "date_window", "http", "spi"},
+        {
+            "query_mode",
+            "payload",
+            "sql_file_path",
+            "date_window",
+            "http",
+            "adapter",
+            "adapter_options",
+            "spi",
+        },
         path="source.api_request",
     )
     payload = request.get("payload")

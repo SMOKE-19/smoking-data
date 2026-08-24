@@ -19,6 +19,7 @@ def copy_template_tree(
     target_root: Path,
     *,
     workspace_root: Path,
+    force: bool = False,
 ) -> dict[str, Any]:
     created: list[str] = []
     preserved: list[str] = []
@@ -32,13 +33,14 @@ def copy_template_tree(
             target = target_root / child_relative
             target.parent.mkdir(parents=True, exist_ok=True)
             display = target.relative_to(workspace_root).as_posix()
-            if target.exists():
+            was_existing = target.exists()
+            if was_existing and not force:
                 preserved.append(display)
                 continue
             temporary = target.with_suffix(target.suffix + ".tmp")
             temporary.write_bytes(child.read_bytes())
             temporary.replace(target)
-            created.append(display)
+            (preserved if was_existing else created).append(display)
 
     visit(template_resource(section), Path())
     return {"created": created, "preserved": preserved}

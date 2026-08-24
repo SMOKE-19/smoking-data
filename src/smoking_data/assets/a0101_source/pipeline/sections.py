@@ -19,7 +19,6 @@ from .models import (
     DateWindowSpec,
     SourceRequestSpec,
     SourceSubJobSpec,
-    SpiPrepareSpec,
 )
 
 
@@ -60,7 +59,8 @@ def parse_structured_request(
         columns=columns,
         filters=filters,
         sub_jobs=sub_jobs,
-        spi_prepare=_parse_spi_prepare(resolved, path_resolver=path_resolver),
+        adapter=_parse_adapter_name(resolved),
+        adapter_options=_parse_adapter_options(resolved),
     )
 
 
@@ -90,41 +90,28 @@ def parse_sql_file_request(
             if path_resolver is not None
             else require_str(resolved, "source", "api_request", "sql_file_path")
         ),
-        spi_prepare=_parse_spi_prepare(resolved, path_resolver=path_resolver),
+        adapter=_parse_adapter_name(resolved),
+        adapter_options=_parse_adapter_options(resolved),
     )
 
 
-def _parse_spi_prepare(
-    resolved: dict[str, Any],
-    *,
-    path_resolver: Callable[[str], str] | None,
-) -> SpiPrepareSpec | None:
+def _parse_adapter_name(resolved: dict[str, Any]) -> str:
     api_request = require_dict(resolved, "source", "api_request")
-    raw = api_request.get("spi")
+    value = str(api_request.get("adapter") or "spi").strip()
+    if not value:
+        raise ValueError("source.api_request.adapter 값이 비어 있습니다.")
+    return value
+
+
+def _parse_adapter_options(resolved: dict[str, Any]) -> dict[str, Any]:
+    api_request = require_dict(resolved, "source", "api_request")
+    raw = api_request.get("adapter_options")
     if raw is None:
-        return None
+        # Backward-compatible opaque options for the former SPI-only contract.
+        raw = api_request.get("spi", {})
     if not isinstance(raw, dict):
-        raise ValueError("source.api_request.spi 는 dict여야 합니다.")
-    unknown = sorted(set(raw) - {"pre_query_script", "execution", "timeout_sec", "lock_timeout_sec"})
-    if unknown:
-        raise ValueError(f"source.api_request.spi의 알 수 없는 키입니다: {unknown}")
-    script_value = str(raw.get("pre_query_script") or "").strip()
-    if not script_value:
-        raise ValueError("source.api_request.spi.pre_query_script 값이 필요합니다.")
-    script_path = path_resolver(script_value) if path_resolver is not None else script_value
-    execution = str(raw.get("execution") or "once_per_run")
-    if execution != "once_per_run":
-        raise ValueError("source.api_request.spi.execution은 once_per_run만 지원합니다.")
-    timeout_sec = float(raw.get("timeout_sec") or 60.0)
-    lock_timeout_sec = float(raw.get("lock_timeout_sec") or 60.0)
-    if timeout_sec <= 0 or lock_timeout_sec <= 0:
-        raise ValueError("SOURCE 0101 SPI timeout 설정은 양수여야 합니다.")
-    return SpiPrepareSpec(
-        script_path=script_path,
-        execution="once_per_run",
-        timeout_sec=timeout_sec,
-        lock_timeout_sec=lock_timeout_sec,
-    )
+        raise ValueError("source.api_request.adapter_options 는 dict여야 합니다.")
+    return dict(raw)
 
 
 def _parse_payload_filters(value: Any) -> tuple[list[str], list[SourceSubJobSpec]]:
@@ -172,8 +159,12 @@ def parse_date_window(resolved: dict[str, Any], *, require_column: bool = True) 
 def parse_http_request(resolved: dict[str, Any], *, query_mode: str) -> SourceRequestSpec:
     table_id = require_str(resolved, "source", "table_id")
     api_request = require_dict(resolved, "source", "api_request")
-    if api_request.get("spi") is not None:
-        raise ValueError("source.api_request.spi는 structured 또는 sql_file에서만 사용할 수 있습니다.")
+    if (
+        api_request.get("adapter") is not None
+        or api_request.get("adapter_options") is not None
+        or api_request.get("spi") is not None
+    ):
+        raise ValueError("source.api_request.adapter는 SQL 기반 Source에서만 사용할 수 있습니다.")
     http = require_dict(api_request, "http")
     unknown = sorted(
         set(http)

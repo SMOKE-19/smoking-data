@@ -40,6 +40,7 @@ CURATED_ROOT_KEYS = frozenset(
     {
         "yaml",
         "job",
+        "migration",
         "define_upstream",
         "combine_upstream",
         "build_sidecar",
@@ -321,6 +322,11 @@ def normalize_pipeline_document(
     normalized = {
         "schema_version": version,
         "job": dict(job),
+        **(
+            {"migration": dict(raw["migration"])}
+            if isinstance(raw.get("migration"), dict)
+            else {}
+        ),
         "sources": sources,
         "operations": lowered_operations,
         "sinks": sinks,
@@ -335,6 +341,8 @@ def _expand_curated_phase_document(
     raw: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Lower the public 0201 phase contract to the internal operation DAG."""
+
+    migration = _validate_migration_metadata(raw.get("migration"))
 
     upstreams = raw.get("define_upstream")
     if not isinstance(upstreams, list) or not upstreams:
@@ -732,12 +740,53 @@ def _expand_curated_phase_document(
         {
             "yaml": raw["yaml"],
             "job": raw["job"],
+            **({"migration": migration} if migration is not None else {}),
             "operations": operations,
             "output": raw["output"],
             "execution": execution,
         },
         phases,
     )
+
+
+def _validate_migration_metadata(value: Any) -> dict[str, Any] | None:
+    """Validate the optional marker used by migration-purpose 0201 jobs."""
+
+    if value is None:
+        return None
+    migration = _mapping(value, path="migration")
+    _reject_unknown(
+        migration,
+        {
+            "id",
+            "mode",
+            "purpose",
+            "source_definition",
+            "source_definition_hash",
+            "source_asset",
+            "source_path",
+        },
+        path="migration",
+    )
+    migration_id = _required_string(migration.get("id"), path="migration.id")
+    mode = str(migration.get("mode") or "").strip().lower()
+    if mode not in {"pass_through", "transform"}:
+        raise ValidationError(
+            "migration.mode must be pass_through or transform.",
+            code="migration.invalid_mode",
+            context={"path": "migration.mode", "value": mode or None},
+        )
+    normalized = {"id": migration_id, "mode": mode}
+    for key in (
+        "purpose",
+        "source_definition",
+        "source_definition_hash",
+        "source_asset",
+        "source_path",
+    ):
+        if migration.get(key) is not None:
+            normalized[key] = _required_string(migration[key], path=f"migration.{key}")
+    return normalized
 
 
 def _canonical_nodes(

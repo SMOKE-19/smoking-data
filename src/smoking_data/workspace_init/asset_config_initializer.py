@@ -12,7 +12,7 @@ from smoking_data.runtime.asset_config import (
 )
 
 
-def initialize_asset_configs(target: str | Path) -> dict[str, Any]:
+def initialize_asset_configs(target: str | Path, *, force: bool = False) -> dict[str, Any]:
     workspace_root = Path(target).expanduser().resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
     created: list[str] = []
@@ -33,13 +33,14 @@ def initialize_asset_configs(target: str | Path) -> dict[str, Any]:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         relative = config_path.relative_to(workspace_root).as_posix()
         config_paths[key] = str(config_path)
-        if config_path.exists():
+        was_existing = config_path.exists()
+        if was_existing and not force:
             preserved.append(relative)
             continue
         temporary = config_path.with_suffix(".yaml.tmp")
         temporary.write_text(text, encoding="utf-8")
         temporary.replace(config_path)
-        created.append(relative)
+        (preserved if was_existing else created).append(relative)
     return {
         "ok": True,
         "workspace_root": str(workspace_root),

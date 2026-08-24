@@ -30,6 +30,7 @@
           "properties": {
             "query_mode": {"type": "string", "enum": ["structured", "sql_file", "http_json", "http_ndjson", "http_xml"]},
             "http": {"$ref": "#/$defs/httpRequest"},
+            "spi": {"$ref": "#/$defs/spiPrepare"},
             "payload": {
               "type": "object",
               "description": "structured query의 select와 canonical filters",
@@ -183,6 +184,16 @@
         "pagination": {"$ref": "#/$defs/httpPagination"},
         "json": {"$ref": "#/$defs/httpJson"},
         "xml": {"$ref": "#/$defs/httpXml"}
+      }
+    },
+    "spiPrepare": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pre_query_script"],
+      "properties": {
+        "pre_query_script": {"type": "string", "minLength": 1, "description": "프로젝트 루트 내부에서 실행할 토큰/세션 준비 Python 스크립트"},
+        "execution": {"const": "once_per_run", "default": "once_per_run"},
+        "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "default": 60},
+        "lock_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "default": 60}
       }
     },
     "httpPagination": {

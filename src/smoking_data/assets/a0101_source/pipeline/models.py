@@ -54,6 +54,14 @@ class SourceLoggingSpec:
 
 
 @dataclass(slots=True)
+class SpiPrepareSpec:
+    script_path: str
+    execution: Literal["once_per_run"] = "once_per_run"
+    timeout_sec: float = 60.0
+    lock_timeout_sec: float = 60.0
+
+
+@dataclass(slots=True)
 class SourceExecutionSpec:
     reset_before_run: bool
     write_source_profile_json: bool
@@ -85,6 +93,7 @@ class SourceRequestSpec:
     sub_jobs: list[SourceSubJobSpec] | None = None
     sql_file_path: str | None = None
     http_request: dict[str, Any] | None = None
+    spi_prepare: SpiPrepareSpec | None = None
 
 
 @dataclass(slots=True)

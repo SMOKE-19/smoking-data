@@ -22,6 +22,20 @@
 `smoking_data/object-stores.yaml`은 bucket·region·AWS profile 이름만 포함하는 비밀 없는 예시다.
 실제 AWS credential 파일은 작업공간 리소스에 포함하지 않는다.
 
+0101 SPI 인증 준비가 필요한 경우 Definition YAML의 `source.api_request.spi`에 프로젝트 루트
+기준 `pre_query_script`를 지정한다. 해당 `.py`는 실행당 한 번 query 전에 별도 프로세스로
+실행되며, 토큰 파일은 외부 SPI가 직접 관리한다.
+
+```yaml
+source:
+  api_request:
+    spi:
+      pre_query_script: auth/generate_token.py
+      execution: once_per_run
+      timeout_sec: 60
+      lock_timeout_sec: 60
+```
+
 기존 사용자 파일은 보존한다. VS Code 설정과 task는 관리 항목만 병합하고, 나머지 템플릿 파일은
 대상 경로가 없을 때만 생성한다. 전체 init 결과의 회귀 스냅샷은 제품 저장소가 아닌 별도
 `smoking-data-testkit` 저장소에서 관리한다.

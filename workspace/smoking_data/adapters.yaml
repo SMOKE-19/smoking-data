@@ -40,6 +40,15 @@ version: 1
 # 실제 환경의 라이브러리명이나 함수명이 다르면 아래 값만 수정하면 됩니다.
 # Parquet 옵션은 각 0101 YAML의 output.artifact.parquet_writer에서 관리합니다.
 # 인증정보는 실제 값을 쓰지 말고 "${ENVIRONMENT_VARIABLE}" 형태로 참조하세요.
+# 토큰 파일을 갱신해야 하는 SPI는 Definition YAML의 source.api_request.spi에
+# 프로젝트 루트 기준 상대경로를 지정합니다. 스크립트 표준출력·표준에러와 토큰 값은
+# Smoking Data가 읽거나 기록하지 않으며, 실행당 한 번 query 전에 별도 프로세스로 실행합니다.
+#
+#   spi:
+#     pre_query_script: auth/generate_token.py
+#     execution: once_per_run
+#     timeout_sec: 60
+#     lock_timeout_sec: 60
 default_adapter: source_spi
 
 adapters:

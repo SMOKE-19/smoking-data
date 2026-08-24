@@ -2028,7 +2028,24 @@ def _main_validate(argv: list[str]) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if _definition_kind(args.yaml_path) == "chain":
+        raw_document = yaml.safe_load(Path(args.yaml_path).read_text(encoding="utf-8")) or {}
+        raw_header = raw_document.get("yaml") if isinstance(raw_document, dict) else None
+        if isinstance(raw_header, dict) and raw_header.get("schema_version") == "smoking-data.publication.v1":
+            from smoking_data.runtime.object_store.config import PublicationSpec
+
+            publication = PublicationSpec.from_mapping(raw_document.get("publication"))
+            if publication is None:
+                raise ValidationError("publication is required for publication.v1 YAML.")
+            payload = {
+                "ok": True,
+                "kind": "publication",
+                "schema_version": "smoking-data.publication.v1",
+                "job_name": str((raw_document.get("job") or {}).get("name") or ""),
+                "target": publication.target,
+                "dataset_prefix": publication.dataset_prefix,
+            }
+            exit_code = 0
+        elif _definition_kind(args.yaml_path) == "chain":
             from smoking_data.runtime.asset_chain import load_asset_chain
 
             config = load_config(

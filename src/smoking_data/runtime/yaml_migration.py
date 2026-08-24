@@ -13,6 +13,7 @@ CURRENT_SOURCE_SCHEMA = "smoking-data.source.v4"
 CURRENT_PIPELINE_SCHEMA = "smoking-data.pipeline.v6"
 CURRENT_CURATED_SCHEMA = "smoking-data.pipeline.v7"
 CURRENT_CHAIN_SCHEMA = "smoking-data.asset-chain.v2"
+CURRENT_PUBLICATION_SCHEMA = "smoking-data.publication.v1"
 
 
 def migrate_definition_yaml(
@@ -30,6 +31,7 @@ def migrate_definition_yaml(
         CURRENT_PIPELINE_SCHEMA,
         CURRENT_CURATED_SCHEMA,
         CURRENT_CHAIN_SCHEMA,
+        CURRENT_PUBLICATION_SCHEMA,
     }:
         converted = deepcopy(payload)
         changes: list[dict[str, str]] = []
@@ -38,6 +40,8 @@ def migrate_definition_yaml(
         converted, changes, warnings = _convert_legacy_pipeline(payload)
     elif _legacy_stage_id(payload) == "etl.chain":
         converted, changes, warnings = _convert_legacy_chain(payload)
+    elif _legacy_stage_id(payload) == "etl.04.01":
+        converted, changes, warnings = _convert_legacy_publication(payload)
     else:
         converted, changes, warnings = _convert_legacy_source(payload)
 
@@ -482,6 +486,62 @@ def _convert_execution(
         execution.pop("write_template_sql")
         warnings.append("legacy execution.write_template_sql은 현재 contract에 없어 제거했습니다.")
     return execution
+
+
+def _convert_legacy_publication(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, str]], list[str]]:
+    aws = _mapping(payload.get("aws"), "aws")
+    sync = _mapping(payload.get("sync"), "sync")
+    target = str(aws.get("profile_name") or "default").replace(" ", "_")
+    prefix = str(sync.get("s3_prefix") or "legacy-migration")
+    converted = {
+        "yaml": {"schema_version": CURRENT_PUBLICATION_SCHEMA},
+        "job": deepcopy(_required_mapping(payload, "job")),
+        "publication": {
+            "enabled": True,
+            "target": target,
+            "dataset_prefix": prefix,
+            "mode": "mirror_after_local_commit",
+            "failure_policy": "required",
+            "parquet": {
+                "enabled": True,
+                "random_access_index": {
+                    "level": "row_group",
+                    "writer_page_index": "disabled",
+                    "key_columns": [],
+                    "key_null_policy": "error",
+                    "key_hash": "sha256_trunc128_v1",
+                    "hash_buckets": 256,
+                },
+            },
+            "sbdf": {
+                "enabled": False,
+                "shard_policy": "mirror_parquet_parts",
+                "row_key_columns": [],
+                "batch_size": 65536,
+                "encoding_rle": True,
+                "key_hash": "sha256_trunc128_v1",
+                "hash_buckets": 256,
+            },
+            "verification": {
+                "checksum": "sha256",
+                "verify_remote_head": True,
+                "verify_sidecar_references": True,
+            },
+        },
+    }
+    changes = [
+        _change("stage.id etl.04.01", f"yaml.schema_version {CURRENT_PUBLICATION_SCHEMA}"),
+        _change("aws.profile_name", "publication.target"),
+        _change("sync.s3_prefix", "publication.dataset_prefix"),
+    ]
+    warnings = [
+        "legacy sync.mode download/sync는 현재 mirror_after_local_commit publication으로 직접 실행되지 않습니다.",
+        "legacy AWS credentials/access_key_id/secret_access_key는 보안상 변환 결과에서 제거했습니다.",
+        "생성 결과는 publication fragment이며 Asset 0401 Snapshot YAML이 아닙니다.",
+    ]
+    return converted, changes, warnings
 
 
 def _required_mapping(payload: dict[str, Any], key: str) -> dict[str, Any]:

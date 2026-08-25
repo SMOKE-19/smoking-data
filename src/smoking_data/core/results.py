@@ -29,6 +29,7 @@ class StageResult:
     started_at: str = field(default_factory=utc_now_iso)
     finished_at: str | None = None
     schema_version: str = STAGE_RESULT_SCHEMA_VERSION
+    dataset_artifacts: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def success(
@@ -39,6 +40,7 @@ class StageResult:
         yaml_path: Path | None = None,
         metadata_path: Path | None = None,
         output_paths: list[Path] | None = None,
+        dataset_artifacts: list[dict[str, Any]] | None = None,
         counters: dict[str, int | float] | None = None,
         details: dict[str, Any] | None = None,
     ) -> StageResult:
@@ -49,6 +51,7 @@ class StageResult:
             yaml_path=yaml_path,
             metadata_path=metadata_path,
             output_paths=output_paths or [],
+            dataset_artifacts=dataset_artifacts or [],
             counters=counters or {},
             details=details or {},
             finished_at=utc_now_iso(),
@@ -95,6 +98,7 @@ class StageResult:
                 "yaml_path": self.yaml_path,
                 "metadata_path": self.metadata_path,
                 "output_paths": self.output_paths,
+                "dataset_artifacts": self.dataset_artifacts,
                 "counters": self.counters,
                 "details": self.details,
                 "error_type": self.error_type,

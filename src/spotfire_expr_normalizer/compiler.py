@@ -81,6 +81,11 @@ _WINDOW_FUNCTIONS = {
     "last",
     "lag",
     "lead",
+    "rollingavg",
+    "rollingmean",
+    "rollingsum",
+    "rollingmin",
+    "rollingmax",
 }
 
 
@@ -163,7 +168,37 @@ def compile_expressions_to_ir(
 def _canonicalize_windows(node: ExpressionNode) -> ExpressionNode:
     if isinstance(node, WindowNode):
         expression = node.expression
+        frame = node.frame
         if isinstance(expression, CallNode):
+            if expression.function in {
+                "rollingavg",
+                "rollingmean",
+                "rollingsum",
+                "rollingmin",
+                "rollingmax",
+            }:
+                if len(expression.arguments) not in {2, 3}:
+                    raise ValueError(
+                        f"{expression.function} requires value, preceding_rows, "
+                        "and optional minimum_periods."
+                    )
+                preceding = expression.arguments[1]
+                minimum = expression.arguments[2] if len(expression.arguments) == 3 else preceding
+                if not isinstance(preceding, LiteralNode) or not isinstance(minimum, LiteralNode):
+                    raise ValueError("Rolling window sizes must be integer literals.")
+                if not isinstance(preceding.value, int) or not isinstance(minimum.value, int):
+                    raise ValueError("Rolling window sizes must be integers.")
+                if preceding.value < 1 or minimum.value < 1 or minimum.value > preceding.value:
+                    raise ValueError("Rolling window sizes must satisfy 1 <= minimum_periods <= preceding_rows.")
+                if not node.order_by:
+                    raise ValueError("Rolling windows require an ORDER BY expression.")
+                expression = CallNode(expression.function, (expression.arguments[0],))
+                frame = {
+                    "kind": "rows",
+                    "preceding": preceding.value - 1,
+                    "following": 0,
+                    "minimum_periods": minimum.value,
+                }
             expression = CallNode(
                 expression.function,
                 tuple(_canonicalize_windows(item) for item in expression.arguments),
@@ -181,6 +216,7 @@ def _canonicalize_windows(node: ExpressionNode) -> ExpressionNode:
                 )
                 for item in node.order_by
             ),
+            frame,
         )
     if isinstance(node, CallNode):
         arguments = tuple(_canonicalize_windows(item) for item in node.arguments)

@@ -25,6 +25,7 @@ from smoking_data.runtime.config import (
     load_config,
     parse_max_tasks_per_child,
 )
+from smoking_data.runtime.dataset_artifacts import describe_dataset_artifacts
 from smoking_data.runtime.events import append_stage_event
 from smoking_data.runtime.lowering import lower_pipeline_spec
 from smoking_data.runtime.metadata import (
@@ -304,6 +305,11 @@ def run_pipeline_yaml(
             run_id=execution_run_id,
         )
         raise
+    result.dataset_artifacts = describe_dataset_artifacts(
+        result.output_paths,
+        metadata_path=result.metadata_path,
+        definition_sha256=pipeline_spec.yaml_hash,
+    )
     pipeline_phases["metadata_write_sec"] = time.perf_counter() - metadata_started
     publication_started = time.perf_counter()
     artifact = (pipeline_spec.raw.get("output") or {}).get("artifact") or {}
@@ -621,6 +627,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_run(argv[1:])
     if argv and argv[0] == "validate":
         return _main_validate(argv[1:])
+    if argv and argv[0] == "capabilities":
+        return _main_capabilities(argv[1:])
     if argv and argv[0] == "compare":
         return _main_compare(argv[1:])
     if argv and argv[0] == "fixture":
@@ -693,6 +701,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return _run_definition_cli(args)
+
+
+def _main_capabilities(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Return the installed smoking-data capability contract."
+    )
+    parser.add_argument("--json", action="store_true", help="Print the capability manifest as JSON.")
+    args = parser.parse_args(argv)
+    from smoking_data.runtime.capabilities import get_capabilities
+
+    payload = get_capabilities()
+    if args.json:
+        print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"[smoking-data] capabilities schema={payload['schema_version']} "
+            f"package={payload['package_version']} operations={len(payload['operations'])}"
+        )
+    return 0
 
 
 def _definition_kind(yaml_path: str | Path) -> str:

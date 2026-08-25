@@ -111,6 +111,7 @@ class WindowNode(ExpressionNode):
     expression: ExpressionNode
     partition_by: tuple[ExpressionNode, ...]
     order_by: tuple[WindowOrder, ...] = ()
+    frame: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,7 +119,7 @@ class WindowNode(ExpressionNode):
             "expression": self.expression.to_dict(),
             "partition_by": [item.to_dict() for item in self.partition_by],
             "order_by": [item.to_dict() for item in self.order_by],
-            "frame": None,
+            "frame": self.frame,
         }
 
 

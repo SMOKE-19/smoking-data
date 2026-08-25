@@ -1,6 +1,6 @@
 # smoking-data
 
-현재 릴리즈: `0.1.3` (Python 3.10–3.13, Linux/Windows wheel 제공)
+현재 릴리즈: `0.1.4` (Python 3.10–3.13, Linux/Windows wheel 제공)
 
 Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
 Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서, 작업공간 원본은 저장소 루트

@@ -274,14 +274,7 @@ fn evaluate_node(node: &ExpressionNode, batch: &RecordBatch) -> Result<ArrayRef,
             partition_by,
             order_by,
             frame,
-        } => {
-            if frame.is_some() {
-                return Err(ArrowError::NotYetImplemented(
-                    "window frame execution is not supported by IR v1".to_string(),
-                ));
-            }
-            evaluate_window(expression, partition_by, order_by, batch)
-        }
+        } => evaluate_window(expression, partition_by, order_by, frame.as_ref(), batch),
     }
 }
 
@@ -720,6 +713,7 @@ fn evaluate_window(
     expression: &ExpressionNode,
     partition_by: &[ExpressionNode],
     order_by: &[WindowOrder],
+    frame: Option<&serde_json::Value>,
     batch: &RecordBatch,
 ) -> Result<ArrayRef, ArrowError> {
     let ExpressionNode::Call {
@@ -740,6 +734,11 @@ fn evaluate_window(
         .map(|partition| evaluate_node(partition, batch))
         .collect::<Result<Vec<_>, _>>()?;
     let groups = window_groups(&partitions, batch.num_rows())?;
+    let ordered_groups = if matches!(function.as_str(), "lag" | "lead") && !order_by.is_empty() {
+        order_window_groups(&groups, order_by, batch)?
+    } else {
+        groups.clone()
+    };
 
     match function.as_str() {
         "rownumber" => window_row_number(order_by, &groups, batch),
@@ -775,11 +774,74 @@ fn evaluate_window(
         "denserank" | "rankreal" => window_rank(function, &values, &groups),
         "firstvalidafter" | "lastvalidbefore" => window_fill(function, &values, &groups),
         "first" | "last" => window_first_last(function, &values, &groups),
-        "lag" | "lead" => window_lag_lead(function, &values, &groups),
+        "lag" | "lead" => window_lag_lead(function, &values, &ordered_groups),
+        "rollingavg" | "rollingmean" | "rollingsum" | "rollingmin" | "rollingmax" => {
+            window_rolling_numeric(function, &values, &ordered_groups, frame)
+        }
         "mostcommon" => window_most_common(&values, &groups),
         "uniqueconcatenate" => window_unique_concatenate(&values, &groups),
         _ => window_numeric_stat(function, &values, &groups, batch.num_rows()),
     }
+}
+
+fn window_rolling_numeric(
+    function: &str,
+    arguments: &[ArrayRef],
+    groups: &HashMap<String, Vec<usize>>,
+    frame: Option<&serde_json::Value>,
+) -> Result<ArrayRef, ArrowError> {
+    let value = arguments.first().ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!("{function} requires one value"))
+    })?;
+    let frame = frame
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            ArrowError::InvalidArgumentError("rolling window frame is required".to_string())
+        })?;
+    let preceding = frame
+        .get("preceding")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            ArrowError::InvalidArgumentError("rolling frame preceding is required".to_string())
+        })? as usize;
+    let following = frame
+        .get("following")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let minimum = frame
+        .get("minimum_periods")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as usize;
+    let numeric = cast(value.as_ref(), &DataType::Float64)?;
+    let numeric = numeric
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| {
+            ArrowError::InvalidArgumentError("rolling value must be numeric".to_string())
+        })?;
+    let mut output = vec![None; value.len()];
+    for indices in groups.values() {
+        for position in 0..indices.len() {
+            let start = position.saturating_sub(preceding);
+            let end = (position + following + 1).min(indices.len());
+            let values: Vec<f64> = indices[start..end]
+                .iter()
+                .filter_map(|index| numeric.is_valid(*index).then(|| numeric.value(*index)))
+                .collect();
+            if values.len() < minimum {
+                continue;
+            }
+            let result = match function {
+                "rollingavg" | "rollingmean" => values.iter().sum::<f64>() / values.len() as f64,
+                "rollingsum" => values.iter().sum(),
+                "rollingmin" => values.iter().copied().fold(f64::INFINITY, f64::min),
+                "rollingmax" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                _ => unreachable!(),
+            };
+            output[indices[position]] = Some(result);
+        }
+    }
+    Ok(Arc::new(Float64Array::from(output)))
 }
 
 fn window_groups(
@@ -806,6 +868,59 @@ fn window_groups(
         groups.entry(key).or_default().push(row_index);
     }
     Ok(groups)
+}
+
+fn order_window_groups(
+    groups: &HashMap<String, Vec<usize>>,
+    order_by: &[WindowOrder],
+    batch: &RecordBatch,
+) -> Result<HashMap<String, Vec<usize>>, ArrowError> {
+    let order_arrays = order_by
+        .iter()
+        .map(|order| evaluate_node(&order.expression, batch))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_indexes =
+        Arc::new(UInt32Array::from_iter_values(0..batch.num_rows() as u32)) as ArrayRef;
+    let mut ordered = HashMap::with_capacity(groups.len());
+    for (key, indices) in groups {
+        let take_indexes = UInt32Array::from(
+            indices
+                .iter()
+                .map(|index| u32::try_from(*index).map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ArrowError::InvalidArgumentError)?,
+        );
+        let mut columns = order_arrays
+            .iter()
+            .zip(order_by)
+            .map(|(array, order)| {
+                Ok(SortColumn {
+                    values: take(array.as_ref(), &take_indexes, None)?,
+                    options: Some(SortOptions {
+                        descending: order.direction == "desc",
+                        nulls_first: order.nulls == "first",
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        columns.push(SortColumn {
+            values: take(source_indexes.as_ref(), &take_indexes, None)?,
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: false,
+            }),
+        });
+        let local = lexsort_to_indices(&columns, None)?;
+        ordered.insert(
+            key.clone(),
+            local
+                .values()
+                .iter()
+                .map(|index| indices[*index as usize])
+                .collect(),
+        );
+    }
+    Ok(ordered)
 }
 
 fn window_numeric_stat(
@@ -3375,6 +3490,7 @@ mod tests {
                 },
                 &[column("group")],
                 &[],
+                None,
                 &batch,
             )
             .unwrap_or_else(|error| panic!("{function} execution fixture failed: {error}"));

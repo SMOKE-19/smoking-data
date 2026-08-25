@@ -135,6 +135,11 @@ pub const SUPPORTED_SCALAR_FUNCTIONS: &[&str] = &[
     "last",
     "lag",
     "lead",
+    "rollingavg",
+    "rollingmean",
+    "rollingsum",
+    "rollingmin",
+    "rollingmax",
     "fiscalmonth",
     "fiscalquarter",
     "fiscalyear",
@@ -359,8 +364,45 @@ fn validate_node(node: &ExpressionNode) -> Result<(), String> {
             order_by,
             frame,
         } => {
-            if frame.is_some() {
-                return Err("window frame execution is not supported by IR v1".to_string());
+            if let Some(frame) = frame {
+                let object = frame
+                    .as_object()
+                    .ok_or_else(|| "window frame must be an object".to_string())?;
+                if object.get("kind").and_then(|value| value.as_str()) != Some("rows") {
+                    return Err("window frame kind must be rows".to_string());
+                }
+                let preceding = object
+                    .get("preceding")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| "window frame preceding must be a non-negative integer".to_string())?;
+                let following = object
+                    .get("following")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| "window frame following must be a non-negative integer".to_string())?;
+                let minimum = object
+                    .get("minimum_periods")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| "window frame minimum_periods must be a positive integer".to_string())?;
+                if minimum == 0 || minimum > preceding + following + 1 {
+                    return Err("window frame minimum_periods is outside the frame".to_string());
+                }
+                if order_by.is_empty() {
+                    return Err("window frame requires at least one order_by item".to_string());
+                }
+                if !matches!(
+                    expression.as_ref(),
+                    ExpressionNode::Call { function, .. }
+                        if matches!(
+                            function.as_str(),
+                            "rollingavg"
+                                | "rollingmean"
+                                | "rollingsum"
+                                | "rollingmin"
+                                | "rollingmax"
+                        )
+                ) {
+                    return Err("window frames require a rolling aggregate function".to_string());
+                }
             }
             if !matches!(expression.as_ref(), ExpressionNode::Call { .. }) {
                 return Err("window expression must contain a canonical call node".to_string());

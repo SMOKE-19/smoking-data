@@ -15,6 +15,7 @@ import pyarrow.parquet as pq
 from smoking_data.core.exceptions import SmokingDataError
 from smoking_data.core.results import StageResult, to_json_safe, utc_now_iso
 from smoking_data.ops.projection import POLARS_TYPE_MAP, apply_add_calc
+from smoking_data.runtime.dataset_artifacts import describe_dataset_artifacts
 from smoking_data.runtime.naming import partition_dir_name
 from smoking_data.runtime.object_store.publication import publish_committed_dataset
 from smoking_data.runtime.paths import file_sha256
@@ -226,7 +227,7 @@ def _run_prepared(
         raise
 
     metadata_path = spec.output_root / _METADATA
-    return StageResult.success(
+    result = StageResult.success(
         preset="0103",
         job_name=spec.job_name,
         yaml_path=spec.yaml_path,
@@ -256,6 +257,12 @@ def _run_prepared(
             ),
         },
     )
+    result.dataset_artifacts = describe_dataset_artifacts(
+        result.output_paths,
+        metadata_path=result.metadata_path,
+        definition_sha256=spec.yaml_hash,
+    )
+    return result
 
 
 def _discover_csv_files(spec: CsvSourceSpec, *, source_root: Path) -> list[Path]:

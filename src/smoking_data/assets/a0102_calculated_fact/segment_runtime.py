@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from smoking_data.core.results import StageResult
+from smoking_data.runtime.dataset_artifacts import describe_dataset_artifacts
 from smoking_data.runtime.events import append_stage_event
 from smoking_data.runtime.task_telemetry import task_telemetry_phase
 from smoking_data_engine_rs import plan_coordinates
@@ -168,7 +169,7 @@ def execute_segment_plan(
                     plan, upstream_delta=upstream_delta, observed_at=calculated_at
                 ),
             )
-            return StageResult.success(
+            result = StageResult.success(
                 preset=RUNNER_PRESET,
                 job_name=plan.spec.job_name,
                 yaml_path=plan.spec.path,
@@ -185,6 +186,12 @@ def execute_segment_plan(
                     "trigger_type": trigger_type,
                 },
             )
+            result.dataset_artifacts = describe_dataset_artifacts(
+                result.output_paths,
+                metadata_path=result.metadata_path,
+                definition_sha256=plan.spec.canonical_hash,
+            )
+            return result
 
         materialize_admission = _materialize_admission(plan)
         task_count = 0
@@ -338,7 +345,7 @@ def execute_segment_plan(
             segment_skips=segment_skips,
         ),
     )
-    return StageResult.success(
+    result = StageResult.success(
         preset=RUNNER_PRESET,
         job_name=plan.spec.job_name,
         yaml_path=plan.spec.path,
@@ -355,6 +362,12 @@ def execute_segment_plan(
             "trigger_type": trigger_type,
         },
     )
+    result.dataset_artifacts = describe_dataset_artifacts(
+        result.output_paths,
+        metadata_path=result.metadata_path,
+        definition_sha256=plan.spec.canonical_hash,
+    )
+    return result
 
 
 def _selected_segments(delta: UpstreamDeltaPlan) -> tuple[UpstreamSegment, ...]:

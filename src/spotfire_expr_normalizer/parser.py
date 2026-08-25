@@ -10,6 +10,7 @@ from .ast import (
     LiteralNode,
     UnaryNode,
     WindowNode,
+    WindowOrder,
 )
 from .tokenizer import Token, tokenize_expression
 
@@ -198,6 +199,7 @@ class ExpressionParser:
                     self.advance()
                     self.expect("(")
                     partitions: list[ExpressionNode] = []
+                    order_by: list[WindowOrder] = []
                     if (
                         self.current.kind == "identifier"
                         and self.current.value.lower() == "partition"
@@ -206,11 +208,43 @@ class ExpressionParser:
                         self.expect("by")
                     if not self.match(")"):
                         while True:
+                            if (
+                                self.current.kind == "identifier"
+                                and self.current.value.lower() == "order"
+                            ):
+                                self.advance()
+                                self.expect("by")
+                                order_expression = self.parse_expression()
+                                direction = "asc"
+                                nulls = "last"
+                                if self.current.kind == "identifier" and self.current.value.lower() in {
+                                    "asc",
+                                    "desc",
+                                }:
+                                    direction = self.advance().value.lower()
+                                if (
+                                    self.current.kind == "identifier"
+                                    and self.current.value.lower() == "nulls"
+                                ):
+                                    self.advance()
+                                    nulls = self.advance().value.lower()
+                                    if nulls not in {"first", "last"}:
+                                        raise ValueError("Window NULLS must be FIRST or LAST.")
+                                order_by.append(WindowOrder(order_expression, direction, nulls))
+                                if self.match(","):
+                                    continue
+                                self.expect(")")
+                                break
                             partitions.append(self.parse_expression())
                             if self.match(")"):
                                 break
+                            if (
+                                self.current.kind == "identifier"
+                                and self.current.value.lower() == "order"
+                            ):
+                                continue
                             self.expect(",")
-                    node = WindowNode(node, tuple(partitions))
+                    node = WindowNode(node, tuple(partitions), tuple(order_by))
                 return node
             return ColumnNode(token.value)
         if token.value == "(":

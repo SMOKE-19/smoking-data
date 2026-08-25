@@ -5,7 +5,7 @@ import json
 import os
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,9 @@ DATASET_CATALOG_VERSION = "smoking-data.dataset-catalog.v1"
 _SOURCE_MANIFEST = Path("_smoking_data/source-file-manifest.json")
 _DATASET_CATALOG = Path("_smoking_data/dataset-catalog.json")
 _METADATA = Path("_smoking_data/metadata.json")
+SOURCE_MODIFIED_AT_COLUMN = "source_modified_at"
+SOURCE_CREATED_AT_COLUMN = "source_created_at"
+_SOURCE_DATETIME_COLUMNS = (SOURCE_MODIFIED_AT_COLUMN, SOURCE_CREATED_AT_COLUMN)
 
 
 def run_yaml(
@@ -363,7 +366,16 @@ def _process_file(
             }
         )
         frame = frame.drop(spec.file_name_column)
-    frame = frame.with_columns(pl.lit(relative_path, dtype=pl.String).alias(spec.file_name_column))
+    source_modified_at, source_created_at = _source_file_datetimes(source_stat)
+    frame = frame.with_columns(
+        pl.lit(relative_path, dtype=pl.String).alias(spec.file_name_column),
+        pl.lit(source_modified_at, dtype=pl.Datetime("us", "UTC")).alias(
+            SOURCE_MODIFIED_AT_COLUMN
+        ),
+        pl.lit(source_created_at, dtype=pl.Datetime("us", "UTC")).alias(
+            SOURCE_CREATED_AT_COLUMN
+        ),
+    )
     input_rows = frame.height
     frame = _apply_materialize(spec, frame)
     unpivot_rows = frame.height
@@ -438,9 +450,14 @@ def _apply_materialize(spec: CsvSourceSpec, frame: pl.DataFrame) -> pl.DataFrame
     for operation in spec.operations:
         kind = str(operation["op"])
         if kind == "type_cast":
-            frame = _apply_grouped_cast(frame, operation, file_name_column=spec.file_name_column)
+            frame = _apply_grouped_cast(
+                frame,
+                operation,
+                file_name_column=spec.file_name_column,
+                datetime_columns=_SOURCE_DATETIME_COLUMNS,
+            )
         elif kind == "unpivot":
-            frame = _apply_unpivot(frame, operation)
+            frame = _apply_unpivot(frame, operation, system_columns=_SOURCE_DATETIME_COLUMNS)
         elif kind == "add_calc":
             frame = apply_add_calc(frame.lazy(), operation["expressions"]).collect()
     return frame
@@ -451,6 +468,7 @@ def _apply_grouped_cast(
     operation: dict[str, Any],
     *,
     file_name_column: str,
+    datetime_columns: tuple[str, ...] = (),
 ) -> pl.DataFrame:
     explicit: dict[str, str] = {}
     for type_name, columns in dict(operation.get("columns_by_type") or {}).items():
@@ -469,19 +487,30 @@ def _apply_grouped_cast(
         type_name = (
             "STRING"
             if column == file_name_column
+            else "DATETIME"
+            if column in datetime_columns
             else explicit.get(column) or name_type_rule(column) or default_type
         )
         expression = pl.col(column)
         if type_name == "DATETIME":
-            expression = expression.str.to_datetime(strict=True)
+            if not isinstance(frame.schema[column], pl.Datetime):
+                expression = expression.str.to_datetime(strict=True)
         else:
             expression = expression.cast(POLARS_TYPE_MAP[type_name], strict=True)
         expressions.append(expression.alias(column))
     return frame.with_columns(expressions)
 
 
-def _apply_unpivot(frame: pl.DataFrame, operation: dict[str, Any]) -> pl.DataFrame:
+def _apply_unpivot(
+    frame: pl.DataFrame,
+    operation: dict[str, Any],
+    *,
+    system_columns: tuple[str, ...] = (),
+) -> pl.DataFrame:
     id_columns = [str(item) for item in operation["id_columns"]]
+    id_columns.extend(
+        column for column in system_columns if column in frame.columns and column not in id_columns
+    )
     missing = sorted(set(id_columns) - set(frame.columns))
     if missing:
         raise SmokingDataError(
@@ -650,6 +679,27 @@ def _source_file_token(spec: CsvSourceSpec, relative_path: str) -> str:
     flattened = re.sub(r"[^A-Za-z0-9._-]+", "_", flattened).strip("._") or "source"
     digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[: spec.collision_hash_length]
     return f"{flattened}__{digest}"
+
+
+def _source_file_datetimes(
+    source_stat: os.stat_result,
+) -> tuple[datetime, datetime | None]:
+    """Return UTC source timestamps with a portable creation-time fallback.
+
+    POSIX ``st_ctime`` is metadata-change time, not creation time, so it is
+    deliberately not used as a creation timestamp on Linux. Windows exposes
+    creation time through ``st_birthtime_ns`` or ``st_ctime_ns``.
+    """
+
+    modified_at = datetime.fromtimestamp(source_stat.st_mtime_ns / 1_000_000_000, timezone.utc)
+    birthtime_ns = getattr(source_stat, "st_birthtime_ns", None)
+    if birthtime_ns is not None:
+        created_at = datetime.fromtimestamp(birthtime_ns / 1_000_000_000, timezone.utc)
+    elif os.name == "nt":
+        created_at = datetime.fromtimestamp(source_stat.st_ctime_ns / 1_000_000_000, timezone.utc)
+    else:
+        created_at = None
+    return modified_at, created_at
 
 
 def _render_filename(template: str, values: dict[str, Any], *, suffix: str) -> str:

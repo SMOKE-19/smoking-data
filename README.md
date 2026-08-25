@@ -1,6 +1,6 @@
 # smoking-data
 
-현재 릴리즈: `0.1.4` (Python 3.10–3.13, Linux/Windows wheel 제공)
+현재 릴리즈: `0.1.5` (Python 3.10–3.13, Linux/Windows wheel 제공)
 
 Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
 Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서, 작업공간 원본은 저장소 루트
@@ -19,6 +19,11 @@ Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서, 작업공�
 - Engine이 Asset Chain 검증·실행과 dataset-local provenance 계약 소유
 - 설치 후 `init`으로 YAML 편집 환경, LLM 진단 지침·sandbox, 0101 adapter와 Asset별 기본 config 생성
 - 로컬 atomic commit 뒤 선택적으로 S3 immutable Parquet·SBDF generation bundle과 random-access sidecar 게시
+
+0103 출력 행에는 `file_name`(상대경로)과 함께 소스 파일의 UTC
+`source_modified_at`이 기록된다. 파일시스템이 생성 시각을 제공하는 환경에서는
+`source_created_at`도 기록하며, Linux/POSIX처럼 생성 시각을 안정적으로 조회할 수
+없는 환경에서는 해당 값이 null이다.
 
 ## 개발 환경
 

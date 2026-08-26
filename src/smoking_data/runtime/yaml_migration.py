@@ -400,9 +400,19 @@ def _convert_legacy_source(
     source = _required_mapping(payload, "source")
     request = _required_mapping(source, "api_request")
     legacy_output = _required_mapping(payload, "output")
+    legacy_job = _required_mapping(payload, "job")
 
     converted_source = deepcopy(source)
     converted_request = deepcopy(request)
+    _drop_legacy_source_types(
+        payload,
+        converted_source=converted_source,
+        converted_request=converted_request,
+        legacy_output=legacy_output,
+        changes=changes,
+        warnings=warnings,
+    )
+    job = _normalize_legacy_source_job(legacy_job, changes, warnings)
 
     spi_options = converted_request.pop("spi", None)
     if spi_options is not None:
@@ -423,12 +433,83 @@ def _convert_legacy_source(
             "schema_version": CURRENT_SOURCE_SCHEMA,
             "asset_code": "0101",
         },
-        "job": deepcopy(_required_mapping(payload, "job")),
+        "job": job,
         "source": converted_source,
         "execution": execution,
         "output": output,
     }
     return converted, changes, warnings
+
+
+def _normalize_legacy_source_job(
+    legacy_job: dict[str, Any],
+    changes: list[dict[str, str]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Keep only fields supported by the current 0101 job contract."""
+
+    job = {key: deepcopy(legacy_job[key]) for key in ("name", "description") if key in legacy_job}
+    discarded = sorted(set(legacy_job) - set(job))
+    for key in discarded:
+        changes.append(_change(f"job.{key}", "removed (unused legacy 0101 field)"))
+    if discarded:
+        warnings.append("legacy 0101 job의 현재 계약 외 필드를 제거했습니다.")
+    return job
+
+
+def _drop_legacy_source_types(
+    payload: dict[str, Any],
+    *,
+    converted_source: dict[str, Any],
+    converted_request: dict[str, Any],
+    legacy_output: dict[str, Any],
+    changes: list[dict[str, str]],
+    warnings: list[str],
+) -> None:
+    """Remove unused type markers from the legacy 0101 Source contract.
+
+    The current Source contract fixes the asset identity and output artifact
+    type in its own schema. Legacy source files may still carry redundant
+    markers at these legacy locations; none of them are copied to the current
+    document. The current output artifact type is intentionally not handled
+    here because it is a required field of the new contract.
+    """
+
+    legacy_mappings = (
+        ("asset", payload.get("asset")),
+        ("source", converted_source),
+        ("source.api_request", converted_request),
+        ("output", legacy_output),
+    )
+    removed = False
+    removed_type = False
+    for path, value in legacy_mappings:
+        if isinstance(value, dict) and "type" in value:
+            value.pop("type", None)
+            changes.append(_change(f"{path}.type", "removed (unused legacy 0101 field)"))
+            removed = True
+            removed_type = True
+    if "type" in payload:
+        changes.append(_change("type", "removed (unused legacy 0101 field)"))
+        removed = True
+        removed_type = True
+    for key in ("stage", "stage_id", "asset_code"):
+        if key in payload:
+            changes.append(_change(key, "removed (legacy identity field)"))
+            removed = True
+    for path, value in (("source", converted_source), ("source.api_request", converted_request)):
+        if not isinstance(value, dict):
+            continue
+        for key in ("stage", "stage_id", "asset", "asset_code"):
+            if key in value:
+                value.pop(key, None)
+                changes.append(_change(f"{path}.{key}", "removed (legacy identity field)"))
+                removed = True
+    if removed:
+        if removed_type:
+            warnings.append("legacy 0101의 사용되지 않는 식별·type 필드를 제거했습니다.")
+        else:
+            warnings.append("legacy 0101의 사용되지 않는 식별 필드를 제거했습니다.")
 
 
 def _convert_output(

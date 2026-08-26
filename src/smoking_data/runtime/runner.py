@@ -1959,7 +1959,10 @@ def _main_parquet_schema(argv: list[str]) -> int:
             "error_code": "source.empty",
             "error_message": "Parquet 파일을 찾을 수 없습니다.",
         }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"[smoking-data] parquet schema failed: {payload['error_message']}")
         return 1
     schema = pq.ParquetFile(files[0].path).schema_arrow
     payload = {
@@ -2037,7 +2040,23 @@ def _main_pwq_advise(argv: list[str]) -> int:
         )
     except SmokingDataError as exc:
         payload = {"ok": False, **exc.to_dict()}
-        print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+        if args.json:
+            print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+        else:
+            print(f"[smoking-data] pwq advise failed: {payload['error_message']}")
+        return 1
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "pwq.advice_failed",
+            "error_message": str(exc),
+            "error_context": {"yaml_path": str(args.yaml_path)},
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"[smoking-data] pwq advise failed: {payload['error_message']}")
         return 1
     payload = {"ok": True, "pwq": handle.to_dict()}
     if args.json:
@@ -2150,7 +2169,23 @@ def _main_pwq_benchmark_dummy(argv: list[str]) -> int:
             )
     except SmokingDataError as exc:
         payload = {"ok": False, **exc.to_dict()}
-        print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+        if args.json:
+            print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+        else:
+            print(f"[smoking-data] pwq benchmark failed: {payload['error_message']}")
+        return 1
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "pwq.benchmark_failed",
+            "error_message": str(exc),
+            "error_context": {"root": str(args.root)},
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"[smoking-data] pwq benchmark failed: {payload['error_message']}")
         return 1
     payload = {"ok": True, "benchmark": handle.to_dict()}
     if args.json:

@@ -34,12 +34,29 @@ class EffectiveAssetConfig:
 
 
 def asset_code_from_definition_path(path: str | Path) -> str | None:
-    name = Path(path).name
+    definition_path = Path(path).expanduser()
+    name = definition_path.name
     parts = name.split(".")
-    if len(parts) < 3 or parts[-1].lower() not in {"yaml", "yml"}:
-        return None
-    candidate = parts[-2]
-    return candidate if candidate in ASSET_CONFIG_RESOURCES else None
+    if len(parts) >= 3 and parts[-1].lower() in {"yaml", "yml"}:
+        candidate = parts[-2]
+        if candidate in ASSET_CONFIG_RESOURCES:
+            return candidate
+
+    # Migration output is commonly named `converted.yaml`, so the filename
+    # cannot always carry the asset code. Prefer the explicit current-contract
+    # header when the path does not identify an asset by name.
+    if definition_path.is_file():
+        try:
+            payload = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            return None
+        if isinstance(payload, dict):
+            header = payload.get("yaml")
+            if isinstance(header, dict):
+                candidate = str(header.get("asset_code") or "").strip()
+                if candidate in ASSET_CONFIG_RESOURCES:
+                    return candidate
+    return None
 
 
 def workspace_common_config_path(project_root: str | Path) -> Path:

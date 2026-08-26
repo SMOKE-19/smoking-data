@@ -54,7 +54,9 @@ smoking-data chain run CHAIN.yaml [--config CONFIG] [--project-root ROOT] [--jso
 - `smoke run`: 0101·0201·0301·0401 Definition을 지정 task 수만 실행하고 isolated output에 기록한다. `templates/` 아래 또는 파일명에 `template`이 포함된 Definition은 요청값과 관계없이 1 task만 실행한다.
 - `migrate chain verify`: Chain 내부 YAML을 변환하지 않고 각 YAML을 validate한 뒤 task 1개씩 smoke 실행한다.
 - `migrate chain run`: 0101을 제외한 0201·0301·0401을 task 1개 smoke 실행하고, 결과 Parquet로 `migration/*.0201.yaml`을 생성한 뒤 0201 migration도 task 1개 smoke 실행한다.
-- `validate`: 실행 없이 0101~0401 Asset 또는 Chain 계약을 검증한다.
+- `validate`: 실행 없이 0101~0401 Asset 또는 Chain 계약을 검증한다. Asset code는 파일명에
+  있으면 파일명을 우선하고, `converted.yaml`처럼 파일명에 없으면 현재 YAML의
+  `yaml.asset_code`를 사용하므로 migration 결과 파일명은 자유롭게 지정할 수 있다.
 - `chain validate`: Asset Chain의 graph와 topological order만 검증한다.
 - `chain run`: Asset Chain을 실행한다.
 - `--trigger-type`: `manual`, `schedule`, `retry`, `chain` 중 실행 trigger를 기록한다.
@@ -75,8 +77,10 @@ smoking-data migrate parquet INPUT_PATH --output migration.0201.yaml \
 1. 기존 YAML과 대상 Asset schema를 함께 읽는다.
 2. 의미가 같은 필드만 현재 contract로 매핑하고, 불명확한 필드는 추정하지 않는다.
 3. 0101 legacy `source.api_request.spi` 옵션은 `adapter_options`로 옮긴다.
-4. 새 파일을 작성한 뒤 `smoking-data validate NEW.yaml --json`으로 검증한다.
-5. 기존·변환 YAML의 job, window, filter, output 경로 차이를 보고한다.
+4. 0101 legacy의 사용되지 않는 `type` 필드는 변환 결과에서 제거하고 changes/warnings에 기록한다.
+5. 0101 legacy의 `stage`, `stage_id`, `asset` 식별 필드는 새 `yaml.asset_code`로 대체되며 결과에 남기지 않는다.
+6. 새 파일을 작성한 뒤 `smoking-data validate NEW.yaml --json`으로 검증한다.
+7. 기존·변환 YAML의 job, window, filter, output 경로 차이를 보고한다.
 
 변환 결과는 `smoking-data validate converted.yaml --json`으로 별도 검증한다.
 
@@ -176,9 +180,10 @@ smoking-data layout migrate MIGRATION.yaml [--project-root ROOT] [--json]
 ```bash
 smoking-data publication inspect [--project-root ROOT] [--target TARGET] [--dataset-prefix PREFIX] [--json]
 smoking-data publication retry RECEIPT.json [--project-root ROOT] [--json]
-smoking-data publication gc --project-root ROOT [--target TARGET] [--dataset-prefix PREFIX] \
-  [--generation-id ID] [--execute] [--json]
-smoking-data publication read-key KEY [--project-root ROOT] [--target TARGET] [--json]
+smoking-data publication gc --project-root ROOT --target TARGET --dataset-prefix PREFIX \
+  [--retain-generations N] [--expected-generation-id ID] [--execute] [--json]
+smoking-data publication read-key --project-root ROOT --target TARGET --dataset-prefix PREFIX \
+  --key-json JSON --output OUTPUT [--key-types-json JSON] [--column COLUMN] [--json]
 ```
 
 `publication gc`는 기본 dry-run이다. 실제 삭제에는 `--execute`와 대상 generation 확인이

@@ -384,6 +384,17 @@ def _convert_legacy_source(
     asset = payload.get("asset")
     if not isinstance(header, dict) or "version" not in header:
         raise ValueError("지원하는 legacy YAML 형식이 아닙니다: yaml.version이 없습니다.")
+    changes: list[dict[str, str]] = []
+    warnings: list[str] = []
+    if asset is None:
+        source_candidate = payload.get("source")
+        if not isinstance(source_candidate, dict) or not isinstance(
+            source_candidate.get("api_request"), dict
+        ) or not isinstance(payload.get("output"), dict):
+            raise ValueError("legacy Source YAML의 0101 식별 정보가 없습니다.")
+        changes.append(_change("implicit legacy source asset", "asset_code 0101"))
+        warnings.append("legacy Source YAML에 asset.code가 없어 source 구조를 기준으로 0101을 추론했습니다.")
+        asset = {"code": "0101"}
     if not isinstance(asset, dict) or str(asset.get("code")) != "0101":
         raise ValueError("현재 결정론적 변환기는 legacy Source asset code 0101만 지원합니다.")
     source = _required_mapping(payload, "source")
@@ -392,8 +403,6 @@ def _convert_legacy_source(
 
     converted_source = deepcopy(source)
     converted_request = deepcopy(request)
-    changes: list[dict[str, str]] = []
-    warnings: list[str] = []
 
     spi_options = converted_request.pop("spi", None)
     if spi_options is not None:

@@ -31,9 +31,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0101.source.0101.yaml · Slim": {
+  "Smoking Data Template · 0101.source.0101.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0101-source",
+    "prefix": "sd-template-0101-source",
     "description": "0101.source.0101.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -74,9 +74,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0101.source.0101.yaml · Full": {
+  "Smoking Data Template · 0101.source.0101.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0101-source-full",
+    "prefix": "sd-template-0101-source-full",
     "description": "0101.source.0101.yaml 전체 예시",
     "body": [
       "yaml:",

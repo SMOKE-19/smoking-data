@@ -11,7 +11,7 @@
 | --- | --- | --- |
 | `vscode/` | `.vscode/` | YAML Schema, snippet, task, 편집기 설정 |
 | `smoking_data/` | `.smoking-data/` | 공통·Asset config, adapter, object-store target, 도움말 |
-| `examples/` | `examples/` | 사용자용 reference Definition, migration, 최소 입력 리소스 |
+| `templates/` | `templates/` | 사용자용 Definition template, migration, 최소 입력 리소스 |
 | `schedules/` | `schedules/` | 비활성 예약 실행 예시 |
 | `AGENTS.md` | `AGENTS.md` | LLM 자동 발견용 읽기 전용 진단 진입점 |
 | `agent/` | `.agent/` | CLI·metadata·profile·실패·missing 분석 지침 |
@@ -38,8 +38,10 @@ source:
       lock_timeout_sec: 60
 ```
 
-기존 사용자 파일은 보존한다. VS Code 설정과 task는 관리 항목만 병합하고, 나머지 템플릿 파일은
-대상 경로가 없을 때만 생성한다. 전체 init 결과의 회귀 스냅샷은 제품 저장소가 아닌 별도
+기본 `init`은 `templates/`를 생성한다. `--force` 지정 시 기존 init 관리 생성물 전체를
+`.history/YYMMDD_HHMMSS/`로 압축 없이 백업한다. `DATA`와 `.temp` 운영 데이터는 제외한다.
+일반 init은 기존 파일을 보존한다. VS Code 설정과 task는
+관리 항목만 병합하고, 나머지 템플릿 파일은 대상 경로가 없을 때만 생성한다. 전체 init 결과의 회귀 스냅샷은 제품 저장소가 아닌 별도
 `smoking-data-testkit` 저장소에서 관리한다.
 
 Agent 지침은 예외적으로 `.agent/smoking-data/`의 패키지 관리 파일을 재실행 때 갱신한다. 루트
@@ -47,6 +49,6 @@ Agent 지침은 예외적으로 `.agent/smoking-data/`의 패키지 관리 파�
 `.agent` 링크가 이미 있는 문서는 그대로 두며 `.agent/local/CONTEXT.md`는 사용자 파일로 보존한다. `for_agents/scripts/`와
 `for_agents/output/`은 Python 초기화 코드가 빈 디렉터리로 만들며 workspace 원본에 두지 않는다.
 
-`examples/`는 운영 설정과 회귀 테스트 fixture를 혼합하는 폴더가 아니다. 제품 계약을 설명하는
-reference Definition과 이를 실행하기 위한 최소 `resources/`만 포함하며, 통합 회귀 테스트 fixture와
+`templates/`는 운영 설정과 회귀 테스트 fixture를 혼합하는 폴더가 아니다. 제품 계약을 설명하는
+Definition template과 이를 실행하기 위한 최소 `resources/`만 포함하며, 통합 회귀 테스트 fixture와
 benchmark 산출물은 별도 testkit·benchmark 영역에서 관리한다.

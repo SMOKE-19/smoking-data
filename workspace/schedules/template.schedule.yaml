@@ -12,10 +12,10 @@ schedule:
 targets:
   - alias: curated
     kind: asset
-    definition: ../examples/0201.pipeline_curated_pivot.0201.yaml
+    definition: ../templates/0201.pipeline_curated_pivot.0201.yaml
   - alias: daily_chain
     kind: chain
-    definition: ../examples/chain.0101_to_0401_asset_chain.chain.yaml
+    definition: ../templates/chain.0101_to_0401_asset_chain.chain.yaml
 
 policy:
   misfire: catch_up_once

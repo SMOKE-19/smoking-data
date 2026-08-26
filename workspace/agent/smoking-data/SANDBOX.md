@@ -8,7 +8,7 @@ for_agents/
   output/    JSON·CSV·Markdown·profile 결과
 ```
 
-- 작업공간 루트, `src/`, `scripts/`, `examples/`, `DATA/`, `.temp/`에 탐색 코드를 만들지 않는다.
+- 작업공간 루트, `src/`, `scripts/`, `templates/`, `DATA/`, `.temp/`에 탐색 코드를 만들지 않는다.
 - script는 입력 파일을 읽기 모드로만 열고 모든 출력 경로를 `for_agents/output/` 아래로 제한한다.
 - Parquet은 가능하면 footer 또는 필요한 column만 읽고 전체 materialize를 피한다.
 - script 파일명은 `YYYYMMDD_<purpose>.py`, 결과는 `YYYYMMDD_<purpose>.<ext>` 형식을 권장한다.

@@ -132,9 +132,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0102.calculated_list_facts.0102.yaml · Slim": {
+  "Smoking Data Template · 0102.calculated_list_facts.0102.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0102-calculated-list-facts",
+    "prefix": "sd-template-0102-calculated-list-facts",
     "description": "0102.calculated_list_facts.0102.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -215,9 +215,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0102.calculated_list_facts.0102.yaml · Full": {
+  "Smoking Data Template · 0102.calculated_list_facts.0102.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0102-calculated-list-facts-full",
+    "prefix": "sd-template-0102-calculated-list-facts-full",
     "description": "0102.calculated_list_facts.0102.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -329,9 +329,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0201.pipeline_curated_pivot.0201.yaml · Slim": {
+  "Smoking Data Template · 0201.pipeline_curated_pivot.0201.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0201-pipeline-curated-pivot",
+    "prefix": "sd-template-0201-pipeline-curated-pivot",
     "description": "0201.pipeline_curated_pivot.0201.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -439,9 +439,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0201.pipeline_curated_pivot.0201.yaml · Full": {
+  "Smoking Data Template · 0201.pipeline_curated_pivot.0201.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0201-pipeline-curated-pivot-full",
+    "prefix": "sd-template-0201-pipeline-curated-pivot-full",
     "description": "0201.pipeline_curated_pivot.0201.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -584,9 +584,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0201.pipeline_pivot_parity.0201.yaml · Slim": {
+  "Smoking Data Template · 0201.pipeline_pivot_parity.0201.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0201-pipeline-pivot-parity",
+    "prefix": "sd-template-0201-pipeline-pivot-parity",
     "description": "0201.pipeline_pivot_parity.0201.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -668,9 +668,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0201.pipeline_pivot_parity.0201.yaml · Full": {
+  "Smoking Data Template · 0201.pipeline_pivot_parity.0201.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0201-pipeline-pivot-parity-full",
+    "prefix": "sd-template-0201-pipeline-pivot-parity-full",
     "description": "0201.pipeline_pivot_parity.0201.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -785,9 +785,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_basic.0301.yaml · Slim": {
+  "Smoking Data Template · 0301.pipeline_basic.0301.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-basic",
+    "prefix": "sd-template-0301-pipeline-basic",
     "description": "0301.pipeline_basic.0301.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -851,9 +851,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_basic.0301.yaml · Full": {
+  "Smoking Data Template · 0301.pipeline_basic.0301.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-basic-full",
+    "prefix": "sd-template-0301-pipeline-basic-full",
     "description": "0301.pipeline_basic.0301.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -939,9 +939,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_multi_right_full_parity.0301.yaml · Slim": {
+  "Smoking Data Template · 0301.pipeline_multi_right_full_parity.0301.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-multi-right-full-parity",
+    "prefix": "sd-template-0301-pipeline-multi-right-full-parity",
     "description": "0301.pipeline_multi_right_full_parity.0301.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -1027,9 +1027,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_multi_right_full_parity.0301.yaml · Full": {
+  "Smoking Data Template · 0301.pipeline_multi_right_full_parity.0301.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-multi-right-full-parity-full",
+    "prefix": "sd-template-0301-pipeline-multi-right-full-parity-full",
     "description": "0301.pipeline_multi_right_full_parity.0301.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -1136,9 +1136,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_multi_right_join.0301.yaml · Slim": {
+  "Smoking Data Template · 0301.pipeline_multi_right_join.0301.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-multi-right-join",
+    "prefix": "sd-template-0301-pipeline-multi-right-join",
     "description": "0301.pipeline_multi_right_join.0301.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -1222,9 +1222,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_multi_right_join.0301.yaml · Full": {
+  "Smoking Data Template · 0301.pipeline_multi_right_join.0301.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-multi-right-join-full",
+    "prefix": "sd-template-0301-pipeline-multi-right-join-full",
     "description": "0301.pipeline_multi_right_join.0301.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -1330,9 +1330,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_multi_right_post_ops.0301.yaml · Slim": {
+  "Smoking Data Template · 0301.pipeline_multi_right_post_ops.0301.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-multi-right-post-ops",
+    "prefix": "sd-template-0301-pipeline-multi-right-post-ops",
     "description": "0301.pipeline_multi_right_post_ops.0301.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -1454,9 +1454,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0301.pipeline_multi_right_post_ops.0301.yaml · Full": {
+  "Smoking Data Template · 0301.pipeline_multi_right_post_ops.0301.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0301-pipeline-multi-right-post-ops-full",
+    "prefix": "sd-template-0301-pipeline-multi-right-post-ops-full",
     "description": "0301.pipeline_multi_right_post_ops.0301.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -1600,9 +1600,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0401.pipeline_analysis_snapshot.0401.yaml · Slim": {
+  "Smoking Data Template · 0401.pipeline_analysis_snapshot.0401.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-0401-pipeline-analysis-snapshot",
+    "prefix": "sd-template-0401-pipeline-analysis-snapshot",
     "description": "0401.pipeline_analysis_snapshot.0401.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -1686,9 +1686,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · 0401.pipeline_analysis_snapshot.0401.yaml · Full": {
+  "Smoking Data Template · 0401.pipeline_analysis_snapshot.0401.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-0401-pipeline-analysis-snapshot-full",
+    "prefix": "sd-template-0401-pipeline-analysis-snapshot-full",
     "description": "0401.pipeline_analysis_snapshot.0401.yaml 전체 예시",
     "body": [
       "yaml:",
@@ -1790,9 +1790,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · chain.0101_to_0401_asset_chain.chain.yaml · Slim": {
+  "Smoking Data Template · chain.0101_to_0401_asset_chain.chain.yaml · Slim": {
     "scope": "yaml",
-    "prefix": "sd-example-chain-0101-to-0401-asset-chain",
+    "prefix": "sd-template-chain-0101-to-0401-asset-chain",
     "description": "chain.0101_to_0401_asset_chain.chain.yaml Slim 예시",
     "body": [
       "yaml:",
@@ -1821,9 +1821,9 @@
       "$0"
     ]
   },
-  "Smoking Data Example · chain.0101_to_0401_asset_chain.chain.yaml · Full": {
+  "Smoking Data Template · chain.0101_to_0401_asset_chain.chain.yaml · Full": {
     "scope": "yaml",
-    "prefix": "sd-example-chain-0101-to-0401-asset-chain-full",
+    "prefix": "sd-template-chain-0101-to-0401-asset-chain-full",
     "description": "chain.0101_to_0401_asset_chain.chain.yaml 전체 예시",
     "body": [
       "yaml:",

@@ -1,7 +1,9 @@
 # Reference Definition 예시
 
 이 디렉터리는 제품 동작을 설명하고 로컬에서 검증할 수 있는 reference Definition 원본이다.
-`smoking-data init`이 사용자 작업공간의 `examples/`에 복사하며, 기존 파일은 덮어쓰지 않는다.
+`smoking-data init`이 사용자 작업공간의 `templates/`에 복사한다. 기본 init은 기존 파일을
+보존하며, `--force` 갱신 시 기존 init 관리 생성물 전체를 `.history/YYMMDD_HHMMSS/`로
+압축 없이 백업한다.
 운영 데이터나 제품 내부 테스트 fixture를 저장하는 위치가 아니다.
 
 ## 예시 분류
@@ -22,8 +24,8 @@ GDELT 예시는 특정 업무 도메인 구현이 아니라 HTTP·bulk download�
 예시는 작업공간 루트에서 실행한다.
 
 ```bash
-smoking-data validate examples/0201.pipeline_curated_pivot.0201.yaml --json
-smoking-data validate examples/chain.0101_to_0401_asset_chain.chain.yaml --json
+smoking-data validate templates/0201.pipeline_curated_pivot.0201.yaml --json
+smoking-data validate templates/chain.0101_to_0401_asset_chain.chain.yaml --json
 ```
 
 Schedule 예시는 이 디렉터리에 두지 않고 작업공간의 `schedules/`에 별도로 생성된다.

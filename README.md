@@ -1,10 +1,10 @@
 # smoking-data
 
-현재 릴리즈: `0.1.5` (Python 3.10–3.13, Linux/Windows wheel 제공)
+현재 릴리즈: `0.1.6` (Python 3.10–3.13, Linux/Windows wheel 제공)
 
 Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
 Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서, 작업공간 원본은 저장소 루트
-`workspace/`에서 관리한다. `workspace/examples/`는 사용자용 reference Definition 원본이며,
+`workspace/`에서 관리한다. `workspace/templates/`는 사용자용 Definition template 원본이며,
 운영 설정이나 회귀 테스트 fixture를 담지 않는다. SBDF 변환은 중복 native 코드를 포함하지 않고 외부
 `smoking-sbdf` 패키지에 위임한다.
 
@@ -38,23 +38,23 @@ uv run smoking-data
 주요 명령은 다음과 같다.
 
 ```bash
-# YAML schema·snippet, examples, schedules, Source adapter와 Asset별 config 생성
+# YAML schema·snippet, schedules, Source adapter와 Asset별 config 생성
 uv run smoking-data init .
 
 # 공통 Asset/Chain 실행·검증 (YAML 종류 자동 판별)
-uv run smoking-data validate examples/0201.pipeline_curated_pivot.0201.yaml --json
-uv run smoking-data validate examples/chain.0101_to_0401_asset_chain.chain.yaml --json
-uv run smoking-data run examples/0101.source.0101.yaml --json
-uv run smoking-data run examples/0101.gdelt_doc_articles.0101.yaml --json
-uv run smoking-data run examples/0102.calculated_list_facts.0102.yaml --json
-uv run smoking-data run examples/0103.csv_unpivot_source.0103.yaml --json
-uv run smoking-data validate examples/0101.http_ndjson.0101.yaml --json
-uv run smoking-data validate examples/0101.http_xml.0101.yaml --json
-uv run smoking-data validate examples/0103.http_zip_unpivot_source.0103.yaml --json
-uv run smoking-data validate examples/chain.gdelt_0103_to_0401.chain.yaml --json
-uv run smoking-data run examples/0201.pipeline_curated_pivot.0201.yaml --json
-uv run smoking-data run examples/chain.0101_to_0401_asset_chain.chain.yaml --json
-uv run smoking-data run examples/chain.gdelt_0103_to_0401.chain.yaml --trigger-type chain --json
+uv run smoking-data validate templates/0201.pipeline_curated_pivot.0201.yaml --json
+uv run smoking-data validate templates/chain.0101_to_0401_asset_chain.chain.yaml --json
+uv run smoking-data run templates/0101.source.0101.yaml --json
+uv run smoking-data run templates/0101.gdelt_doc_articles.0101.yaml --json
+uv run smoking-data run templates/0102.calculated_list_facts.0102.yaml --json
+uv run smoking-data run templates/0103.csv_unpivot_source.0103.yaml --json
+uv run smoking-data validate templates/0101.http_ndjson.0101.yaml --json
+uv run smoking-data validate templates/0101.http_xml.0101.yaml --json
+uv run smoking-data validate templates/0103.http_zip_unpivot_source.0103.yaml --json
+uv run smoking-data validate templates/chain.gdelt_0103_to_0401.chain.yaml --json
+uv run smoking-data run templates/0201.pipeline_curated_pivot.0201.yaml --json
+uv run smoking-data run templates/chain.0101_to_0401_asset_chain.chain.yaml --json
+uv run smoking-data run templates/chain.gdelt_0103_to_0401.chain.yaml --trigger-type chain --json
 
 # dataset·실패·missing dependency·profile 읽기 전용 진단
 uv run smoking-data inspect dataset DATA/0103/csv_unpivot_source --project-root . --json
@@ -63,21 +63,23 @@ uv run smoking-data inspect missing DATA/0102/calculated_fact --project-root . -
 uv run smoking-data inspect profile DATA/0201/curated/_smoking_data/metadata.json --project-root . --json
 
 # 기존 명령 호환
-uv run smoking-data source examples/0101.source.0101.yaml --json
-uv run smoking-data examples/0201.pipeline_curated_pivot.0201.yaml --json
-uv run smoking-data chain validate examples/chain.0101_to_0401_asset_chain.chain.yaml --json
-uv run smoking-data chain run examples/chain.0101_to_0401_asset_chain.chain.yaml --json
+uv run smoking-data source templates/0101.source.0101.yaml --json
+uv run smoking-data templates/0201.pipeline_curated_pivot.0201.yaml --json
+uv run smoking-data chain validate templates/chain.0101_to_0401_asset_chain.chain.yaml --json
+uv run smoking-data chain run templates/chain.0101_to_0401_asset_chain.chain.yaml --json
 
 # 후행 실행 이력으로 실행 가능한 물리 레이아웃 권고 YAML 생성
 uv run smoking-data layout report 0101.yaml 0201.yaml --json
 
 # migration YAML의 execution.mode는 최초 dry_run으로 검토한다.
 uv run smoking-data layout migrate \
-  examples/migrations/0101.physical_layout.layout-migration.yaml --json
+  templates/migrations/0101.physical_layout.layout-migration.yaml --json
 ```
 
-위 `examples/`와 `schedules/` 경로는 먼저 실행한 `init .`이 현재 작업공간에 생성한다. `examples/`는
-Asset·Chain 계약을 설명하는 reference 파일이고, 실제 회귀 테스트 fixture는 별도 testkit에서 관리한다.
+`init .`은 `templates/`와 `schedules/`를 생성한다. `templates/`는 Asset·Chain 계약을 설명하는
+Definition template이며, 실제 회귀 테스트 fixture는 별도 testkit에서 관리한다. `--force`로
+갱신할 때 기존 init 관리 생성물은 압축하지 않고 `.history/YYMMDD_HHMMSS/` 아래에 함께
+백업한다. `DATA`와 `.temp` 운영 데이터는 백업하지 않는다.
 GDELT bulk 예제는 작은 `lastupdate.txt`를 우선 조회하고 실제로 게시된 최신 Events ZIP을 선택한다.
 최신 슬롯이 아직 미게시 상태면 이전 성공 파일을 재사용하고, 이력이 없는 최초 실행·복구 상황에서만
 전체 masterfile을 스트리밍 스캔한다. 선택 파일의 byte 크기와 MD5를 검증한 뒤 헤더 없는 TSV에
@@ -98,8 +100,9 @@ Asset Definition 파일은 `정렬키.설명.계약종류.yaml` 형식을 사용
 
 `init`은 공통 `.smoking-data/config.yaml`과 지원 Asset별 `config.yaml`을 생성하고,
 작업공간 안의 기본 실행 디렉터리인 `DATA`, `.temp`, `.temp/metadata`, `.temp/logs`도 준비한다.
-또한 실행 가능한 `examples/`와 비활성 상태의 `schedules/` 예약 실행 예시를 생성한다.
-기존 파일은 덮어쓰지 않는다.
+또한 사용자용 `templates/`와 비활성 상태의 `schedules/` 예약 실행 템플릿을 생성한다.
+`--force`는 기본값이 아니며, 지정한 경우에만 기존 `.vscode`, `.smoking-data`, `.agent`,
+`for_agents`, `schedules`, `AGENTS.md`, `templates/`를 동일한 history snapshot에 보관한다.
 LLM 진단을 위해 루트 `AGENTS.md`, 패키지 관리 `.agent/smoking-data/`, 사용자 관리
 `.agent/local/CONTEXT.md`도 생성한다. 임시 Python 탐색 코드는 `for_agents/scripts/`, JSON·CSV·보고서는
 `for_agents/output/`에만 저장하며 `for_agents/.gitignore`가 sandbox 전체를 Git에서 제외한다.
@@ -111,8 +114,8 @@ Asset별 생성물 기본값인 `output`은 불필요한 래퍼 없이 config �
 설정은 `번들 공통 < 번들 Asset < 작업공간 공통 < 작업공간 Asset < 개별 Definition`
 순서로 재귀 병합한다. 저장소에서 init 리소스를 수정할 때는
 저장소 루트의 [`workspace`](workspace/README.md)를 단일 원본으로 사용한다. `vscode`,
-`smoking_data`, `examples`, `schedules`가 각각 init 결과의 `.vscode`,
-`.smoking-data`, `examples`, `schedules`로 대응한다.
+`smoking_data`, `templates`, `schedules`가 각각 `.smoking-data`, `templates`,
+`schedules`로 대응한다.
 자동완성 prefix, 파일명 규칙과 검증·실행 명령은 init이 생성하는 `.smoking-data/HELP.md`에서 바로
 확인할 수 있으며, 이미 존재하는 도움말은 덮어쓰지 않는다.
 

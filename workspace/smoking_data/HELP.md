@@ -2,6 +2,18 @@
 
 이 문서는 `smoking-data init .`이 생성하는 YAML 작성·자동완성·실행 도움말이다.
 
+## 명령어 탐색 계약
+
+```bash
+smoking-data --help
+smoking-data migrate --help
+smoking-data migrate yaml --help
+```
+
+root help는 전체 top-level command를, group help는 직속 subcommand를, leaf help는
+해당 명령의 인자와 옵션을 보여준다. 새 CLI 기능은 dispatch, help, 이 문서와 테스트를
+함께 갱신해야 한다.
+
 ## 처음 설정
 
 ```bash
@@ -71,7 +83,9 @@ init은 비밀 값이 없는 `.smoking-data/object-stores.yaml` 예시도 생성
 Windows는 `%USERPROFILE%\.aws`의 AWS shared profile을 SDK가 읽으며 init은 `.aws`나 credential
 파일을 생성하지 않는다. 여러 profile은 object-store target을 분리해 지정한다.
 
-`examples/`에는 Asset·Chain Definition과 0102 expression CSV, migration 예시가 생성된다.
+`templates/`에는 Asset·Chain Definition과 0102 expression CSV, migration template이 생성된다.
+기본 `init`은 기존 파일을 보존하며, `--force` 갱신 시 기존 init 관리 생성물 전체를
+`.history/YYMMDD_HHMMSS/`에 압축 없이 백업한다. `DATA`와 `.temp` 운영 데이터는 백업하지 않는다.
 `schedules/`에는 이 Definition을 참조하는 예약 실행 예시가 생성되며 안전을 위해 모두
 `enabled: false`이다. 실제 Definition 경로를 확인·수정한 뒤 활성화한다. `init`은 이미 같은 경로의
 사용자 파일이 있으면 덮어쓰지 않고 보존한다.
@@ -213,7 +227,7 @@ YAML 옵션으로 노출하지 않는다.
 | `sd-execution-test-run` | 전역 sidecar·plan 생성 후 최종 task만 제한하는 테스트 실행 골격 |
 
 `define_asset.definition`의 상대경로는 현재 Pipeline Definition 파일을 기준으로 해석한다.
-`define_dataset.paths`는 기존처럼 물리 dataset 경로를 직접 지정한다. Full example template에는 동일 alias의
+`define_dataset.paths`는 기존처럼 물리 dataset 경로를 직접 지정한다. Full template에는 동일 alias의
 두 입력 방식이 함께 들어가며, 하나만 활성화하고 다른 블록은 주석 상태로 유지한다.
 모든 operation은 `id` 대신 사람이 편집할 수 있는 `alias`를 선언하고 `inputs`에서도 alias를 참조한다.
 검증 시 생성되는 캐노니컬 key는 alias 변경과 무관하다.
@@ -230,42 +244,45 @@ YAML 옵션으로 노출하지 않는다.
 
 ### 예시 template
 
-`sd-example-{asset-code}-{description}`은 Asset config가 제공하는 `output`과 실행 기본값을 생략한
+`sd-template-{asset-code}-{description}`은 Asset config가 제공하는 `output`과 실행 기본값을 생략한
 Slim 예시다. 같은
 prefix 끝에 `-full`을 붙이면 모든 선택 필드가 포함된 전체 예시를 삽입한다.
 
 | Slim prefix | Full prefix | 생성 내용 |
 | --- | --- | --- |
-| `sd-example-0101-source` | `sd-example-0101-source-full` | 0101 Source |
-| `sd-example-0102-calculated-list-facts` | `sd-example-0102-calculated-list-facts-full` | 0102 Calculated Fact |
-| `sd-example-0201-pipeline-curated-pivot` | `sd-example-0201-pipeline-curated-pivot-full` | 0201 Curated Pivot |
-| `sd-example-0201-pipeline-pivot-parity` | `sd-example-0201-pipeline-pivot-parity-full` | 0201 Pivot parity |
-| `sd-example-0301-pipeline-basic` | `sd-example-0301-pipeline-basic-full` | 0301 기본 Join |
-| `sd-example-0301-pipeline-multi-right-full-parity` | `sd-example-0301-pipeline-multi-right-full-parity-full` | 0301 Multi-right full parity |
-| `sd-example-0301-pipeline-multi-right-join` | `sd-example-0301-pipeline-multi-right-join-full` | 0301 Multi-right Join |
-| `sd-example-0301-pipeline-multi-right-post-ops` | `sd-example-0301-pipeline-multi-right-post-ops-full` | 0301 Join 후속 operation |
-| `sd-example-0401-pipeline-analysis-snapshot` | `sd-example-0401-pipeline-analysis-snapshot-full` | 0401 Snapshot |
-| `sd-example-chain-0101-to-0401-asset-chain` | `sd-example-chain-0101-to-0401-asset-chain-full` | 0101~0401 Chain |
+| `sd-template-0101-source` | `sd-template-0101-source-full` | 0101 Source |
+| `sd-template-0102-calculated-list-facts` | `sd-template-0102-calculated-list-facts-full` | 0102 Calculated Fact |
+| `sd-template-0201-pipeline-curated-pivot` | `sd-template-0201-pipeline-curated-pivot-full` | 0201 Curated Pivot |
+| `sd-template-0201-pipeline-pivot-parity` | `sd-template-0201-pipeline-pivot-parity-full` | 0201 Pivot parity |
+| `sd-template-0301-pipeline-basic` | `sd-template-0301-pipeline-basic-full` | 0301 기본 Join |
+| `sd-template-0301-pipeline-multi-right-full-parity` | `sd-template-0301-pipeline-multi-right-full-parity-full` | 0301 Multi-right full parity |
+| `sd-template-0301-pipeline-multi-right-join` | `sd-template-0301-pipeline-multi-right-join-full` | 0301 Multi-right Join |
+| `sd-template-0301-pipeline-multi-right-post-ops` | `sd-template-0301-pipeline-multi-right-post-ops-full` | 0301 Join 후속 operation |
+| `sd-template-0401-pipeline-analysis-snapshot` | `sd-template-0401-pipeline-analysis-snapshot-full` | 0401 Snapshot |
+| `sd-template-chain-0101-to-0401-asset-chain` | `sd-template-chain-0101-to-0401-asset-chain-full` | 0101~0401 Chain |
 
 ## 검증과 실행
 
 ```bash
 # Asset 또는 Chain 계약 검증 (YAML을 자동 판별)
-smoking-data validate examples/0201.pipeline_curated_pivot.0201.yaml --project-root . --json
-smoking-data validate examples/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
+smoking-data validate templates/0201.pipeline_curated_pivot.0201.yaml --project-root . --json
+smoking-data validate templates/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
 
 # Asset 또는 Chain 실행 (YAML을 자동 판별)
-smoking-data run examples/0101.source.0101.yaml --project-root . --json
-smoking-data run examples/0102.calculated_list_facts.0102.yaml --project-root . --json
-smoking-data run examples/0103.csv_unpivot_source.0103.yaml --project-root . --json
-smoking-data run examples/0201.pipeline_curated_pivot.0201.yaml --project-root . --json
-smoking-data run examples/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
+smoking-data run templates/0101.source.0101.yaml --project-root . --json
+smoking-data run templates/0102.calculated_list_facts.0102.yaml --project-root . --json
+smoking-data run templates/0103.csv_unpivot_source.0103.yaml --project-root . --json
+smoking-data run templates/0201.pipeline_curated_pivot.0201.yaml --project-root . --json
+smoking-data run templates/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
 
 # 기존 명령도 호환된다.
-smoking-data source examples/0101.source.0101.yaml --json
-smoking-data examples/0201.pipeline_curated_pivot.0201.yaml --project-root . --json
-smoking-data chain validate examples/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
-smoking-data chain run examples/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
+smoking-data source templates/0101.source.0101.yaml --json
+smoking-data templates/0201.pipeline_curated_pivot.0201.yaml --project-root . --json
+smoking-data chain validate templates/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
+smoking-data chain run templates/chain.0101_to_0401_asset_chain.chain.yaml --project-root . --json
+
+# template smoke 실행은 항상 1 task로 제한된다.
+smoking-data smoke run templates/0201.pipeline_curated_pivot.0201.yaml --tasks 9 --json
 
 # 재사용 가능한 filter operation과 자동완성 선택 기록
 smoking-data registry list --op filter --project-root . --json

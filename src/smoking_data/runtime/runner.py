@@ -619,6 +619,23 @@ def _validate_pipeline_against_source_schemas(spec: Any, *, config: Any) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] in [["-h"], ["--help"]]:
+        _print_cli_help()
+        return 0
+    if argv[:1] in [
+        ["migrate"],
+        ["layout"],
+        ["smoke"],
+        ["chain"],
+        ["registry"],
+        ["schedule"],
+        ["publication"],
+        ["pwq"],
+        ["inspect"],
+    ]:
+        if len(argv) == 1 or argv[1:2] in [["-h"], ["--help"]]:
+            _print_cli_help(argv[0])
+            return 0
     if argv and argv[0] == "init":
         return _main_init(argv[1:])
     if argv and argv[0] == "source":
@@ -680,6 +697,14 @@ def main(argv: list[str] | None = None) -> int:
         "profile",
     }:
         return _main_inspect(argv[1], argv[2:])
+
+    if argv and not _looks_like_definition_path(argv[0]):
+        print(
+            f"[smoking-data] unknown command: {argv[0]}. "
+            "Run 'smoking-data --help' for available commands.",
+            file=sys.stderr,
+        )
+        return 2
 
     parser = argparse.ArgumentParser(description="Run smoking-data pipeline YAML.")
     parser.add_argument("yaml_path", nargs="?", help="pipeline YAML path to validate/run.")
@@ -832,15 +857,91 @@ def _main_run(argv: list[str]) -> int:
     return _run_definition_cli(parser.parse_args(argv))
 
 
+_CLI_COMMANDS: dict[str, tuple[str, ...]] = {
+    "init": ("Initialize a workspace",),
+    "source": ("Run a 0101 Source Definition",),
+    "run": ("Run an Asset Definition or Chain",),
+    "validate": ("Validate an Asset Definition or Chain",),
+    "capabilities": ("Show engine capabilities",),
+    "compare": ("Compare execution results",),
+    "fixture": ("Run fixture utilities",),
+    "parquet-schema": ("Read Parquet footer schema",),
+    "migrate": ("Migrate Definitions, Parquet inputs, or Chains",),
+    "smoke": ("Run bounded smoke tasks",),
+    "layout": ("Inspect or migrate physical layout",),
+    "publication": ("Inspect and manage publication state",),
+    "chain": ("Validate or run an Asset Chain",),
+    "registry": ("Inspect authoring registry",),
+    "schedule": ("Validate or tick schedules",),
+    "inspect": ("Inspect datasets and metadata",),
+    "pwq": ("Advise or benchmark pipeline write quality",),
+}
+
+_CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
+    "migrate": (
+        "migrate yaml LEGACY.yaml --output CURRENT.yaml",
+        "migrate parquet INPUT --output migration.0201.yaml --source-asset ASSET",
+        "migrate chain verify CHAIN.yaml",
+        "migrate chain run CHAIN.yaml",
+    ),
+    "smoke": ("smoke run DEFINITION.yaml [--tasks N]",),
+    "layout": (
+        "layout report DATASET",
+        "layout migrate MIGRATION.yaml",
+    ),
+    "chain": ("chain validate CHAIN.yaml", "chain run CHAIN.yaml"),
+    "registry": ("registry list", "registry record-insert OP_ID"),
+    "schedule": ("schedule validate", "schedule tick"),
+    "publication": (
+        "publication inspect",
+        "publication retry RECEIPT.json",
+        "publication gc",
+        "publication read-key KEY",
+    ),
+    "pwq": (
+        "pwq advise PIPELINE.yaml",
+        "pwq benchmark-dummy --root ROOT",
+    ),
+    "inspect": (
+        "inspect dataset PATH",
+        "inspect failure PATH",
+        "inspect missing PATH",
+        "inspect profile PATH",
+    ),
+}
+
+
+def _print_cli_help(group: str | None = None) -> None:
+    if group is None:
+        print("usage: smoking-data COMMAND [OPTIONS]")
+        print("       smoking-data PIPELINE.yaml [OPTIONS]")
+        print("\ncommands:")
+        for command, description in _CLI_COMMANDS.items():
+            print(f"  {command:<15} {description[0]}")
+        print("\nRun 'smoking-data COMMAND --help' for command-specific options.")
+        return
+    print(f"usage: smoking-data {group} SUBCOMMAND [OPTIONS]")
+    print(f"\n{group} commands:")
+    for command in _CLI_GROUP_COMMANDS.get(group, ()):
+        print(f"  {command}")
+    print(f"\nRun 'smoking-data {group} SUBCOMMAND --help' for command-specific options.")
+
+
+def _looks_like_definition_path(value: str) -> bool:
+    path = Path(value).expanduser()
+    return path.exists() or path.suffix.casefold() in {".yaml", ".yml"}
+
+
 def _main_init(argv: list[str]) -> int:
     from smoking_data.workspace_init import (
+        backup_init_outputs,
         initialize_agent_workspace,
         initialize_asset_configs,
         initialize_help,
         initialize_runtime_directories,
-        initialize_schedule_examples,
+        initialize_schedule_templates,
         initialize_workspace,
-        initialize_workspace_examples,
+        initialize_workspace_templates,
     )
     from smoking_data.workspace_init.config_initializer import initialize_runtime_config
 
@@ -855,7 +956,7 @@ def _main_init(argv: list[str]) -> int:
         "--force",
         action="store_true",
         help=(
-            "Replace files managed by init, including examples, schedules, Asset configs, "
+            "Replace files managed by init, including templates, schedules, Asset configs, "
             "HELP.md, and agent guidance. User runtime data, object-store settings, "
             "AGENTS.md, and .agent/local are preserved."
         ),
@@ -863,12 +964,17 @@ def _main_init(argv: list[str]) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
+        history = (
+            backup_init_outputs(args.target)
+            if args.force
+            else {"history_root": None, "backed_up": []}
+        )
         workspace = initialize_workspace(args.target)
         adapter = initialize_runtime_config(args.target)
         asset_configs = initialize_asset_configs(args.target, force=args.force)
         runtime_directories = initialize_runtime_directories(args.target)
-        examples = initialize_workspace_examples(args.target, force=args.force)
-        schedule_examples = initialize_schedule_examples(args.target, force=args.force)
+        templates = initialize_workspace_templates(args.target, force=args.force)
+        schedule_templates = initialize_schedule_templates(args.target, force=args.force)
         help_document = initialize_help(args.target, force=args.force)
         agent_workspace = initialize_agent_workspace(args.target)
         payload = {
@@ -877,11 +983,12 @@ def _main_init(argv: list[str]) -> int:
             "adapter": adapter,
             "asset_configs": asset_configs,
             "runtime_directories": runtime_directories,
-            "examples": examples,
-            "schedule_examples": schedule_examples,
+            "templates": templates,
+            "schedule_templates": schedule_templates,
             "help": help_document,
             "agent_workspace": agent_workspace,
             "force": args.force,
+            "history": history,
         }
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
@@ -906,14 +1013,14 @@ def _main_init(argv: list[str]) -> int:
             f"{len(payload['runtime_directories']['skipped_outside_workspace'])}"
         )
         print(
-            "[smoking-data] examples: "
-            f"created={len(payload['examples']['created'])} "
-            f"preserved={len(payload['examples']['preserved'])}"
+            "[smoking-data] templates: "
+            f"created={len(payload['templates']['created'])} "
+            f"preserved={len(payload['templates']['preserved'])}"
         )
         print(
-            "[smoking-data] schedule examples: "
-            f"created={len(payload['schedule_examples']['created'])} "
-            f"preserved={len(payload['schedule_examples']['preserved'])}"
+            "[smoking-data] schedule templates: "
+            f"created={len(payload['schedule_templates']['created'])} "
+            f"preserved={len(payload['schedule_templates']['preserved'])}"
         )
         print(f"[smoking-data] help: {payload['help']['help_path']}")
         print(
@@ -1557,7 +1664,9 @@ def _main_smoke_run(argv: list[str]) -> int:
         execution = payload.setdefault("execution", {})
         if not isinstance(execution, dict):
             raise ValueError("execution must be an object.")
-        execution["test_run"] = {"final_task_limit": args.tasks}
+        execution["test_run"] = {
+            "final_task_limit": 1 if _is_template_definition(source_path) else args.tasks
+        }
         smoke_dir = output_root / "_definitions"
         smoke_dir.mkdir(parents=True, exist_ok=True)
         smoke_path = smoke_dir / f"smoke_{source_path.name}"
@@ -1585,6 +1694,12 @@ def _main_smoke_run(argv: list[str]) -> int:
         else:
             print(f"[smoking-data] smoke failed: {payload['error_message']}")
         return 1
+
+
+def _is_template_definition(path: Path) -> bool:
+    """Template Definitions are validation inputs and are limited to one task."""
+    parts = {part.casefold() for part in path.parts}
+    return "template" in parts or "templates" in parts or "template" in path.stem.casefold()
 
 
 def _apply_smoke_output_root(payload: dict[str, Any], root: Path) -> None:

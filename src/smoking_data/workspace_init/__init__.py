@@ -1,17 +1,20 @@
 from .agent_initializer import initialize_agent_workspace
 from .asset_config_initializer import initialize_asset_configs
 from .directory_initializer import initialize_runtime_directories
-from .example_initializer import initialize_workspace_examples
 from .help_initializer import initialize_help
+from .history import backup_init_outputs, backup_paths
 from .initializer import initialize_workspace
-from .schedule_initializer import initialize_schedule_examples
+from .schedule_initializer import initialize_schedule_templates
+from .template_initializer import initialize_workspace_templates
 
 __all__ = [
     "initialize_asset_configs",
     "initialize_agent_workspace",
     "initialize_runtime_directories",
-    "initialize_workspace_examples",
+    "initialize_workspace_templates",
+    "backup_init_outputs",
+    "backup_paths",
     "initialize_help",
     "initialize_workspace",
-    "initialize_schedule_examples",
+    "initialize_schedule_templates",
 ]

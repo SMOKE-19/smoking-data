@@ -10,10 +10,10 @@ schedule:
 targets:
   - alias: source
     kind: asset
-    definition: ../examples/0101.source.0101.yaml
+    definition: ../templates/0101.source.0101.yaml
   - alias: curated
     kind: asset
-    definition: ../examples/0201.pipeline_curated_pivot.0201.yaml
+    definition: ../templates/0201.pipeline_curated_pivot.0201.yaml
 
 policy:
   misfire: catch_up_once

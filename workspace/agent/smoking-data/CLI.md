@@ -4,6 +4,19 @@
 다른 작업공간을 대상으로 할 때 `--project-root`를 지정한다. LLM이나 자동화에서는 가능한
 경우 `--json`을 사용하고, 결과 파일은 `for_agents/output/`에 저장한다.
 
+## 명령어 탐색 계약
+
+```bash
+smoking-data --help
+smoking-data migrate --help
+smoking-data migrate yaml --help
+```
+
+첫 번째 명령은 전체 top-level command를, 두 번째 명령은 migration 직속 명령을,
+세 번째 명령은 leaf command의 인자와 옵션을 보여준다. 새 CLI 기능을 추가할 때는
+dispatch, root/group/leaf help, 이 문서, 생성되는 `.smoking-data/HELP.md`와 테스트를
+동시에 갱신해야 한다. 구현 함수가 존재하는 것만으로 public CLI가 된 것으로 보지 않는다.
+
 ## 작업공간 초기화
 
 ```bash
@@ -11,12 +24,17 @@ smoking-data init [TARGET]
 smoking-data init [TARGET] --force
 ```
 
-`init`은 `.vscode`, `examples`, `schedules`, `.smoking-data`, `.agent`, `for_agents`의
-초기화 리소스를 생성한다. 이미 존재하는 사용자 파일은 기본적으로 보존한다.
+`init`은 `.vscode`, `templates`, `schedules`, `.smoking-data`, `.agent`, `for_agents`의
+초기화 리소스를 생성한다.
 
-`--force`는 init이 관리하는 examples, schedules, Asset config, HELP.md, agent guidance를
-현재 패키지 버전으로 교체한다. 작업공간의 runtime data, object-store 설정, `AGENTS.md`,
-`.agent/local/CONTEXT.md`, 사용자 정의 스케줄·스크립트는 삭제하지 않는다.
+`--force`는 기본값이 아니다. 지정하면 init이 관리하는 templates, schedules, Asset config,
+HELP.md, agent guidance를 현재 패키지 버전으로 갱신한다. 작업공간의
+runtime data, object-store 설정, `AGENTS.md`, `.agent/local/CONTEXT.md`, 사용자 정의
+스케줄·스크립트는 삭제하지 않는다.
+
+강제 갱신 전에는 기존 init 관리 생성물 전체를 `.history/YYMMDD_HHMMSS/` 아래에 압축 없이
+백업한다. 동일 초에 충돌하면 `_02`, `_03` 접미사를 붙인다. `DATA`와 `.temp` 운영 데이터는
+백업하지 않는다.
 
 ## 실행·검증
 
@@ -33,7 +51,7 @@ smoking-data chain run CHAIN.yaml [--config CONFIG] [--project-root ROOT] [--jso
 
 - `source`: 0101 Source YAML을 실행한다.
 - `run`: Asset Definition 또는 Chain을 파일 확장자에 따라 실행한다.
-- `smoke run`: 0101·0201·0301·0401 Definition을 지정 task 수만 실행하고 isolated output에 기록한다.
+- `smoke run`: 0101·0201·0301·0401 Definition을 지정 task 수만 실행하고 isolated output에 기록한다. `templates/` 아래 또는 파일명에 `template`이 포함된 Definition은 요청값과 관계없이 1 task만 실행한다.
 - `migrate chain verify`: Chain 내부 YAML을 변환하지 않고 각 YAML을 validate한 뒤 task 1개씩 smoke 실행한다.
 - `migrate chain run`: 0101을 제외한 0201·0301·0401을 task 1개 smoke 실행하고, 결과 Parquet로 `migration/*.0201.yaml`을 생성한 뒤 0201 migration도 task 1개 smoke 실행한다.
 - `validate`: 실행 없이 0101~0401 Asset 또는 Chain 계약을 검증한다.

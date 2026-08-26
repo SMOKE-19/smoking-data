@@ -8,7 +8,7 @@ from smoking_data.runtime.config import load_config
 from .template_resources import copy_template_tree
 
 
-def initialize_schedule_examples(target: str | Path, *, force: bool = False) -> dict[str, Any]:
+def initialize_schedule_templates(target: str | Path, *, force: bool = False) -> dict[str, Any]:
     """Create the managed schedule starter without overwriting user files."""
     workspace_root = Path(target).expanduser().resolve()
     schedule_root = load_config(project_root=workspace_root).schedule_root.resolve()

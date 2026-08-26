@@ -10,13 +10,13 @@ schedule:
 targets:
   - alias: curated
     kind: asset
-    definition: ../examples/0201.pipeline_curated_pivot.0201.yaml
+    definition: ../templates/0201.pipeline_curated_pivot.0201.yaml
   - alias: joined
     kind: asset
-    definition: ../examples/0301.pipeline_multi_right_join.0301.yaml
+    definition: ../templates/0301.pipeline_multi_right_join.0301.yaml
   - alias: snapshot
     kind: asset
-    definition: ../examples/0401.pipeline_analysis_snapshot.0401.yaml
+    definition: ../templates/0401.pipeline_analysis_snapshot.0401.yaml
 
 policy:
   misfire: catch_up_once

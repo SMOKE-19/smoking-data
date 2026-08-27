@@ -412,6 +412,11 @@ def _convert_legacy_source(
         changes=changes,
         warnings=warnings,
     )
+    _normalize_legacy_source_filters(
+        converted_request,
+        changes=changes,
+        warnings=warnings,
+    )
     job = _normalize_legacy_source_job(legacy_job, changes, warnings)
 
     spi_options = converted_request.pop("spi", None)
@@ -424,6 +429,7 @@ def _convert_legacy_source(
         changes.append(_change("source.api_request.spi", "source.api_request.adapter_options"))
     converted_request.setdefault("adapter", "spi")
     changes.append(_change("implicit legacy source adapter", "source.api_request.adapter"))
+    _order_legacy_source_fields(converted_source, converted_request)
     converted_source["api_request"] = converted_request
 
     output = _convert_output(legacy_output, changes, warnings)
@@ -439,6 +445,137 @@ def _convert_legacy_source(
         "output": output,
     }
     return converted, changes, warnings
+
+
+def _order_legacy_source_fields(
+    source: dict[str, Any],
+    request: dict[str, Any],
+) -> None:
+    """Arrange migrated 0101 fields in the current authoring order."""
+
+    _reorder_mapping(source, ("table_id", "api_request"))
+    _reorder_mapping(
+        request,
+        ("query_mode", "adapter", "adapter_options", "payload", "sql_file_path", "date_window", "http"),
+    )
+    payload = request.get("payload")
+    if isinstance(payload, dict):
+        _reorder_mapping(payload, ("select", "filters"))
+        filters = payload.get("filters")
+        if isinstance(filters, dict):
+            _reorder_mapping(filters, ("common", "sub_job"))
+            sub_jobs = filters.get("sub_job")
+            if isinstance(sub_jobs, list):
+                for item in sub_jobs:
+                    if isinstance(item, dict):
+                        _reorder_mapping(item, ("sub_job_name", "sub_job_filtering"))
+    date_window = request.get("date_window")
+    if isinstance(date_window, dict):
+        _reorder_mapping(date_window, ("column", "step", "date_window"))
+
+
+def _reorder_mapping(mapping: dict[str, Any], preferred_keys: tuple[str, ...]) -> None:
+    """Move known keys to a stable order while retaining unknown keys at the end."""
+
+    ordered: dict[str, Any] = {
+        key: mapping[key] for key in preferred_keys if key in mapping
+    }
+    ordered.update({key: value for key, value in mapping.items() if key not in ordered})
+    mapping.clear()
+    mapping.update(ordered)
+
+
+def _normalize_legacy_source_filters(
+    request: dict[str, Any],
+    *,
+    changes: list[dict[str, str]],
+    warnings: list[str],
+) -> None:
+    """Translate the permissive legacy filter aliases to the v4 Source shape."""
+
+    payload = request.get("payload")
+    if not isinstance(payload, dict) or "filters" not in payload:
+        return
+
+    raw = payload.get("filters")
+    if raw is None:
+        payload["filters"] = {"common": [], "sub_job": []}
+        changes.append(_change("source.api_request.payload.filters: null", "filters.common/sub_job"))
+        warnings.append("legacy 0101 filters의 null 값을 빈 canonical filter 블록으로 변환했습니다.")
+        return
+
+    if isinstance(raw, list):
+        payload["filters"] = {"common": [str(item) for item in raw], "sub_job": []}
+        changes.append(_change("source.api_request.payload.filters (list)", "filters.common"))
+        warnings.append("legacy 0101 filters list를 filters.common 목록으로 변환했습니다.")
+        return
+
+    if not isinstance(raw, dict):
+        raise ValueError("legacy source.api_request.payload.filters는 list 또는 object여야 합니다.")
+
+    unknown = sorted(set(raw) - {"common", "sub_job", "sub_jobs"})
+    if unknown:
+        raise ValueError(f"legacy source.api_request.payload.filters의 알 수 없는 키입니다: {unknown}")
+    if "sub_job" in raw and "sub_jobs" in raw:
+        raise ValueError(
+            "legacy source.api_request.payload.filters에 sub_job과 sub_jobs를 동시에 사용할 수 없습니다."
+        )
+
+    common = raw.get("common", [])
+    if common is None:
+        common_filters: list[str] = []
+    elif isinstance(common, str):
+        common_filters = [common]
+    elif isinstance(common, list):
+        common_filters = [str(item) for item in common]
+    else:
+        raise ValueError("legacy source.api_request.payload.filters.common은 str 또는 list여야 합니다.")
+
+    raw_sub_jobs = raw.get("sub_job", raw.get("sub_jobs"))
+    if raw_sub_jobs is None:
+        sub_job_items: list[Any] = []
+    elif isinstance(raw_sub_jobs, dict):
+        sub_job_items = [raw_sub_jobs]
+    elif isinstance(raw_sub_jobs, list):
+        sub_job_items = raw_sub_jobs
+    else:
+        raise ValueError("legacy source.api_request.payload.filters.sub_job은 dict 또는 list여야 합니다.")
+
+    sub_jobs: list[dict[str, Any]] = []
+    used_alias = "sub_jobs" in raw
+    for index, item in enumerate(sub_job_items, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"legacy filters.sub_job[{index}]은 object여야 합니다.")
+        name = item.get("sub_job_name", item.get("name"))
+        if not str(name or "").strip():
+            raise ValueError(f"legacy filters.sub_job[{index}].sub_job_name 값이 필요합니다.")
+        raw_filter_values = item.get("sub_job_filtering", item.get("filters", []))
+        if raw_filter_values is None:
+            filter_values: list[str] = []
+        elif isinstance(raw_filter_values, str):
+            filter_values = [raw_filter_values]
+        elif isinstance(raw_filter_values, list):
+            filter_values = [str(value) for value in raw_filter_values]
+        else:
+            raise ValueError(
+                f"legacy filters.sub_job[{index}].sub_job_filtering은 str 또는 list여야 합니다."
+            )
+        sub_jobs.append(
+            {
+                "sub_job_name": str(name).strip(),
+                "sub_job_filtering": filter_values,
+            }
+        )
+
+    canonical = {"common": common_filters, "sub_job": sub_jobs}
+    if raw != canonical:
+        payload["filters"] = canonical
+        changes.append(_change("source.api_request.payload.filters (legacy aliases)", "filters.common/sub_job"))
+        warnings.append("legacy 0101 filters alias를 현재 canonical 형태로 정규화했습니다.")
+    elif used_alias:
+        payload["filters"] = canonical
+        changes.append(_change("source.api_request.payload.filters.sub_jobs", "filters.sub_job"))
+        warnings.append("legacy 0101 filters.sub_jobs를 filters.sub_job으로 정규화했습니다.")
 
 
 def _normalize_legacy_source_job(

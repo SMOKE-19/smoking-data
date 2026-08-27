@@ -35,6 +35,16 @@ def call_data_api(
         task=task,
         writer_options=dict(task.parquet_writer_options or {}),
     )
-    if not output_file.is_file():
-        raise RuntimeError(f"SOURCE adapter did not create the declared parquet file: {output_file}")
-    return [(str(output_file), pq.ParquetFile(output_file).metadata.num_rows)]
+    # SPI decorators may emit one or more parts (for example,
+    # ``part1-<filename>.parquet``) instead of using the requested name verbatim.
+    # The staging orchestrator normalizes all reported parts before publication.
+    parquet_parts = sorted(resolved_output_dir.glob("*.parquet"))
+    if not parquet_parts:
+        raise RuntimeError(
+            f"SOURCE adapter did not create a parquet part in the staging directory: "
+            f"{resolved_output_dir}"
+        )
+    return [
+        (str(part), pq.ParquetFile(part).metadata.num_rows)
+        for part in parquet_parts
+    ]

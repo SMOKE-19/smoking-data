@@ -30,7 +30,8 @@ from .sections import (
     require_str,
 )
 
-SOURCE_SCHEMA_VERSION = "smoking-data.source.v4"
+LEGACY_SOURCE_SCHEMA_VERSION = "smoking-data.source.v4"
+SOURCE_SCHEMA_VERSION = "smoking-data.source.v5"
 SOURCE_EXECUTION_KEYS = {
     "reset_before_run",
     "write_source_profile_json",
@@ -96,7 +97,7 @@ def load_source_spec(path: str | Path) -> SourceSpec:
         )
 
         return SourceSpec(
-            schema_version=SOURCE_SCHEMA_VERSION,
+                schema_version=str(merged["yaml"]["schema_version"]),
             path=yaml_path,
             project=project,
             raw=merged,
@@ -405,9 +406,9 @@ def _reject_unknown_keys(
 def _validate_asset_contract(raw: dict[str, object]) -> None:
     yaml_header = _mapping(raw.get("yaml"), path="yaml")
     schema_version = str(yaml_header.get("schema_version") or "").strip()
-    if schema_version != SOURCE_SCHEMA_VERSION:
+    if schema_version not in {LEGACY_SOURCE_SCHEMA_VERSION, SOURCE_SCHEMA_VERSION}:
         raise ValueError(
-            f"schema_version은 {SOURCE_SCHEMA_VERSION!r}이어야 합니다: "
+            f"schema_version은 {SOURCE_SCHEMA_VERSION!r} 또는 {LEGACY_SOURCE_SCHEMA_VERSION!r}이어야 합니다: "
             f"{schema_version or '<missing>'!r}"
         )
     asset_code = str(yaml_header.get("asset_code") or "").strip()

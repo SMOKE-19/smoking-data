@@ -9,7 +9,8 @@ from typing import Any
 import pyarrow.parquet as pq
 import yaml
 
-CURRENT_SOURCE_SCHEMA = "smoking-data.source.v4"
+LEGACY_SOURCE_SCHEMA = "smoking-data.source.v4"
+CURRENT_SOURCE_SCHEMA = "smoking-data.source.v5"
 CURRENT_PIPELINE_SCHEMA = "smoking-data.pipeline.v6"
 CURRENT_CURATED_SCHEMA = "smoking-data.pipeline.v7"
 CURRENT_CHAIN_SCHEMA = "smoking-data.asset-chain.v2"
@@ -42,8 +43,8 @@ def migrate_definition_yaml(
     if not isinstance(payload, dict):
         raise ValueError("Legacy YAML root must be an object.")
 
-    if _is_current_source(payload):
-        if _needs_source_normalization(payload):
+    if _source_schema(payload) in {LEGACY_SOURCE_SCHEMA, CURRENT_SOURCE_SCHEMA}:
+        if _source_schema(payload) != CURRENT_SOURCE_SCHEMA or _needs_source_normalization(payload):
             converted, changes, warnings = _normalize_current_source(payload)
         else:
             converted = deepcopy(payload)
@@ -407,7 +408,10 @@ def _convert_legacy_chain(payload: dict[str, Any]) -> tuple[dict[str, Any], list
 
 def _is_current_source(payload: dict[str, Any]) -> bool:
     header = payload.get("yaml")
-    return isinstance(header, dict) and header.get("schema_version") == CURRENT_SOURCE_SCHEMA
+    return isinstance(header, dict) and header.get("schema_version") in {
+        LEGACY_SOURCE_SCHEMA,
+        CURRENT_SOURCE_SCHEMA,
+    }
 
 
 def _needs_source_normalization(payload: dict[str, Any]) -> bool:
@@ -441,8 +445,11 @@ def _normalize_current_source(
     request = _required_mapping(source, "api_request")
     changes: list[dict[str, str]] = []
     warnings = [
-        "source.v4 스키마 버전은 현재이지만 내부 필드가 구형 레이아웃이어서 canonical 구조로 정규화했습니다."
+        "0101 Source YAML을 source.v5 canonical 구조로 정규화했습니다."
     ]
+    converted.setdefault("yaml", {})["schema_version"] = CURRENT_SOURCE_SCHEMA
+    if _source_schema(payload) != CURRENT_SOURCE_SCHEMA:
+        changes.append(_change(LEGACY_SOURCE_SCHEMA, CURRENT_SOURCE_SCHEMA))
 
     source_table_id = source.pop("table_id", None)
     sql = request.get("sql")

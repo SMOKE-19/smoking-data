@@ -5,7 +5,7 @@
     "description": "0101 Source Definition 골격",
     "body": [
       "yaml:",
-      "  schema_version: smoking-data.source.v4",
+      "  schema_version: smoking-data.source.v5",
       "  asset_code: \"0101\"",
       "job:",
       "  name: ${1:source_job}",
@@ -38,7 +38,7 @@
     "description": "0101.source.0101.yaml Slim 예시",
     "body": [
       "yaml:",
-      "  schema_version: smoking-data.source.v4",
+      "  schema_version: smoking-data.source.v5",
       "  asset_code: '0101'",
       "job:",
       "  name: source_0101_passthrough_structured",
@@ -81,7 +81,7 @@
     "description": "0101.source.0101.yaml 전체 예시",
     "body": [
       "yaml:",
-      "  schema_version: smoking-data.source.v4",
+      "  schema_version: smoking-data.source.v5",
       "  asset_code: \"0101\"",
       "",
       "job:",

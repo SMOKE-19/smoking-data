@@ -2266,7 +2266,7 @@ def _main_validate(argv: list[str]) -> int:
             payload = {
                 "ok": True,
                 "kind": "asset",
-                "schema_version": "smoking-data.source.v4",
+                "schema_version": "smoking-data.source.v5",
                 "asset_code": "0101",
                 "job_name": spec.job.name,
             }

@@ -131,7 +131,7 @@ def validate_definition(
                 ok=True,
                 definition_path=path,
                 kind="asset",
-                schema_version="smoking-data.source.v4",
+                schema_version=spec.schema_version,
                 asset_code=asset_code,
                 job_name=spec.job.name,
                 yaml_sha256=yaml_sha256,

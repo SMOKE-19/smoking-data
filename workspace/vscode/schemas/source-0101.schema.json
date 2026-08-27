@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "smoking-data.source.v4",
-  "title": "Smoking Data Source 0101 v4",
+  "$id": "smoking-data.source.v5",
+  "title": "Smoking Data Source 0101 v5",
   "type": "object",
   "additionalProperties": false,
   "required": ["yaml", "job", "source", "output"],
@@ -12,7 +12,7 @@
       "additionalProperties": false,
       "required": ["schema_version", "asset_code"],
       "properties": {
-        "schema_version": {"const": "smoking-data.source.v4", "description": "0101 Source YAML 공개 계약 버전"},
+        "schema_version": {"const": "smoking-data.source.v5", "description": "0101 Source YAML 공개 계약 버전"},
         "asset_code": {"const": "0101", "description": "Source Asset 코드"}
       }
     },

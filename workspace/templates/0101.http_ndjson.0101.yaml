@@ -1,5 +1,5 @@
 yaml:
-  schema_version: smoking-data.source.v4
+  schema_version: smoking-data.source.v5
   asset_code: "0101"
 job:
   name: public_api_ndjson

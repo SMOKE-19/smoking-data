@@ -10,12 +10,23 @@
 smoking-data --help
 smoking-data migrate --help
 smoking-data migrate yaml --help
+smoking-data update templates --help
 ```
 
 첫 번째 명령은 전체 top-level command를, 두 번째 명령은 migration 직속 명령을,
 세 번째 명령은 leaf command의 인자와 옵션을 보여준다. 새 CLI 기능을 추가할 때는
 dispatch, root/group/leaf help, 이 문서, 생성되는 `.smoking-data/HELP.md`와 테스트를
 동시에 갱신해야 한다. 구현 함수가 존재하는 것만으로 public CLI가 된 것으로 보지 않는다.
+
+템플릿만 패키지 최신 상태로 갱신하려면 다음을 사용한다.
+
+```bash
+smoking-data update templates [TARGET] [--json]
+```
+
+기존 `TARGET/templates/`는 갱신 전에 `TARGET/.history/YYMMDD_HHMMSS/templates/`에
+압축 없이 백업한다. `.smoking-data`, schedules, `.agent`, `for_agents` 등 다른 init
+생성물은 변경하지 않는다.
 
 ## 작업공간 초기화
 

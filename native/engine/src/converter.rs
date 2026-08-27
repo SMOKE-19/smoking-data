@@ -136,6 +136,8 @@ struct WriterConfig {
     pivot: Option<PivotConfig>,
     output_row_group_rows: Option<usize>,
     #[serde(default)]
+    pre_pivot_operations: Vec<PostOperation>,
+    #[serde(default)]
     post_operations: Vec<PostOperation>,
     #[serde(default)]
     ordered_operations: Vec<OrderedOperation>,
@@ -2121,6 +2123,12 @@ fn execute_and_project_writer_batch(
         })?,
         None => batch,
     };
+    let batch =
+        execute_post_operations(batch, &writer_config.pre_pivot_operations).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to execute pre-pivot operations for {context}: {error}"
+            ))
+        })?;
     if let Some(config) = &writer_config.long_fact {
         let metadata = config
             .calculated_columns
@@ -2236,6 +2244,7 @@ pub fn execute_curated_task_impl(
             long_fact: None,
             pivot: None,
             output_row_group_rows: None,
+            pre_pivot_operations: Vec::new(),
             post_operations: Vec::new(),
             ordered_operations: Vec::new(),
             compression: None,

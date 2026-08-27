@@ -115,7 +115,7 @@
         "missing_policy": {"type": "string"},
         "duplicate_policy": {"type": "string"},
         "lookup_path": {"type": "string"},
-        "schema": {"type": "object"},
+        "schema": {"oneOf": [{"type": "object"}, {"const": "auto"}]},
         "config": {"type": "object"},
         "batch_size": {"type": "integer", "minimum": 1},
         "drop_cache_hint": {"type": "boolean"},

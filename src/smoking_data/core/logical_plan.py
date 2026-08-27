@@ -195,6 +195,9 @@ def compile_0201_logical_plan(
 
     if bool(list_restore.get("enabled", False)):
         config = _mapping(list_restore.get("config"), path="list_restore.config")
+        restore_schema = list_restore.get("schema")
+        if not isinstance(restore_schema, dict):
+            restore_schema = {}
         value_columns = tuple(str(item) for item in config.get("value_columns") or [])
         coord_columns = tuple(str(item) for item in config.get("source_coord_columns") or [])
         key_column = str(config.get("key_column") or "")
@@ -206,7 +209,7 @@ def compile_0201_logical_plan(
                 input_columns=tuple(dict.fromkeys([key_column, *value_columns, *coord_columns])),
                 output_columns=tuple(
                     ColumnContract(
-                        name, dtype=(list_restore.get("schema") or {}).get(name), nullable=True
+                        name, dtype=restore_schema.get(name), nullable=True
                     )
                     for name in (*value_columns, *coord_columns)
                 ),
@@ -661,6 +664,7 @@ def _validate_0201_yaml_shape(raw: dict[str, Any]) -> None:
             "reference_replace",
             "include_columns",
             "exclude_columns",
+            "pre_pivot_operations",
             "post_operations",
             "final_post_projection",
             "dataset_assertions",

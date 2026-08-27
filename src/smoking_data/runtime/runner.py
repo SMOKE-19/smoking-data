@@ -632,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
         ["publication"],
         ["pwq"],
         ["inspect"],
+        ["update"],
     ]:
         if len(argv) == 1 or argv[1:2] in [["-h"], ["--help"]]:
             _print_cli_help(argv[0])
@@ -650,6 +651,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_compare(argv[1:])
     if argv and argv[0] == "fixture":
         return _main_fixture(argv[1:])
+    if argv[:2] == ["update", "templates"]:
+        return _main_update_templates(argv[2:])
     if argv and argv[0] == "parquet-schema":
         return _main_parquet_schema(argv[1:])
     if argv[:2] == ["pwq", "advise"]:
@@ -875,6 +878,7 @@ _CLI_COMMANDS: dict[str, tuple[str, ...]] = {
     "schedule": ("Validate or tick schedules",),
     "inspect": ("Inspect datasets and metadata",),
     "pwq": ("Advise or benchmark pipeline write quality",),
+    "update": ("Update initialized workspace resources",),
 }
 
 _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
@@ -902,6 +906,7 @@ _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
         "pwq advise PIPELINE.yaml",
         "pwq benchmark-dummy --root ROOT",
     ),
+    "update": ("update templates [TARGET] [--json]",),
     "inspect": (
         "inspect dataset PATH",
         "inspect failure PATH",
@@ -930,6 +935,49 @@ def _print_cli_help(group: str | None = None) -> None:
 def _looks_like_definition_path(value: str) -> bool:
     path = Path(value).expanduser()
     return path.exists() or path.suffix.casefold() in {".yaml", ".yml"}
+
+
+def _main_update_templates(argv: list[str]) -> int:
+    from smoking_data.workspace_init import backup_paths, initialize_workspace_templates
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Update workspace templates from the installed smoking-data package. "
+            "Existing templates are backed up before replacement."
+        )
+    )
+    parser.add_argument("target", nargs="?", default=".", help="Workspace root.")
+    parser.add_argument("--json", action="store_true", help="Print a JSON result.")
+    args = parser.parse_args(argv)
+    try:
+        history = backup_paths(args.target, names=("templates",))
+        templates = initialize_workspace_templates(args.target, force=True)
+        payload = {
+            "ok": True,
+            "command": "update templates",
+            "workspace_root": str(Path(args.target).expanduser().resolve()),
+            "templates": templates,
+            "history": history,
+        }
+    except (OSError, TypeError, ValueError) as exc:
+        payload = {
+            "ok": False,
+            "command": "update templates",
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload["ok"]:
+        print(
+            "[smoking-data] templates updated: "
+            f"created={len(payload['templates']['created'])} "
+            f"replaced={len(payload['templates']['preserved'])} "
+            f"history={payload['history']['history_root']}"
+        )
+    else:
+        print(f"[smoking-data] template update failed: {payload['error']}")
+    return 0 if payload["ok"] else 1
 
 
 def _main_init(argv: list[str]) -> int:

@@ -8,6 +8,7 @@
 smoking-data --help
 smoking-data migrate --help
 smoking-data migrate yaml --help
+smoking-data update templates --help
 ```
 
 `migrate yaml`은 입력 `yaml.schema_version`을 확인한다. `smoking-data.source.v4` 또는
@@ -19,6 +20,10 @@ YAML이라도 `source.table_id`, `api_request.payload`, 구형 `api_request.date
 root help는 전체 top-level command를, group help는 직속 subcommand를, leaf help는
 해당 명령의 인자와 옵션을 보여준다. 새 CLI 기능은 dispatch, help, 이 문서와 테스트를
 함께 갱신해야 한다.
+
+`smoking-data update templates [TARGET]`은 지정 작업공간의 `templates/`만 설치된
+패키지 버전으로 갱신한다. 기존 템플릿은 `.history/YYMMDD_HHMMSS/templates/`에
+압축 없이 백업하며 다른 init 생성물은 변경하지 않는다.
 
 ## 처음 설정
 

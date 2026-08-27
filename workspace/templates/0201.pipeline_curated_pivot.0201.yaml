@@ -88,11 +88,6 @@ materialize:
   workers: 1
   max_tasks_per_child: 1
   operations:
-  - op: type_cast
-    alias: cast_amount
-    columns:
-    - name: amount
-      type: INT64
   - op: add_calc
     alias: calculate_payload
     expressions:
@@ -100,16 +95,49 @@ materialize:
       sql: amount * 2
     - name: amount_label
       spotfire_expression: 'String([amount]) & "_units"'
-  - op: include_columns
-    alias: select_output_payload
+  - op: rename_columns
+    alias: rename_payload
+    mapping:
+      amount_x2: amount_double
+  # 외부 Parquet lookup으로 값만 치환하려면 다음 operation을 사용한다.
+  # 칼럼명 자체를 바꾸는 경우에는 위 rename_columns를 사용한다.
+  # - op: reference_replace
+  #   alias: replace_category
+  #   source_column: category
+  #   reference_parquet: resources/category_map.parquet
+  #   reference_input_column: old_value
+  #   reference_output_column: new_value
+  # 선택 사항: lookup 기반 리스트 복원은 materialize task 안에서 가장 먼저 실행한다.
+  # 실제 lookup 파일과 컬럼 계약에 맞게 수정한 뒤 주석을 해제한다.
+  # - op: list_restore
+  #   alias: restore_lists
+  #   lookup_path: DATA/reference/list_lookup.parquet
+  #   schema: auto
+  #   # 타입을 고정해야 하는 경우에만 아래처럼 명시 스키마를 사용한다.
+  #   # schema: {restored_value: DOUBLE[], restored_order: INTEGER[]}
+  #   config:
+  #     key_column: row_key
+  #     order_column: restored_order
+  #     value_columns: [restored_value]
+  #     source_coord_columns: [partition]
+  #     lookup_coord_columns: [partition]
+  # JSON 배열 문자열도 대상 타입에 맞춰 Arrow List 칼럼으로 복원한다.
+  # 예: '["0.005", "0.001", "0.009"]' + DOUBLE[] -> List<Float64>
+  - op: type_cast
+    alias: cast_amount
     columns:
-    - partition
-    - row_key
-    - updated_at
-    - metric
-    - amount
-    - amount.x2
-    - amount_label
+    - name: amount
+      type: INT64
+  # - op: include_columns
+  #   alias: select_output_payload
+  #   columns:
+  #   - partition
+  #   - row_key
+  #   - updated_at
+  #   - metric
+  #   - amount
+  #   - amount.x2
+  #   - amount_label
   - op: pivot
     alias: pivot_metrics
     row_keys: [partition, row_key]

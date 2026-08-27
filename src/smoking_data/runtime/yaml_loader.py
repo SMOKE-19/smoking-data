@@ -391,6 +391,15 @@ def _compile_pipeline_expression_irs(operations: Any) -> dict[str, dict[str, Any
                 )
             name = str(expression.get("name") or "").strip()
             column = str(expression.get("column") or "").strip()
+            if operation_kind == "active_row_selection" and not column:
+                has_expression = any(
+                    str(expression.get(key) or "").strip()
+                    for key in ("sql", "spotfire_expression")
+                )
+                if not has_expression and name:
+                    # The public shorthand `{name: key}` means the input
+                    # column named `key`; it is not an expression to compile.
+                    continue
             if operation_kind == "active_row_selection" and column:
                 if any(
                     str(expression.get(key) or "").strip() for key in ("sql", "spotfire_expression")

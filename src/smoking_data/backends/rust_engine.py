@@ -51,6 +51,7 @@ class CuratedTaskRequest:
     restore_config: dict[str, Any] | None = None
     reference_replace: list[dict[str, Any]] | None = None
     pivot: dict[str, Any] | None = None
+    pre_pivot_operations: list[dict[str, Any]] | None = None
     post_operations: list[dict[str, Any]] | None = None
     ordered_operations: list[dict[str, str]] | None = None
     compression: str = "zstd"
@@ -137,6 +138,7 @@ def execute_curated_task(request: CuratedTaskRequest) -> dict[str, float]:
             "partition_columns": request.partition_columns or [],
             "reference_replace": request.reference_replace or None,
             "pivot": request.pivot or None,
+            "pre_pivot_operations": request.pre_pivot_operations or [],
             "post_operations": request.post_operations or [],
             "ordered_operations": request.ordered_operations or [],
             "compression": request.compression,

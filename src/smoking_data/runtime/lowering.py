@@ -154,6 +154,7 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
     selector_payload: dict[str, Any] = {}
     list_restore: dict[str, Any] = {}
     pivot: dict[str, Any] = {}
+    pre_pivot_operations: list[dict[str, Any]] = []
     post_operations: list[dict[str, Any]] = []
     dataset_assertions: list[dict[str, Any]] = []
     pivot_index = next(
@@ -215,7 +216,25 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
             pivot = {"enabled": True, **operation.config}
         elif operation.kind is OperationKind.DATA_ASSERTION:
             dataset_assertions.append(operation.config)
-        elif operation.kind in {OperationKind.RENAME_COLUMNS, OperationKind.UNPIVOT}:
+        elif operation.kind is OperationKind.RENAME_COLUMNS:
+            lowered = {
+                "operation_id": operation.operation_id,
+                "kind": operation.kind.value,
+                "config": operation.config,
+            }
+            mapping = dict(operation.config.get("resolved_mapping") or {})
+            later_boundary = pivot_index if pivot_index is not None else len(operations)
+            later_operations = operations[index + 1 : later_boundary + 1]
+            consumed_before_boundary = any(
+                target in _operation_references(later)
+                for target in mapping.values()
+                for later in later_operations
+            )
+            if consumed_before_boundary:
+                pre_pivot_operations.append(lowered)
+            else:
+                post_operations.append(lowered)
+        elif operation.kind is OperationKind.UNPIVOT:
             post_operations.append(
                 {
                     "operation_id": operation.operation_id,
@@ -226,6 +245,8 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
     if post_operations:
         payload["post_operations"] = post_operations
         payload["final_post_projection"] = True
+    if pre_pivot_operations:
+        payload["pre_pivot_operations"] = pre_pivot_operations
     if dataset_assertions:
         payload["dataset_assertions"] = dataset_assertions
     partition_by = list(write.config["partition_by"])
@@ -274,6 +295,17 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
             ),
         },
     }
+
+
+def _operation_references(operation: Any) -> set[str]:
+    """Return logical columns consumed by an operation."""
+    references = {
+        *getattr(operation, "input_columns", ()),
+        *getattr(operation, "group_keys", ()),
+        *getattr(operation, "partition_keys", ()),
+        *(column for column, _ in getattr(operation, "ordering", ())),
+    }
+    return {str(value) for value in references if str(value)}
 
 
 def _infer_curated_writer_output_columns(spec: PipelineSpec) -> list[str]:

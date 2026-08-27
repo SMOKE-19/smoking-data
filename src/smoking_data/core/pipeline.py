@@ -655,6 +655,12 @@ def _compile_operation(
                 for key in ("column", "sql", "spotfire_expression")
                 if str(item.get(key) or "").strip()
             }
+            # A group key that only declares its logical name refers to the
+            # input column with the same name.  Keep the expanded form in the
+            # canonical plan so downstream lineage and execution do not need
+            # to distinguish the shorthand.
+            if not sources:
+                sources = {"column": name}
             if len(sources) != 1:
                 raise ValidationError(
                     "active_row_selection group key requires exactly one of column, sql or spotfire_expression.",
@@ -1062,7 +1068,12 @@ def _compile_operation(
             path=path,
         )
         _required_string(config.get("lookup_path"), path=f"{path}.lookup_path")
-        schema = _mapping(config.get("schema"), path=f"{path}.schema")
+        raw_schema = config.get("schema")
+        schema_auto = isinstance(raw_schema, str) and raw_schema.strip().lower() == "auto"
+        if schema_auto:
+            schema: dict[str, Any] = {}
+        else:
+            schema = _mapping(raw_schema, path=f"{path}.schema")
         restore_config = _mapping(config.get("config"), path=f"{path}.config")
         _keys(
             restore_config,
@@ -1095,7 +1106,7 @@ def _compile_operation(
                 context={"path": path},
             )
         missing_schema = sorted(set([*value_columns, *source_coord]).difference(schema))
-        if missing_schema:
+        if missing_schema and not schema_auto:
             raise ValidationError(
                 "list_restore schema is missing restored columns.",
                 code="list_restore.schema_missing_columns",

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from smoking_data.backends.rust_engine import (
@@ -4327,6 +4328,7 @@ def _write_curated_part_rust_direct(
             )
     expression_ir = payload.get("expression_ir")
     post_operations = list(payload.get("post_operations") or [])
+    pre_pivot_operations = list(payload.get("pre_pivot_operations") or [])
     if bool(payload.get("final_post_projection", False)):
         pre_pivot_output_columns = []
     generated_columns = {
@@ -4334,13 +4336,25 @@ def _write_curated_part_rust_direct(
         for item in (payload.get("add_calc") or [])
         if isinstance(item, dict)
     }
+    restore_enabled = bool(list_restore.get("enabled", False))
+    resolved_lookup_path = (
+        resolve_project_path(str(list_restore["lookup_path"]), project_root=project_root)
+        if restore_enabled
+        else None
+    )
     schema = {
         str(item.get("name") or item.get("column")): _rust_schema_type(str(item["type"]))
         for item in (payload.get("type_casts") or [])
     }
-    schema.update(
-        {str(name): str(dtype) for name, dtype in (list_restore.get("schema") or {}).items()}
-    )
+    if restore_enabled:
+        schema.update(
+            _resolve_list_restore_schema(
+                list_restore,
+                coordinates=coordinates,
+                lookup_path=resolved_lookup_path,
+                source_stats=payload.get("source_stats"),
+            )
+        )
     reference_configs = payload.get("reference_replace") or []
     if isinstance(reference_configs, dict):
         reference_configs = [reference_configs]
@@ -4358,7 +4372,6 @@ def _write_curated_part_rust_direct(
         str(item.get("output_column") or item.get("source_column") or "")
         for item in resolved_reference_configs
     )
-    restore_enabled = bool(list_restore.get("enabled", False))
     restore_config = dict(list_restore.get("config") or {})
     restore_config["enabled"] = restore_enabled
     required_source_columns = {
@@ -4374,6 +4387,9 @@ def _write_curated_part_rust_direct(
     required_source_columns.update(
         _post_operation_source_columns(post_operations) - generated_columns
     )
+    required_source_columns.update(
+        _post_operation_source_columns(pre_pivot_operations) - generated_columns
+    )
     if restore_enabled:
         required_source_columns.update(
             [
@@ -4382,9 +4398,25 @@ def _write_curated_part_rust_direct(
                 *[str(item) for item in restore_config.get("source_coord_columns") or []],
             ]
         )
+    pre_rename_mapping: dict[str, str] = {}
+    for operation in pre_pivot_operations:
+        if str(operation.get("kind") or "") != "rename_columns":
+            continue
+        mapping = (operation.get("config") or {}).get("resolved_mapping") or {}
+        if isinstance(mapping, dict):
+            pre_rename_mapping.update(
+                {str(source): str(target) for source, target in mapping.items()}
+            )
+    for source_column, target_column in pre_rename_mapping.items():
+        if source_column in generated_columns:
+            required_source_columns.discard(target_column)
+        elif target_column in required_source_columns:
+            required_source_columns.discard(target_column)
+            required_source_columns.add(source_column)
     required_source_columns.discard("")
     projection_columns = [
-        {"name": column, "source": column} for column in sorted(required_source_columns)
+        {"name": pre_rename_mapping.get(column, column), "source": column}
+        for column in sorted(required_source_columns)
     ]
     rust_stats = execute_curated_task(
         CuratedTaskRequest(
@@ -4397,14 +4429,11 @@ def _write_curated_part_rust_direct(
             schema=schema,
             expression_ir=expression_ir,
             output_columns=pre_pivot_output_columns,
-            lookup_path=(
-                resolve_project_path(str(list_restore["lookup_path"]), project_root=project_root)
-                if restore_enabled
-                else None
-            ),
+            lookup_path=resolved_lookup_path,
             restore_config=restore_config,
             reference_replace=resolved_reference_configs,
             pivot=pivot if pivot_enabled else None,
+            pre_pivot_operations=pre_pivot_operations,
             post_operations=post_operations,
             ordered_operations=list(payload.get("ordered_operations") or []),
             compression=str(payload.get("compression") or "zstd"),
@@ -5247,6 +5276,156 @@ def _expression_ir_hash(document: dict[str, Any] | None) -> str | None:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _list_restore_rust_type(dtype: Any, *, column: str, source: str) -> str:
+    """Convert a scalar/list Arrow or Polars dtype to the Rust list contract."""
+    if isinstance(dtype, pl.List):
+        return _list_restore_rust_type(dtype.inner, column=column, source=source)
+    if dtype == pl.Float32:
+        return "FLOAT[]"
+    if dtype == pl.Float64 or isinstance(dtype, pl.Decimal):
+        return "DOUBLE[]"
+    if dtype in {
+        pl.Int8,
+        pl.Int16,
+        pl.Int32,
+        pl.Int64,
+        pl.UInt8,
+        pl.UInt16,
+        pl.UInt32,
+        pl.UInt64,
+    }:
+        return "INTEGER[]"
+    if dtype == pl.String:
+        return "TEXT[]"
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+        return _list_restore_rust_type(dtype.value_type, column=column, source=source)
+    if pa.types.is_float32(dtype):
+        return "FLOAT[]"
+    if pa.types.is_floating(dtype):
+        return "DOUBLE[]"
+    if pa.types.is_integer(dtype):
+        return "INTEGER[]"
+    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+        return "TEXT[]"
+    raise ValidationError(
+        f"list_restore schema auto cannot infer supported list type for {column}: {dtype!r}",
+        code="list_restore.schema_inference_unsupported_type",
+        context={"column": column, "source": source, "dtype": str(dtype)},
+    )
+
+
+def _infer_json_list_rust_type(
+    source_path: Path, *, column: str
+) -> str | None:
+    try:
+        values = pq.read_table(source_path, columns=[column]).column(0).to_pylist()
+    except Exception:
+        return None
+    for raw in values:
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            parsed = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(parsed, list):
+            continue
+        item = next((value for value in parsed if value is not None), None)
+        if item is None:
+            continue
+        if isinstance(item, bool):
+            return "TEXT[]"
+        if isinstance(item, int):
+            return "INTEGER[]"
+        if isinstance(item, float):
+            return "DOUBLE[]"
+        if isinstance(item, str):
+            return "TEXT[]"
+    return None
+
+
+def _resolve_list_restore_schema(
+    list_restore: dict[str, Any],
+    *,
+    coordinates: pl.DataFrame,
+    lookup_path: Path | None,
+    source_stats: Any = None,
+) -> dict[str, str]:
+    configured = list_restore.get("schema")
+    if isinstance(configured, dict):
+        return {str(name): _rust_schema_type(str(dtype)) for name, dtype in configured.items()}
+    if not isinstance(configured, str) or configured.strip().lower() != "auto":
+        raise ValidationError(
+            "list_restore.schema must be a mapping or 'auto'.",
+            code="list_restore.invalid_schema",
+            context={"value": configured},
+        )
+    if lookup_path is None:
+        raise ValidationError(
+            "list_restore.schema=auto requires lookup_path.",
+            code="list_restore.schema_inference_missing_lookup",
+        )
+    config = dict(list_restore.get("config") or {})
+    columns = [
+        str(item)
+        for item in [
+            *(config.get("value_columns") or []),
+            *(config.get("source_coord_columns") or []),
+        ]
+    ]
+    lookup_schema = pq.ParquetFile(lookup_path).schema_arrow
+    input_schema: pa.Schema | None = None
+    input_path: Path | None = None
+    if SOURCE_FILE_COLUMN in coordinates.columns:
+        source_values = coordinates.get_column(SOURCE_FILE_COLUMN).drop_nulls().unique().to_list()
+        if source_values:
+            source_path = Path(str(source_values[0]))
+            if source_path.exists():
+                input_path = source_path
+                input_schema = pq.ParquetFile(source_path).schema_arrow
+    if input_schema is None and isinstance(source_stats, dict):
+        for source_value in source_stats:
+            source_path = Path(str(source_value))
+            if source_path.exists():
+                input_path = source_path
+                input_schema = pq.ParquetFile(source_path).schema_arrow
+                break
+    inferred: dict[str, str] = {}
+    for column in dict.fromkeys(columns):
+        input_dtype = coordinates.schema.get(column)
+        if input_dtype is not None and isinstance(input_dtype, pl.List):
+            inferred[column] = _list_restore_rust_type(
+                input_dtype, column=column, source="input"
+            )
+            continue
+        if input_schema is not None and column in input_schema.names:
+            input_dtype = input_schema.field(column).type
+            if pa.types.is_list(input_dtype) or pa.types.is_large_list(input_dtype):
+                inferred[column] = _list_restore_rust_type(
+                    input_dtype, column=column, source="input"
+                )
+                continue
+            if input_path is not None and (
+                pa.types.is_string(input_dtype) or pa.types.is_large_string(input_dtype)
+            ):
+                inferred_json = _infer_json_list_rust_type(input_path, column=column)
+                if inferred_json is not None:
+                    inferred[column] = inferred_json
+                    continue
+        if column not in lookup_schema.names:
+            raise ValidationError(
+                f"list_restore.schema=auto cannot find source column {column!r} in input or lookup.",
+                code="list_restore.schema_inference_missing_column",
+                context={"column": column, "lookup_path": str(lookup_path)},
+            )
+        inferred[column] = _list_restore_rust_type(
+            lookup_schema.field(column).type,
+            column=column,
+            source="lookup",
+        )
+    return inferred
 
 
 def _rust_schema_type(type_name: str) -> str:

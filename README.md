@@ -40,6 +40,7 @@ uv run smoking-data
 ```bash
 # YAML schema·snippet, schedules, Source adapter와 Asset별 config 생성
 uv run smoking-data init .
+uv run smoking-data update templates .
 
 # 공통 Asset/Chain 실행·검증 (YAML 종류 자동 판별)
 uv run smoking-data validate templates/0201.pipeline_curated_pivot.0201.yaml --json

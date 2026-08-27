@@ -4,9 +4,13 @@ yaml:
 job:
   name: public_api_xml
 source:
-  table_id: public_api_xml
   api_request:
     query_mode: http_xml
+    sql:
+      table_id: public_api_xml
+      date_window:
+        step: 1
+        date_window: ['(2025-01-01, 2025-01-01)']
     http:
       url: https://example.go.kr/openapi/items
       query:
@@ -27,7 +31,4 @@ source:
         result_code_path: response.header.resultCode
         result_message_path: response.header.resultMsg
         success_codes: ["00"]
-    date_window:
-      step: 1
-      date_window: ['(2025-01-01, 2025-01-01)']
 output: {}

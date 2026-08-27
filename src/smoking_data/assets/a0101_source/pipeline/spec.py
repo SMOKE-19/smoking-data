@@ -69,7 +69,14 @@ def load_source_spec(path: str | Path) -> SourceSpec:
             job_name=str(merged.get("job", {}).get("name") or ""),
             asset_code="0101",
             extra_scope={
-                "table_id": str(merged.get("source", {}).get("table_id") or ""),
+                "table_id": str(
+                    merged.get("source", {})
+                    .get("api_request", {})
+                    .get("sql", {})
+                    .get("table_id")
+                    or merged.get("source", {}).get("table_id")
+                    or ""
+                ),
             },
         )
         # HTTP query/header values may intentionally contain runtime-only ${ENV}
@@ -179,9 +186,17 @@ def _validate_source_yaml_shape(raw: dict[str, object]) -> None:
             "adapter",
             "adapter_options",
             "spi",
+            "sql",
         },
         path="source.api_request",
     )
+    sql = request.get("sql")
+    if sql is not None:
+        if request.get("payload") is not None:
+            raise ValueError(
+                "source.api_request.sql과 legacy source.api_request.payload을 동시에 사용할 수 없습니다."
+            )
+        _validate_sql_definition(sql)
     payload = request.get("payload")
     if payload is not None:
         payload_mapping = _mapping(payload, path="source.api_request.payload")
@@ -261,7 +276,50 @@ def _validate_source_yaml_shape(raw: dict[str, object]) -> None:
             limit = test_run_mapping.get("final_task_limit")
             if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
                 raise ValueError("execution.test_run.final_task_limit은 1 이상의 정수여야 합니다.")
+    _validate_output_shape(raw)
 
+
+def _validate_sql_definition(value: object) -> None:
+    sql = _mapping(value, path="source.api_request.sql")
+    _reject_unknown_keys(
+        sql,
+        {"table_id", "select", "filters", "sql_file_path", "date_window"},
+        path="source.api_request.sql",
+    )
+    if "table_id" in sql and not isinstance(sql["table_id"], str):
+        raise ValueError("source.api_request.sql.table_id 는 string이어야 합니다.")
+    select = sql.get("select")
+    if select is not None:
+        if not isinstance(select, list):
+            raise ValueError("source.api_request.sql.select 는 list여야 합니다.")
+        for index, item in enumerate(select):
+            _reject_unknown_keys(
+                _mapping(item, path=f"source.api_request.sql.select[{index}]"),
+                {"name", "expr"},
+                path=f"source.api_request.sql.select[{index}]",
+            )
+    filters = sql.get("filters")
+    if filters is not None:
+        _validate_sql_filters(filters)
+    date_window = sql.get("date_window")
+    if date_window is not None:
+        _reject_unknown_keys(
+            _mapping(date_window, path="source.api_request.sql.date_window"),
+            {"column", "step", "date_window"},
+            path="source.api_request.sql.date_window",
+        )
+
+
+def _validate_sql_filters(value: object) -> None:
+    filters = _mapping(value, path="source.api_request.sql.filters")
+    _reject_unknown_keys(
+        filters,
+        {"common", "sub_job"},
+        path="source.api_request.sql.filters",
+    )
+
+
+def _validate_output_shape(raw: dict[str, object]) -> None:
     output = _mapping(raw.get("output"), path="output")
     _reject_unknown_keys(
         output,

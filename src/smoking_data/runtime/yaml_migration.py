@@ -27,7 +27,14 @@ def migrate_definition_yaml(
     if not isinstance(payload, dict):
         raise ValueError("Legacy YAML root must be an object.")
 
-    if _is_current_source(payload) or _schema_name(payload) in {
+    if _is_current_source(payload):
+        if _needs_source_normalization(payload):
+            converted, changes, warnings = _normalize_current_source(payload)
+        else:
+            converted = deepcopy(payload)
+            changes = []
+            warnings = [f"입력 YAML이 이미 {_schema_name(payload)}입니다."]
+    elif _schema_name(payload) in {
         CURRENT_PIPELINE_SCHEMA,
         CURRENT_CURATED_SCHEMA,
         CURRENT_CHAIN_SCHEMA,
@@ -370,6 +377,72 @@ def _is_current_source(payload: dict[str, Any]) -> bool:
     return isinstance(header, dict) and header.get("schema_version") == CURRENT_SOURCE_SCHEMA
 
 
+def _needs_source_normalization(payload: dict[str, Any]) -> bool:
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        return False
+    request = source.get("api_request")
+    if not isinstance(request, dict):
+        return False
+    if "table_id" in source or "payload" in request or "date_window" in request:
+        return True
+    sql = request.get("sql")
+    if not isinstance(sql, dict):
+        return False
+    select = sql.get("select")
+    return any(
+        isinstance(item, dict)
+        and list(item)[:2] != ["name", "expr"]
+        and "expr" in item
+        for item in select or []
+    )
+
+
+def _normalize_current_source(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, str]], list[str]]:
+    """Canonicalize an old internal layout that was labeled as source.v4."""
+
+    converted = deepcopy(payload)
+    source = _required_mapping(converted, "source")
+    request = _required_mapping(source, "api_request")
+    changes: list[dict[str, str]] = []
+    warnings = [
+        "source.v4 스키마 버전은 현재이지만 내부 필드가 구형 레이아웃이어서 canonical 구조로 정규화했습니다."
+    ]
+
+    source_table_id = source.pop("table_id", None)
+    sql = request.get("sql")
+    if not isinstance(sql, dict):
+        sql = {"table_id": source_table_id}
+        legacy_payload = request.pop("payload", None)
+        if isinstance(legacy_payload, dict):
+            sql.update(legacy_payload)
+        for key in ("sql_file_path", "date_window"):
+            if key in request:
+                sql[key] = request.pop(key)
+        request["sql"] = sql
+        changes.append(_change("source.table_id/api_request.payload", "source.api_request.sql"))
+    else:
+        if source_table_id is not None and "table_id" not in sql:
+            sql["table_id"] = source_table_id
+            changes.append(_change("source.table_id", "source.api_request.sql.table_id"))
+        if "payload" in request:
+            legacy_payload = request.pop("payload")
+            if isinstance(legacy_payload, dict):
+                for key, value in legacy_payload.items():
+                    sql.setdefault(key, value)
+            changes.append(_change("source.api_request.payload", "source.api_request.sql"))
+        for key in ("sql_file_path", "date_window"):
+            if key in request:
+                sql.setdefault(key, request.pop(key))
+                changes.append(_change(f"source.api_request.{key}", f"source.api_request.sql.{key}"))
+
+    _normalize_legacy_source_filters(request, changes=changes, warnings=warnings)
+    _order_legacy_source_fields(source, request)
+    return converted, changes, warnings
+
+
 def _source_schema(payload: dict[str, Any]) -> str:
     header = payload.get("yaml")
     if isinstance(header, dict):
@@ -412,6 +485,17 @@ def _convert_legacy_source(
         changes=changes,
         warnings=warnings,
     )
+    legacy_table_id = converted_source.pop("table_id", None)
+    if not str(legacy_table_id or "").strip():
+        legacy_table_id = str(legacy_job.get("name") or "source")
+        changes.append(_change("missing source.table_id", "source.api_request.sql.table_id"))
+        warnings.append(
+            "legacy Source YAML에 source.table_id가 없어 job.name을 SQL table_id로 사용했습니다."
+        )
+    converted_request["sql"] = _build_legacy_sql_definition(
+        converted_request=converted_request,
+        table_id=legacy_table_id,
+    )
     _normalize_legacy_source_filters(
         converted_request,
         changes=changes,
@@ -434,6 +518,8 @@ def _convert_legacy_source(
 
     output = _convert_output(legacy_output, changes, warnings)
     execution = _convert_execution(payload.get("execution"), changes, warnings)
+    _order_legacy_source_execution(execution)
+    _order_legacy_source_output(output)
     converted: dict[str, Any] = {
         "yaml": {
             "schema_version": CURRENT_SOURCE_SCHEMA,
@@ -447,6 +533,23 @@ def _convert_legacy_source(
     return converted, changes, warnings
 
 
+def _build_legacy_sql_definition(
+    *,
+    converted_request: dict[str, Any],
+    table_id: Any,
+) -> dict[str, Any]:
+    """Collect legacy SQL-building fields into the current ``sql`` block."""
+
+    sql: dict[str, Any] = {"table_id": table_id}
+    legacy_payload = converted_request.pop("payload", None)
+    if isinstance(legacy_payload, dict):
+        sql.update(legacy_payload)
+    for key in ("sql_file_path", "date_window"):
+        if key in converted_request:
+            sql[key] = converted_request.pop(key)
+    return sql
+
+
 def _order_legacy_source_fields(
     source: dict[str, Any],
     request: dict[str, Any],
@@ -456,12 +559,17 @@ def _order_legacy_source_fields(
     _reorder_mapping(source, ("table_id", "api_request"))
     _reorder_mapping(
         request,
-        ("query_mode", "adapter", "adapter_options", "payload", "sql_file_path", "date_window", "http"),
+        ("query_mode", "adapter", "adapter_options", "sql", "http"),
     )
-    payload = request.get("payload")
-    if isinstance(payload, dict):
-        _reorder_mapping(payload, ("select", "filters"))
-        filters = payload.get("filters")
+    sql = request.get("sql")
+    if isinstance(sql, dict):
+        _reorder_mapping(sql, ("table_id", "select", "filters", "sql_file_path", "date_window"))
+        select = sql.get("select")
+        if isinstance(select, list):
+            for item in select:
+                if isinstance(item, dict):
+                    _reorder_mapping(item, ("name", "expr"))
+        filters = sql.get("filters")
         if isinstance(filters, dict):
             _reorder_mapping(filters, ("common", "sub_job"))
             sub_jobs = filters.get("sub_job")
@@ -469,9 +577,73 @@ def _order_legacy_source_fields(
                 for item in sub_jobs:
                     if isinstance(item, dict):
                         _reorder_mapping(item, ("sub_job_name", "sub_job_filtering"))
-    date_window = request.get("date_window")
+    date_window = sql.get("date_window") if isinstance(sql, dict) else None
     if isinstance(date_window, dict):
         _reorder_mapping(date_window, ("column", "step", "date_window"))
+
+
+def _order_legacy_source_execution(execution: dict[str, Any]) -> None:
+    _reorder_mapping(
+        execution,
+        (
+            "reset_before_run",
+            "write_source_profile_json",
+            "retryable_error_substrings",
+            "data_api_print_capture",
+            "workers",
+            "warmup_first_task",
+            "worker_start_delay_sec",
+            "max_retries",
+            "retry_backoff_sec",
+            "test_run",
+        ),
+    )
+    capture = execution.get("data_api_print_capture")
+    if isinstance(capture, dict):
+        _reorder_mapping(capture, ("rules",))
+        rules = capture.get("rules")
+        if isinstance(rules, dict):
+            _reorder_mapping(rules, ("enabled", "fields"))
+            fields = rules.get("fields")
+            if isinstance(fields, list):
+                for item in fields:
+                    if isinstance(item, dict):
+                        _reorder_mapping(item, ("field", "enabled", "capture", "regex"))
+
+
+def _order_legacy_source_output(output: dict[str, Any]) -> None:
+    _reorder_mapping(output, ("artifact", "logging"))
+    artifact = output.get("artifact")
+    if isinstance(artifact, dict):
+        _reorder_mapping(
+            artifact,
+            ("type", "root_dir", "format", "write_policy", "file_name_rule", "parquet_writer", "publication"),
+        )
+        file_name_rule = artifact.get("file_name_rule")
+        if isinstance(file_name_rule, dict):
+            _reorder_mapping(file_name_rule, ("raw_dataset",))
+        writer = artifact.get("parquet_writer")
+        if isinstance(writer, dict):
+            _reorder_mapping(
+                writer,
+                (
+                    "index",
+                    "engine",
+                    "compression",
+                    "row_group_size",
+                    "write_page_index",
+                    "write_statistics",
+                    "data_page_size",
+                    "max_rows_per_page",
+                    "use_dictionary",
+                ),
+            )
+    logging = output.get("logging")
+    if isinstance(logging, dict):
+        _reorder_mapping(logging, ("root_dir", "file_name_rule"))
+        file_name_rule = logging.get("file_name_rule")
+        if isinstance(file_name_rule, dict):
+            _reorder_mapping(file_name_rule, ("logging",))
 
 
 def _reorder_mapping(mapping: dict[str, Any], preferred_keys: tuple[str, ...]) -> None:
@@ -493,20 +665,20 @@ def _normalize_legacy_source_filters(
 ) -> None:
     """Translate the permissive legacy filter aliases to the v4 Source shape."""
 
-    payload = request.get("payload")
-    if not isinstance(payload, dict) or "filters" not in payload:
+    container = request.get("sql") or request.get("payload")
+    if not isinstance(container, dict) or "filters" not in container:
         return
 
-    raw = payload.get("filters")
+    raw = container.get("filters")
     if raw is None:
-        payload["filters"] = {"common": [], "sub_job": []}
-        changes.append(_change("source.api_request.payload.filters: null", "filters.common/sub_job"))
+        container["filters"] = {"common": [], "sub_job": []}
+        changes.append(_change("source.api_request.filters: null", "filters.common/sub_job"))
         warnings.append("legacy 0101 filters의 null 값을 빈 canonical filter 블록으로 변환했습니다.")
         return
 
     if isinstance(raw, list):
-        payload["filters"] = {"common": [str(item) for item in raw], "sub_job": []}
-        changes.append(_change("source.api_request.payload.filters (list)", "filters.common"))
+        container["filters"] = {"common": [str(item) for item in raw], "sub_job": []}
+        changes.append(_change("source.api_request.filters (list)", "filters.common"))
         warnings.append("legacy 0101 filters list를 filters.common 목록으로 변환했습니다.")
         return
 
@@ -569,12 +741,12 @@ def _normalize_legacy_source_filters(
 
     canonical = {"common": common_filters, "sub_job": sub_jobs}
     if raw != canonical:
-        payload["filters"] = canonical
-        changes.append(_change("source.api_request.payload.filters (legacy aliases)", "filters.common/sub_job"))
+        container["filters"] = canonical
+        changes.append(_change("source.api_request.filters (legacy aliases)", "filters.common/sub_job"))
         warnings.append("legacy 0101 filters alias를 현재 canonical 형태로 정규화했습니다.")
     elif used_alias:
-        payload["filters"] = canonical
-        changes.append(_change("source.api_request.payload.filters.sub_jobs", "filters.sub_job"))
+        container["filters"] = canonical
+        changes.append(_change("source.api_request.filters.sub_jobs", "filters.sub_job"))
         warnings.append("legacy 0101 filters.sub_jobs를 filters.sub_job으로 정규화했습니다.")
 
 

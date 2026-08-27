@@ -66,7 +66,7 @@ smoking-data chain run CHAIN.yaml [--config CONFIG] [--project-root ROOT] [--jso
 Legacy 0101 YAML은 다음 결정론적 명령으로 변환할 수 있다.
 
 ```bash
-smoking-data migrate yaml LEGACY.yaml --output converted.yaml --json
+smoking-data migrate yaml INPUT.yaml --output normalized.yaml --json
 smoking-data migrate parquet INPUT_PATH --output migration.0201.yaml \
   --source-asset 0301 --job-name parquet_migration --json
 ```

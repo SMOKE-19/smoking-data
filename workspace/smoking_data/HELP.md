@@ -10,6 +10,11 @@ smoking-data migrate --help
 smoking-data migrate yaml --help
 ```
 
+`migrate yaml`은 입력 `yaml.schema_version`을 확인한다. 이미 `smoking-data.source.v4`인
+YAML이라도 `source.table_id`, `api_request.payload`, 구형 `api_request.date_window`가
+남아 있으면 현재 `source.api_request.sql` 구조로 정규화하고, `select` 항목의 키 순서도
+`name` 다음 `expr` 순서로 정리한다. 변환 결과는 `--output` 경로에 별도로 기록한다.
+
 root help는 전체 top-level command를, group help는 직속 subcommand를, leaf help는
 해당 명령의 인자와 옵션을 보여준다. 새 CLI 기능은 dispatch, help, 이 문서와 테스트를
 함께 갱신해야 한다.

@@ -6,7 +6,6 @@ job:
   name: source_0101_passthrough_structured
 
 source:
-  table_id: basic_source
   api_request:
     query_mode: structured
     adapter: spi
@@ -15,7 +14,8 @@ source:
     #   pre_query_script: auth/generate_token.py
     #   timeout_sec: 60
     #   lock_timeout_sec: 60
-    payload:
+    sql:
+      table_id: basic_source
       select:
       - name: text_1
       - name: text_2
@@ -34,12 +34,12 @@ source:
         - sub_job_name: text_1_b
           sub_job_filtering:
           - text_1 LIKE 'B%'
-    date_window:
-      column: CAST(timestamp_1 AS DATE)
-      step: 1
       date_window:
-      - '(2025-01-01, 2025-01-01)'
-      - '(2025-01-02, 2025-01-02)'
+        column: CAST(timestamp_1 AS DATE)
+        step: 1
+        date_window:
+        - '(2025-01-01, 2025-01-01)'
+        - '(2025-01-02, 2025-01-02)'
 execution:
   reset_before_run: false
   write_source_profile_json: false

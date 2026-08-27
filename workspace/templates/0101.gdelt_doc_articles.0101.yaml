@@ -7,9 +7,13 @@ job:
   description: GDELT DOC 2.0 article-list API smoke/sample ingestion
 
 source:
-  table_id: gdelt_doc_articles
   api_request:
     query_mode: http_json
+    sql:
+      table_id: gdelt_doc_articles
+      date_window:
+        step: 1
+        date_window: ['(-1, -1)']
     http:
       url: https://api.gdeltproject.org/api/v2/doc/doc
       query:
@@ -30,10 +34,6 @@ source:
         strategy: none
       json:
         item_path: articles
-    date_window:
-      step: 1
-      # 기본 실행일 기준 전일 한 구간만 요청해 GDELT 호출 간격 제한을 지킨다.
-      date_window: ['(-1, -1)']
 
 execution:
   reset_before_run: false

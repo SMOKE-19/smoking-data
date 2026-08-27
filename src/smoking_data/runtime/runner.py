@@ -879,7 +879,7 @@ _CLI_COMMANDS: dict[str, tuple[str, ...]] = {
 
 _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
     "migrate": (
-        "migrate yaml LEGACY.yaml --output CURRENT.yaml",
+        "migrate yaml INPUT.yaml --output NORMALIZED.yaml",
         "migrate parquet INPUT --output migration.0201.yaml --source-asset ASSET",
         "migrate chain verify CHAIN.yaml",
         "migrate chain run CHAIN.yaml",
@@ -1256,10 +1256,13 @@ def _main_migrate_yaml(argv: list[str]) -> int:
     from smoking_data.runtime.yaml_migration import migrate_definition_yaml
 
     parser = argparse.ArgumentParser(
-        description="Convert a supported legacy Definition YAML to the current contract."
+        description=(
+            "Inspect yaml.schema_version and normalize supported legacy or current-schema "
+            "Definition YAML structures."
+        )
     )
-    parser.add_argument("yaml_path", help="Legacy Definition YAML path")
-    parser.add_argument("--output", required=True, help="Converted YAML output path")
+    parser.add_argument("yaml_path", help="Input Definition YAML path")
+    parser.add_argument("--output", required=True, help="Normalized YAML output path")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:

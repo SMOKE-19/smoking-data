@@ -42,8 +42,9 @@ def parse_structured_request(
     *,
     path_resolver: Callable[[str], str] | None = None,
 ) -> SourceRequestSpec:
-    table_id = require_str(resolved, "source", "table_id")
-    payload = require_dict(resolved, "source", "api_request", "payload")
+    sql = _sql_definition(resolved)
+    table_id = require_str(sql, "table_id")
+    payload = sql
     columns: list[ColumnSpec] = []
     for item in payload.get("select", []):
         if not isinstance(item, dict):
@@ -55,7 +56,9 @@ def parse_structured_request(
     return SourceRequestSpec(
         table_id=table_id,
         query_mode="structured",
-        date_window=parse_date_window(resolved),
+        date_window=_parse_date_window_mapping(
+            sql.get("date_window") if isinstance(sql.get("date_window"), dict) else {}
+        ),
         columns=columns,
         filters=filters,
         sub_jobs=sub_jobs,
@@ -69,8 +72,9 @@ def parse_sql_file_request(
     *,
     path_resolver: Callable[[str], str] | None = None,
 ) -> SourceRequestSpec:
-    table_id = require_str(resolved, "source", "table_id")
-    payload = require_dict(resolved, "source", "api_request", "payload")
+    sql = _sql_definition(resolved)
+    table_id = require_str(sql, "table_id")
+    payload = sql
     columns: list[ColumnSpec] = []
     for item in payload.get("select", []):
         if not isinstance(item, dict):
@@ -81,14 +85,14 @@ def parse_sql_file_request(
     return SourceRequestSpec(
         table_id=table_id,
         query_mode="sql_file",
-        date_window=parse_date_window(resolved),
+        date_window=_parse_date_window_mapping(sql),
         columns=columns,
         filters=[],
         sub_jobs=[],
         sql_file_path=(
-            path_resolver(require_str(resolved, "source", "api_request", "sql_file_path"))
+            path_resolver(require_str(sql, "sql_file_path"))
             if path_resolver is not None
-            else require_str(resolved, "source", "api_request", "sql_file_path")
+            else require_str(sql, "sql_file_path")
         ),
         adapter=_parse_adapter_name(resolved),
         adapter_options=_parse_adapter_options(resolved),
@@ -112,6 +116,24 @@ def _parse_adapter_options(resolved: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("source.api_request.adapter_options 는 dict여야 합니다.")
     return dict(raw)
+
+
+def _sql_definition(resolved: dict[str, Any]) -> dict[str, Any]:
+    request = require_dict(resolved, "source", "api_request")
+    sql = request.get("sql")
+    if sql is not None:
+        if not isinstance(sql, dict):
+            raise ValueError("source.api_request.sql 는 dict여야 합니다.")
+        return sql
+    # Backward-compatible v4 layout. New Definitions and migration output use
+    # source.api_request.sql as the single SQL-build specification block.
+    payload = request.get("payload")
+    legacy = dict(payload) if isinstance(payload, dict) else {}
+    legacy["table_id"] = require_str(resolved, "source", "table_id")
+    for key in ("date_window", "sql_file_path"):
+        if key in request:
+            legacy[key] = request[key]
+    return legacy
 
 
 def _parse_payload_filters(value: Any) -> tuple[list[str], list[SourceSubJobSpec]]:
@@ -147,7 +169,15 @@ def _parse_payload_filters(value: Any) -> tuple[list[str], list[SourceSubJobSpec
 
 
 def parse_date_window(resolved: dict[str, Any], *, require_column: bool = True) -> DateWindowSpec:
-    window_payload = require_dict(resolved, "source", "api_request", "date_window")
+    window_payload = _sql_definition(resolved).get("date_window")
+    if not isinstance(window_payload, dict):
+        raise ValueError("source.api_request.sql.date_window 는 dict여야 합니다.")
+    return _parse_date_window_mapping(window_payload, require_column=require_column)
+
+
+def _parse_date_window_mapping(
+    window_payload: dict[str, Any], *, require_column: bool = True
+) -> DateWindowSpec:
     windows = _parse_date_window_items(get_value(window_payload, "date_window"))
     return DateWindowSpec(
         column=(require_str(window_payload, "column") if require_column else str(window_payload.get("column") or "")),
@@ -157,7 +187,8 @@ def parse_date_window(resolved: dict[str, Any], *, require_column: bool = True) 
 
 
 def parse_http_request(resolved: dict[str, Any], *, query_mode: str) -> SourceRequestSpec:
-    table_id = require_str(resolved, "source", "table_id")
+    sql = _sql_definition(resolved)
+    table_id = require_str(sql, "table_id")
     api_request = require_dict(resolved, "source", "api_request")
     if (
         api_request.get("adapter") is not None
@@ -198,7 +229,12 @@ def parse_http_request(resolved: dict[str, Any], *, query_mode: str) -> SourceRe
     return SourceRequestSpec(
         table_id=table_id,
         query_mode=query_mode,  # type: ignore[arg-type]
-        date_window=parse_date_window(resolved, require_column=False),
+        date_window=_parse_date_window_mapping(
+            sql.get("date_window")
+            if isinstance(sql.get("date_window"), dict)
+            else {},
+            require_column=False,
+        ),
         columns=[],
         filters=[],
         sub_jobs=[],

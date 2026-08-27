@@ -16,6 +16,21 @@ CURRENT_CHAIN_SCHEMA = "smoking-data.asset-chain.v2"
 CURRENT_PUBLICATION_SCHEMA = "smoking-data.publication.v1"
 
 
+class _ExpressionText(str):
+    """Marker for SQL expressions that must be emitted as literal YAML text."""
+
+
+class _MigrationDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_expression_text(dumper: yaml.Dumper, value: _ExpressionText) -> yaml.Node:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", str(value), style="|")
+
+
+_MigrationDumper.add_representer(_ExpressionText, _represent_expression_text)
+
+
 def migrate_definition_yaml(
     input_path: str | Path,
     *,
@@ -55,7 +70,7 @@ def migrate_definition_yaml(
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = target_path.with_suffix(target_path.suffix + ".tmp")
     temporary.write_text(
-        yaml.safe_dump(converted, allow_unicode=True, sort_keys=False),
+        _dump_migration_yaml(converted),
         encoding="utf-8",
     )
     temporary.replace(target_path)
@@ -178,9 +193,27 @@ def _write_yaml_atomic(payload: dict[str, Any], target_path: Path) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = target_path.with_suffix(target_path.suffix + ".tmp")
     temporary.write_text(
-        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        _dump_migration_yaml(payload), encoding="utf-8"
     )
     temporary.replace(target_path)
+
+
+def _dump_migration_yaml(payload: dict[str, Any]) -> str:
+    marked = deepcopy(payload)
+    _mark_expression_text(marked)
+    return yaml.dump(marked, Dumper=_MigrationDumper, allow_unicode=True, sort_keys=False)
+
+
+def _mark_expression_text(value: Any, *, key: str | None = None) -> Any:
+    if isinstance(value, dict):
+        for name, item in list(value.items()):
+            value[name] = _mark_expression_text(item, key=name)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _mark_expression_text(item, key=key)
+    elif key == "expr" and isinstance(value, str):
+        return _ExpressionText(value)
+    return value
 
 
 def _schema_name(payload: dict[str, Any]) -> str:

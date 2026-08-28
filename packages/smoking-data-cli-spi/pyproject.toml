@@ -1,0 +1,27 @@
+[project]
+name = "smoking-data-cli-spi"
+version = "0.1.14"
+description = "SPI-environment workspace initializer for smoking-data."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = ["smoking-data==0.1.14"]
+
+[project.scripts]
+smoking-data-cli-spi = "smoking_data_cli_spi:main"
+
+[tool.uv.sources]
+smoking-data = { path = "../..", editable = true }
+
+[build-system]
+requires = ["setuptools>=82", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+smoking_data_cli_spi = ["_workspace/**/*"]

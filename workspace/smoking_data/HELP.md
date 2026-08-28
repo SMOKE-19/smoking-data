@@ -243,6 +243,16 @@ YAML 옵션으로 노출하지 않는다.
 모든 operation은 `id` 대신 사람이 편집할 수 있는 `alias`를 선언하고 `inputs`에서도 alias를 참조한다.
 검증 시 생성되는 캐노니컬 key는 alias 변경과 무관하다.
 
+0201의 `build_sidecar.operations[].group_keys`는 논리적인 active-row 선택 그룹을 선언한다.
+`materialize.part_boundary.preserve_groups`는 물리적인 payload 경계 힌트이므로 두 필드가
+항상 같을 필요가 없으며, 선택 그룹의 일부만 지정할 수 있다. 좌표로 선택된 행은 sidecar
+결과를 기준으로 유지된다.
+
+Pivot의 `value_keys`와 `value_keys_without_column`에서 `output_dtype`는 선택 사항이다.
+생략하면 명시적 cast를 수행하지 않고 집계 결과의 Arrow 타입을 사용하며, `first`, `min`,
+`max` 집계는 원천 칼럼 타입을 그대로 상속한다. 타입을 강제로 바꿔야 하는 경우에만
+`output_dtype`를 지정한다.
+
 0201은 `smoking-data.pipeline.v7` phase 계약만 허용한다. 기존 v6 `operations` 배열은 호환하지 않는다.
 `define_upstream`은 입력을 정의하고, `build_sidecar.operations`는 전역 후보와 active 좌표를 만든다.
 후보 프로세스는 기본적으로 파일 수와 selector 투영 크기를 함께 제한하는 adaptive recycle을

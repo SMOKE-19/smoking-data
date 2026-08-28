@@ -1634,14 +1634,6 @@ def _validate_explicit_physical_boundaries(
         OperationKind.PIVOT,
         OperationKind.JOIN,
     }
-    first_join_id = next(
-        (
-            operation.operation_id
-            for operation in operations
-            if operation.kind is OperationKind.JOIN
-        ),
-        None,
-    )
     for operation in operations:
         if operation.kind not in heavy_kinds:
             continue
@@ -1656,25 +1648,11 @@ def _validate_explicit_physical_boundaries(
                 code="materialize.required_before_heavy_operation",
                 context={"operation_id": operation.operation_id, "operation": operation.kind.value},
             )
-        materialize = prior[-1]
-        preserved = set(materialize.config["part_boundary"]["preserve_groups"])
-        if operation.kind is OperationKind.PIVOT:
-            required_groups = set(operation.config.get("row_keys") or [])
-        elif operation.kind is OperationKind.JOIN and operation.operation_id == first_join_id:
-            required_groups = set(operation.config.get("left_on") or [])
-        else:
-            required_groups = set()
-        missing_groups = sorted(required_groups.difference(preserved))
-        if missing_groups:
-            raise ValidationError(
-                "materialize part_boundary must preserve the heavy operation groups.",
-                code="materialize.missing_preserved_groups",
-                context={
-                    "operation_id": materialize.operation_id,
-                    "consumer": operation.operation_id,
-                    "groups": missing_groups,
-                },
-            )
+        # A materialize boundary may intentionally preserve only a subset of
+        # the groups used by the downstream heavy operation.  The sidecar
+        # still computes the complete logical group key, while this setting
+        # controls the coarser physical boundary used for payload reads.
+        # Do not require every logical group to be repeated here.
 
     for operation in operations:
         if operation.kind is not OperationKind.ACTIVE_ROW_SELECTION:
@@ -1690,20 +1668,9 @@ def _validate_explicit_physical_boundaries(
                 code="materialize.selector_not_consumed",
                 context={"operation_id": operation.operation_id},
             )
-        selector_groups = set(operation.group_keys)
-        for consumer in consumers:
-            preserved = set(consumer.config["part_boundary"]["preserve_groups"])
-            missing_groups = sorted(selector_groups.difference(preserved))
-            if missing_groups:
-                raise ValidationError(
-                    "materialize must preserve every active-row selector group.",
-                    code="materialize.missing_preserved_groups",
-                    context={
-                        "operation_id": consumer.operation_id,
-                        "selector": operation.operation_id,
-                        "groups": missing_groups,
-                    },
-                )
+        # preserve_groups is a physical partition-boundary hint.  It is valid
+        # for it to be a proper subset of the selector groups; the selected
+        # coordinates remain authoritative for row selection.
 
     right_sources = {
         str(operation.config["right_source"])

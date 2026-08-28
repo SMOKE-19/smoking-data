@@ -394,6 +394,10 @@ fn aggregate_column(
         )),
         _ => return Err(format!("unsupported pivot aggregation: {aggregation}")),
     };
+    // output_dtype is an optional override.  When it is omitted, retain the
+    // aggregation's native Arrow type, which for first/min/max inherits the
+    // source column type.  This keeps schema declarations optional without
+    // changing the natural result type of count/sum/avg/concatenation.
     let output = match value.output_dtype.as_deref() {
         Some(dtype) if !dtype.trim().is_empty() => {
             cast(&output, &parse_output_dtype(dtype)?).map_err(|error| error.to_string())?

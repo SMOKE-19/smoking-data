@@ -1,16 +1,19 @@
 # smoking-data
 
-현재 릴리즈: `0.1.6` (Python 3.10–3.13, Linux/Windows wheel 제공)
+현재 엔진/API 릴리즈: `0.1.13` (Python 3.10–3.13, Linux/Windows wheel 제공)
 
-Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
+Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 엔진/API 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
 Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서, 작업공간 원본은 저장소 루트
 `workspace/`에서 관리한다. `workspace/templates/`는 사용자용 Definition template 원본이며,
 운영 설정이나 회귀 테스트 fixture를 담지 않는다. SBDF 변환은 중복 native 코드를 포함하지 않고 외부
 `smoking-sbdf` 패키지에 위임한다.
 
+CLI와 엔진은 다시 하나의 `smoking-data` wheel에서 제공한다. SPI 환경 전용 작업공간
+초기화만 별도 `smoking-data-cli-spi` 패키지가 담당한다.
+
 ## 목표 구조
 
-- 하나의 `smoking-data` WHL과 `smoking-data` CLI
+- `smoking-data` 엔진/API/CLI 통합 WHL과 선택적인 `smoking-data-cli-spi` 초기화 WHL
 - `0101` SQL SPI·HTTP JSON/NDJSON/XML Source Dataset과 자동 Physical Probe, `0102` Calculated Fact,
   `0103` 로컬·HTTP CSV/TSV/ZIP Source,
   `0201` Curated,
@@ -30,7 +33,7 @@ Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서, 작업공�
 ```bash
 uv sync
 uv run ruff check .
-uv run smoking-data
+uv run smoking-data --help
 ```
 
 제품의 통합·회귀 테스트는 제품 코드와 분리된 `smoking-data-testkit` 저장소에서 실행한다.
@@ -40,6 +43,7 @@ uv run smoking-data
 ```bash
 # YAML schema·snippet, schedules, Source adapter와 Asset별 config 생성
 uv run smoking-data init .
+uv run smoking-data-cli-spi init .
 uv run smoking-data update templates .
 
 # 공통 Asset/Chain 실행·검증 (YAML 종류 자동 판별)

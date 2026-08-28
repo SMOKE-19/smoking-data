@@ -4,6 +4,32 @@
 다른 작업공간을 대상으로 할 때 `--project-root`를 지정한다. LLM이나 자동화에서는 가능한
 경우 `--json`을 사용하고, 결과 파일은 `for_agents/output/`에 저장한다.
 
+## LLM 컨텍스트 절약 규칙
+
+명령어 사용법을 확인할 때는 이 문서를 전부 읽지 말고 실행 파일의 help를 순서대로
+조회한다.
+
+```bash
+smoking-data --help
+smoking-data GROUP --help
+smoking-data GROUP COMMAND --help
+```
+
+정상 작업에는 help와 `--json` 결과만 사용한다. 아래 표는 `--json` 결과에서 문제가
+확인된 경우에만 해당 문서 하나를 추가로 읽기 위한 routing이다.
+
+| 상황 | 추가로 읽을 문서 |
+| --- | --- |
+| 결과 JSON 형식·상태 해석 | `REPORT_FORMAT.md` |
+| 실행 실패·예외 원인 | `FAILURE_DIAGNOSIS.md` |
+| missing column·input·route | `MISSING_DATA_DIAGNOSIS.md` |
+| RSS·elapsed·OOM·physical layout | `PROFILE_ANALYSIS.md` |
+| generation·definition·lineage | `METADATA_MAP.md` |
+| for_agents 스크립트·출력 보관 | `SANDBOX.md` |
+
+`.smoking-data/HELP.md`는 YAML을 작성하거나 schema 세부사항이 필요한 경우에만 읽는다.
+문서 전체 일괄 열람, 소스코드 선행 탐색, 동일 결과의 반복 수집은 금지한다.
+
 ## 명령어 탐색 계약
 
 ```bash

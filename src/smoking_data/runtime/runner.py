@@ -985,6 +985,7 @@ def _main_init(argv: list[str]) -> int:
         backup_init_outputs,
         initialize_agent_workspace,
         initialize_asset_configs,
+        initialize_cast_types,
         initialize_help,
         initialize_runtime_directories,
         initialize_schedule_templates,
@@ -1024,6 +1025,7 @@ def _main_init(argv: list[str]) -> int:
         templates = initialize_workspace_templates(args.target, force=args.force)
         schedule_templates = initialize_schedule_templates(args.target, force=args.force)
         help_document = initialize_help(args.target, force=args.force)
+        cast_types_document = initialize_cast_types(args.target, force=args.force)
         agent_workspace = initialize_agent_workspace(args.target)
         payload = {
             "ok": True,
@@ -1034,6 +1036,7 @@ def _main_init(argv: list[str]) -> int:
             "templates": templates,
             "schedule_templates": schedule_templates,
             "help": help_document,
+            "cast_types": cast_types_document,
             "agent_workspace": agent_workspace,
             "force": args.force,
             "history": history,

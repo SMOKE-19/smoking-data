@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.14"
+__version__ = "0.1.15"
 
 from smoking_data.api import ValidationResult, validate_definition
 from smoking_data.runtime.capabilities import get_capabilities

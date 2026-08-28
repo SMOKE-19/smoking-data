@@ -90,6 +90,10 @@ paths:
 `.temp/metadata`, `.temp/logs`가 생성된다. 작업공간 밖을 가리키는 절대경로는 init이 임의 생성하지
 않으며, 실제 실행 전 사용자가 별도로 준비해야 한다.
 
+캐스트 타입과 alias, 동일 타입 cast 생략 규칙은 init이 생성하는
+`.smoking-data/CAST_TYPES.md`를 기준으로 확인한다. `INTEGER`는 엔진의 `INT32` alias이며,
+64-bit 정수는 `INT64` 또는 `BIGINT`를 사용한다.
+
 init은 비밀 값이 없는 `.smoking-data/object-stores.yaml` 예시도 생성한다. Linux는 `~/.aws`,
 Windows는 `%USERPROFILE%\.aws`의 AWS shared profile을 SDK가 읽으며 init은 `.aws`나 credential
 파일을 생성하지 않는다. 여러 profile은 object-store target을 분리해 지정한다.

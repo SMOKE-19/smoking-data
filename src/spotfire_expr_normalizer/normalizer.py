@@ -1398,7 +1398,7 @@ def _normalize_polars_cast_type(value: str) -> str:
     normalized = re.sub(r"\s+", "", value.strip().lower())
     type_map = {
         "int": "pl.Int64",
-        "integer": "pl.Int64",
+        "integer": "pl.Int32",
         "long": "pl.Int64",
         "longinteger": "pl.Int64",
         "real": "pl.Float64",
@@ -1421,7 +1421,7 @@ def _normalize_polars_cast_type(value: str) -> str:
 
 def _polars_function_cast_target(function_name: str) -> str | None:
     return {
-        "integer": "pl.Int64",
+        "integer": "pl.Int32",
         "longinteger": "pl.Int64",
         "real": "pl.Float64",
         "single": "pl.Float32",

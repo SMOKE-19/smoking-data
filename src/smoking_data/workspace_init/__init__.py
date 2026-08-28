@@ -1,5 +1,6 @@
 from .agent_initializer import initialize_agent_workspace
 from .asset_config_initializer import initialize_asset_configs
+from .cast_types_initializer import initialize_cast_types
 from .directory_initializer import initialize_runtime_directories
 from .help_initializer import initialize_help
 from .history import backup_init_outputs, backup_paths
@@ -9,6 +10,7 @@ from .template_initializer import initialize_workspace_templates
 
 __all__ = [
     "initialize_asset_configs",
+    "initialize_cast_types",
     "initialize_agent_workspace",
     "initialize_runtime_directories",
     "initialize_workspace_templates",

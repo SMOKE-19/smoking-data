@@ -8,20 +8,26 @@ import polars as pl
 POLARS_TYPE_MAP: dict[str, pl.DataType] = {
     "TEXT": pl.String,
     "STRING": pl.String,
-    "INT": pl.Int64,
+    "TINYINT": pl.Int8,
     "INT8": pl.Int8,
+    "SMALLINT": pl.Int16,
     "INT16": pl.Int16,
     "INT32": pl.Int32,
     "INT64": pl.Int64,
-    "INTEGER": pl.Int64,
+    # INTEGER is the engine's 32-bit integer alias.  Use INT64/BIGINT when
+    # the wider representation is intended; keeping this aligned with the
+    # Rust payload engine makes repeated INTEGER casts true no-ops.
+    "INTEGER": pl.Int32,
     "FLOAT": pl.Float32,
     "FLOAT32": pl.Float32,
+    "REAL": pl.Float32,
     "FLOAT64": pl.Float64,
     "DOUBLE": pl.Float64,
     "BOOL": pl.Boolean,
     "BOOLEAN": pl.Boolean,
     "DATE": pl.Date,
     "TIME": pl.Time,
+    "TIMESTAMP": pl.Datetime,
     "DATETIME": pl.Datetime,
     "DURATION": pl.Duration("us"),
 }
@@ -39,10 +45,18 @@ def apply_exclude_columns(lf: pl.LazyFrame, columns: list[str] | None) -> pl.Laz
     return lf.drop(columns, strict=False)
 
 
-def apply_type_casts(lf: pl.LazyFrame, casts: list[dict[str, Any]] | None) -> pl.LazyFrame:
+def apply_type_casts(
+    lf: pl.LazyFrame,
+    casts: list[dict[str, Any]] | None,
+    *,
+    stats: dict[str, int] | None = None,
+) -> pl.LazyFrame:
     if not casts:
         return lf
     expressions: list[pl.Expr] = []
+    source_schema = lf.collect_schema()
+    seen_targets: set[tuple[str, str]] = set()
+    skipped = 0
     for item in casts:
         name = str(item.get("name") or item.get("column") or "").strip()
         type_name = str(item.get("type") or "").strip().upper()
@@ -56,7 +70,17 @@ def apply_type_casts(lf: pl.LazyFrame, casts: list[dict[str, Any]] | None) -> pl
         )
         if dtype is None:
             raise ValueError(f"Unsupported cast type: {type_name}")
+        canonical_target = str(dtype)
+        target_key = (name, canonical_target)
+        if target_key in seen_targets or source_schema.get(name) == dtype:
+            skipped += 1
+            continue
+        seen_targets.add(target_key)
         expressions.append(pl.col(name).cast(dtype).alias(name))
+    if stats is not None:
+        stats["skipped_same_dtype"] = stats.get("skipped_same_dtype", 0) + skipped
+    if not expressions:
+        return lf
     return lf.with_columns(expressions)
 
 

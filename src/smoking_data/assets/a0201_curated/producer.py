@@ -156,17 +156,21 @@ PRESET_NAME = "0201"
 RUST_DIRECT_TYPE_MAP = {
     "TEXT": "TEXT",
     "STRING": "TEXT",
+    "TINYINT": "TINYINT",
     "INT8": "TINYINT",
+    "SMALLINT": "SMALLINT",
     "INT16": "SMALLINT",
     "INT32": "INTEGER",
     "INT64": "BIGINT",
     "BIGINT": "BIGINT",
     "FLOAT": "FLOAT",
     "FLOAT32": "FLOAT",
+    "REAL": "FLOAT",
     "FLOAT64": "DOUBLE",
     "DOUBLE": "DOUBLE",
     "DATE": "DATE",
     "TIME": "TIME",
+    "TIMESTAMP": "TIMESTAMP",
     "DATETIME": "TIMESTAMP",
     "DURATION": "DURATION",
     "BOOL": "BOOLEAN",
@@ -5356,6 +5360,8 @@ def _resolve_list_restore_schema(
     configured = list_restore.get("schema")
     if isinstance(configured, dict):
         return {str(name): _rust_schema_type(str(dtype)) for name, dtype in configured.items()}
+    if configured is None:
+        configured = "auto"
     if not isinstance(configured, str) or configured.strip().lower() != "auto":
         raise ValidationError(
             "list_restore.schema must be a mapping or 'auto'.",

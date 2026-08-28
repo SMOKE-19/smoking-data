@@ -1069,7 +1069,9 @@ def _compile_operation(
         )
         _required_string(config.get("lookup_path"), path=f"{path}.lookup_path")
         raw_schema = config.get("schema")
-        schema_auto = isinstance(raw_schema, str) and raw_schema.strip().lower() == "auto"
+        schema_auto = raw_schema is None or (
+            isinstance(raw_schema, str) and raw_schema.strip().lower() == "auto"
+        )
         if schema_auto:
             schema: dict[str, Any] = {}
         else:
@@ -1119,7 +1121,11 @@ def _compile_operation(
             config,
             input_columns=tuple(dict.fromkeys([key_column, *value_columns, *source_coord])),
             output_columns=tuple(
-                ColumnContract(name, dtype=str(schema[name]), nullable=True)
+                ColumnContract(
+                    name,
+                    dtype=str(schema[name]) if name in schema else None,
+                    nullable=True,
+                )
                 for name in [*value_columns, *source_coord]
             ),
             group_keys=(key_column,),

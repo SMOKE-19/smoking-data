@@ -23,6 +23,7 @@ class OperationKind(StrEnum):
     RENAME_COLUMNS = "rename_columns"
     DATA_ASSERTION = "data_assertion"
     UNPIVOT = "unpivot"
+    UNNEST = "unnest"
     PIVOT = "pivot"
     JOIN = "join"
     WRITE_DATASET = "write_dataset"
@@ -246,6 +247,14 @@ OPERATION_PROPERTIES: dict[OperationKind, OperationProperties] = {
         order_sensitive=True,
         schema_changing=True,
         requires_complete_group=False,
+        null_semantics=NullSemantics.OP_DEFINED,
+    ),
+    OperationKind.UNNEST: OperationProperties(
+        row_preserving=False,
+        cardinality_effect=CardinalityEffect.EXPAND_OR_REDUCE,
+        deterministic=True,
+        order_sensitive=True,
+        schema_changing=True,
         null_semantics=NullSemantics.OP_DEFINED,
     ),
     OperationKind.PIVOT: OperationProperties(

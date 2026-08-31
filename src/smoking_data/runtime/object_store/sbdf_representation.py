@@ -170,6 +170,98 @@ def build_sbdf_representation(
     )
 
 
+def build_existing_sbdf_representation(
+    dataset_root: Path,
+    output_root: Path,
+    *,
+    generation_id: str,
+    generation_prefix: str,
+    parts: list[dict[str, Any]],
+    spec: SbdfPublicationSpec,
+) -> BuiltSbdfRepresentation:
+    """Package an already committed SBDF dataset without rebuilding it from Parquet."""
+
+    if not spec.row_key_columns:
+        raise SmokingDataError(
+            "SBDF publication requires explicit row_key_columns.",
+            code="remote.sbdf_key_columns_required",
+        )
+    objects: list[SbdfObject] = []
+    piece_root = output_root / ".sbdf-key-pieces"
+    total_rows = 0
+    key_rows = 0
+    schema_contracts: list[dict[str, Any]] = []
+    for part in sorted(parts, key=lambda item: str(item.get("relative_path") or "")):
+        relative = str(part.get("relative_path") or "")
+        sbdf_path = (dataset_root / relative).resolve()
+        sidecar_relative = str(part.get("key_sidecar_relative_path") or "")
+        sidecar_path = (dataset_root / sidecar_relative).resolve()
+        if (
+            not relative
+            or not sidecar_relative
+            or not sbdf_path.is_relative_to(dataset_root)
+            or not sidecar_path.is_relative_to(dataset_root)
+            or not sbdf_path.is_file()
+            or not sidecar_path.is_file()
+        ):
+            raise SmokingDataError(
+                "Committed SBDF artifact is missing its data or key sidecar.",
+                code="remote.sbdf_local_reference_invalid",
+                context={"relative_path": relative, "key_sidecar": sidecar_relative},
+            )
+        content_sha256 = str(part.get("sha256") or file_sha256(sbdf_path))
+        file_id = hashlib.sha256(f"{relative}\0{content_sha256}".encode()).hexdigest()
+        object_key = f"{generation_prefix}/representations/sbdf/{file_id}.sbdf"
+        rows = int(part.get("rows") or 0)
+        sidecar_rows = int(pq.ParquetFile(sidecar_path).metadata.num_rows)
+        if sidecar_rows != rows:
+            raise SmokingDataError(
+                "SBDF artifact and key sidecar row counts differ.",
+                code="remote.sbdf_row_count_mismatch",
+                context={"file_id": file_id, "sbdf_rows": rows, "sidecar_rows": sidecar_rows},
+            )
+        schema_contracts.append(
+            {"relative_path": relative, "columns": _read_sbdf_schema(sbdf_path)}
+        )
+        key_rows += _spool_remote_sidecar(
+            sidecar_path,
+            piece_root,
+            generation_id=generation_id,
+            file_id=file_id,
+            sbdf_object_key=object_key,
+            sbdf_sha256=content_sha256,
+            key_columns=spec.row_key_columns,
+            hash_buckets=spec.hash_buckets,
+        )
+        total_rows += rows
+        objects.append(
+            SbdfObject(
+                file_id=file_id,
+                source_relative_path=relative,
+                local_path=sbdf_path,
+                object_key=object_key,
+                sha256=content_sha256,
+                rows=rows,
+            )
+        )
+    indexes = _compact_pieces(piece_root, output_root / "indexes" / "sbdf" / "keys")
+    return BuiltSbdfRepresentation(
+        objects=tuple(objects),
+        index_paths=tuple(indexes),
+        rows=total_rows,
+        key_rows=key_rows,
+        reused_files=len(objects),
+        schema_fingerprint=hashlib.sha256(
+            json.dumps(
+                schema_contracts,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+    )
+
+
 def _read_sbdf_schema(path: Path) -> list[dict[str, Any]]:
     with path.open("rb") as handle:
         if handle.read(5) != b"\xdf\x5b\x01\x01\x00":

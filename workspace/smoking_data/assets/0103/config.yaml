@@ -15,7 +15,10 @@ output:
     root_dir: f"{asset_data_root}/{job_name}"
     format: parquet
     compression: zstd
-    write_policy: atomic_replace
+    physical_layout:
+      profile: source_ingest_v1
+      adaptation_scope: generation_fixed
+      row_group_rows: 100000
     file_name_rule:
       dataset: "{run_date}_{source_file_flat}_{job_id}.{job_name}_{route_name}"
       parquet: "data_{source_file_flat}_{part_index:04d}_{transform_revision16}.parquet"
@@ -23,7 +26,5 @@ output:
         posix_separator_replacement: "_"
         windows_separator_replacement: "_"
         collision_hash_length: 8
-    parquet_writer:
-      row_group_size: 100000
   logging:
     root_dir: f"{asset_log_root}"

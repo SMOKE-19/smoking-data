@@ -5,9 +5,11 @@ config:
 paths:
   data_root: DATA
   temp_root: .temp
-  metadata_root: f"{temp_root}/metadata"
-  log_root: f"{temp_root}/logs"
+  metadata_root: metadata
+  log_root: logs
   schedule_root: schedules
+
+  custom_yaml_root: templates_new
 
 execution:
   workers: 1

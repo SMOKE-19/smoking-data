@@ -21,12 +21,18 @@ from smoking_data.core.pipeline_dag import (
     CURATED_PIPELINE_SCHEMA_VERSION,
     PIPELINE_SCHEMA_VERSION,
     PUBLIC_EXECUTION_KEYS,
+    SNAPSHOT_PIPELINE_SCHEMA_VERSION,
     normalize_pipeline_document,
 )
 
 SUPPORTED_PIPELINE_SCHEMA_VERSIONS = frozenset(
-    {PIPELINE_SCHEMA_VERSION, CURATED_PIPELINE_SCHEMA_VERSION}
+    {
+        PIPELINE_SCHEMA_VERSION,
+        CURATED_PIPELINE_SCHEMA_VERSION,
+        SNAPSHOT_PIPELINE_SCHEMA_VERSION,
+    }
 )
+_SNAPSHOT_PARTITION_COLUMN = "__smoking_data_snapshot_partition"
 INTERNAL_ROOT_KEYS = frozenset(
     {
         "schema_version",
@@ -53,6 +59,7 @@ SOURCE_KEYS = frozenset(
         "combined_members",
         "source_column",
         "duplicate_path_policy",
+        "keyspace",
     }
 )
 SINK_KEYS = frozenset({"kind", "path", "compression", "overwrite"})
@@ -73,6 +80,7 @@ class SourceSpec:
     combined_members: tuple[dict[str, Any], ...] = ()
     source_column: dict[str, Any] | None = None
     duplicate_path_policy: str | None = None
+    keyspace: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +369,7 @@ def parse_sources(raw: dict[str, Any]) -> dict[str, SourceSpec]:
                 if config.get("duplicate_path_policy")
                 else None
             ),
+            keyspace=(dict(config["keyspace"]) if config.get("keyspace") else None),
         )
         for name, config in raw["sources"].items()
     }
@@ -407,14 +416,29 @@ def compile_operations(
     primary_sources = [name for name in raw["sources"] if name not in right_source_names]
     known_columns: set[str] = set()
     validate_columns = source_columns is not None
-    if source_columns is not None and len(primary_sources) == 1:
-        known_columns.update(source_columns.get(primary_sources[0], ()))
+    primary_source = primary_sources[0] if len(primary_sources) == 1 else None
+    primary_config = raw["sources"].get(primary_source, {}) if primary_source else {}
+    keyspace = primary_config.get("keyspace") if isinstance(primary_config, dict) else None
+    if isinstance(keyspace, dict):
+        known_columns.update(str(item) for item in keyspace.get("keys") or [])
+    elif source_columns is not None and primary_source is not None:
+        known_columns.update(source_columns.get(primary_source, ()))
     else:
         for columns in (source_columns or {}).values():
             known_columns.update(columns)
-    known_dtypes = dict(
-        (source_dtypes or {}).get(primary_sources[0], {}) if len(primary_sources) == 1 else {}
-    )
+    if isinstance(keyspace, dict):
+        members = keyspace.get("members") or []
+        first_member = members[0].get("name") if members and isinstance(members[0], dict) else None
+        member_dtypes = (source_dtypes or {}).get(str(first_member), {})
+        known_dtypes = {
+            str(key): member_dtypes[str(key)]
+            for key in keyspace.get("keys") or []
+            if str(key) in member_dtypes
+        }
+    else:
+        known_dtypes = dict(
+            (source_dtypes or {}).get(primary_source, {}) if primary_source is not None else {}
+        )
 
     for index, value in enumerate(raw["operations"]):
         path = f"operations[{index}]"
@@ -452,7 +476,13 @@ def compile_operations(
             schema_version=schema_version,
         )
         if validate_columns:
-            missing = sorted(set(operation.input_columns).difference(known_columns))
+            missing_columns = set(operation.input_columns).difference(known_columns)
+            if schema_version == SNAPSHOT_PIPELINE_SCHEMA_VERSION and kind in {
+                OperationKind.MATERIALIZE,
+                OperationKind.WRITE_DATASET,
+            }:
+                missing_columns.discard(_SNAPSHOT_PARTITION_COLUMN)
+            missing = sorted(missing_columns)
             if missing:
                 raise ValidationError(
                     "Operation references columns not produced by prior operations.",
@@ -471,6 +501,7 @@ def compile_operations(
                     OperationKind.RENAME_COLUMNS,
                     OperationKind.INCLUDE_COLUMNS,
                     OperationKind.UNPIVOT,
+                    OperationKind.LIST_RESTORE,
                 }
             )
             if duplicate_outputs:
@@ -625,11 +656,29 @@ def _compile_operation(
         allowed_keys = {"method", "group_keys", "sort", "sidecar"}
         _keys(config, allowed_keys, path=path)
         method = str(config.get("method") or "sort_first").strip().lower()
-        if method != "sort_first":
+        if method not in {"sort_first", "all_rows"}:
             raise ValidationError(
-                "active_row_selection currently requires method=sort_first.",
+                "active_row_selection method must be sort_first or all_rows.",
                 code="active_row_selection.unsupported_method",
                 context={"path": f"{path}.method", "value": method},
+            )
+        if method == "all_rows":
+            if config.get("group_keys") or config.get("sort"):
+                raise ValidationError(
+                    "active_row_selection method=all_rows does not accept group_keys or sort.",
+                    code="active_row_selection.invalid_all_rows",
+                    context={"path": path},
+                )
+            return _operation(
+                operation_id,
+                kind,
+                {
+                    "method": method,
+                    "sidecar": str(config.get("sidecar") or "").strip() or None,
+                    "group_keys": [],
+                    "sort": [],
+                    "expression_ir": None,
+                },
             )
         group_key_items = _mapping_list(config.get("group_keys"), path=f"{path}.group_keys")
         canonical_group_keys: list[dict[str, str]] = []
@@ -838,6 +887,82 @@ def _compile_operation(
         inputs = _assertion_columns(rules, path=path)
         _validate_static_assertion_dtypes(rules, known_dtypes=known_dtypes, path=path)
         return _operation(operation_id, kind, config, input_columns=inputs)
+    if kind is OperationKind.UNNEST:
+        _keys(config, {"columns", "max_elements_per_row"}, path=path)
+        raw_bindings = config.get("columns")
+        all_list_columns = raw_bindings is None or raw_bindings == "auto"
+        if all_list_columns:
+            bindings: list[dict[str, Any]] = []
+        else:
+            bindings = _mapping_list(raw_bindings, path=f"{path}.columns")
+            if not bindings:
+                raise ValidationError(
+                    "unnest columns must be omitted, auto, or a non-empty binding list.",
+                    code="unnest.empty_columns",
+                    context={"path": f"{path}.columns"},
+                )
+        canonical_bindings: list[dict[str, str]] = []
+        sources: list[str] = []
+        outputs: list[str] = []
+        for index, binding in enumerate(bindings):
+            binding_path = f"{path}.columns[{index}]"
+            _keys(binding, {"source", "output"}, path=binding_path)
+            source = _required_string(binding.get("source"), path=f"{binding_path}.source")
+            output = str(binding.get("output") or source).strip()
+            if not output:
+                raise ValidationError(
+                    "unnest output must not be empty.",
+                    code="yaml.invalid_type",
+                    context={"path": f"{binding_path}.output"},
+                )
+            sources.append(source)
+            outputs.append(output)
+            canonical_bindings.append({"source": source, "output": output})
+        if len(sources) != len(set(sources)) or len(outputs) != len(set(outputs)):
+            raise ValidationError(
+                "unnest source and output names must be unique.",
+                code="unnest.duplicate_binding",
+                context={"path": f"{path}.columns"},
+            )
+        collisions = sorted(set(outputs).intersection(known_columns).difference(sources))
+        if collisions:
+            raise ValidationError(
+                "unnest output columns collide with existing columns.",
+                code="unnest.column_collision",
+                context={"path": path, "columns": collisions},
+            )
+        invalid_dtypes = {
+            source: known_dtypes[source]
+            for source in sources
+            if source in known_dtypes
+            and known_dtypes[source] != "unknown"
+            and not str(known_dtypes[source]).lower().startswith(("list", "large_list"))
+        }
+        if invalid_dtypes:
+            raise ValidationError(
+                "unnest source columns must have Arrow List dtype.",
+                code="unnest.invalid_dtype",
+                context={"path": path, "dtypes": invalid_dtypes},
+            )
+        max_elements = _positive_integer(
+            config.get("max_elements_per_row", 1024),
+            path=f"{path}.max_elements_per_row",
+        )
+        return _operation(
+            operation_id,
+            kind,
+            {
+                "columns": canonical_bindings,
+                "all_list_columns": all_list_columns,
+                "max_elements_per_row": max_elements,
+            },
+            input_columns=tuple(sources),
+            output_columns=tuple(ColumnContract(name) for name in outputs),
+            alias_lineage={
+                output: (source,)
+                for source, output in zip(sources, outputs, strict=True)
+            },
+        )
     if kind is OperationKind.UNPIVOT:
         _keys(
             config,
@@ -1002,18 +1127,18 @@ def _compile_operation(
                 code="join.key_dtype_mismatch",
                 context={"path": path, "mismatches": mismatches},
             )
-        right_outputs = _resolve_join_output_columns(
+        right_outputs, resolved_columns = _resolve_join_output_columns(
             config.get("columns") or {},
             source_columns=(source_columns or {}).get(right_source, ()),
             right_on=right_on,
             known_columns=known_columns,
-            suffix=str(config.get("suffix") or f"_{right_source}"),
+            collision_suffix=_join_collision_suffix(config, right_source=right_source),
             path=path,
         )
         return _operation(
             operation_id,
             kind,
-            {**config, "how": how},
+            {**config, "how": how, "columns": resolved_columns},
             input_columns=left_on,
             output_columns=tuple(ColumnContract(name) for name in right_outputs),
             group_keys=left_on,
@@ -1166,6 +1291,10 @@ def _advance_known_columns(columns: set[str], operation: Any) -> None:
     elif operation.kind is OperationKind.UNPIVOT:
         columns.clear()
         columns.update(column.name for column in operation.output_columns)
+    elif operation.kind is OperationKind.UNNEST:
+        for binding in operation.config["columns"]:
+            columns.discard(binding["source"])
+            columns.add(binding["output"])
     else:
         columns.update(column.name for column in operation.output_columns)
 
@@ -1218,6 +1347,15 @@ def _advance_known_dtypes(dtypes: dict[str, str], operation: Any) -> None:
         retained[operation.config["value_column"]] = "unknown"
         dtypes.clear()
         dtypes.update(retained)
+    elif operation.kind is OperationKind.UNNEST:
+        if operation.config.get("all_list_columns"):
+            for name, dtype in list(dtypes.items()):
+                if str(dtype).lower().startswith(("list", "large_list")):
+                    dtypes[name] = "unknown"
+        else:
+            for binding in operation.config["columns"]:
+                dtypes.pop(binding["source"], None)
+                dtypes[binding["output"]] = "unknown"
     else:
         for column in operation.output_columns:
             if column.dtype:
@@ -1312,16 +1450,20 @@ def _resolve_join_output_columns(
     source_columns: tuple[str, ...],
     right_on: tuple[str, ...],
     known_columns: set[str],
-    suffix: str,
+    collision_suffix: str,
     path: str,
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any]]:
     if not isinstance(policy, dict):
         raise ValidationError(
             "join columns must be a mapping.",
             code="yaml.invalid_type",
             context={"path": f"{path}.columns"},
         )
-    _keys(policy, {"include", "exclude", "regex"}, path=f"{path}.columns")
+    _keys(
+        policy,
+        {"include", "exclude", "regex", "exclude_regex"},
+        path=f"{path}.columns",
+    )
     include = [str(item) for item in policy.get("include") or []]
     exclude = {str(item) for item in policy.get("exclude") or []}
     patterns = []
@@ -1334,6 +1476,27 @@ def _resolve_join_output_columns(
                 code="join.invalid_column_regex",
                 context={"path": f"{path}.columns.regex", "pattern": pattern},
             ) from error
+    exclude_patterns = []
+    for pattern in policy.get("exclude_regex") or []:
+        try:
+            exclude_patterns.append(re.compile(str(pattern)))
+        except re.error as error:
+            raise ValidationError(
+                "Invalid join exclude column regex.",
+                code="join.invalid_column_regex",
+                context={"path": f"{path}.columns.exclude_regex", "pattern": pattern},
+            ) from error
+    excluded_required = sorted(
+        name
+        for name in right_on
+        if name in exclude or any(pattern.search(name) for pattern in exclude_patterns)
+    )
+    if excluded_required:
+        raise ValidationError(
+            "Join key columns cannot be excluded.",
+            code="join.required_column_excluded",
+            context={"path": path, "columns": excluded_required},
+        )
     missing = sorted(set(include).difference(source_columns))
     if source_columns and missing:
         raise ValidationError(
@@ -1353,15 +1516,36 @@ def _resolve_join_output_columns(
             )
         )
     )
-    selected = [name for name in selected if name not in exclude and name not in right_on]
-    outputs = [f"{name}{suffix}" if name in known_columns else name for name in selected]
+    selected = [
+        name
+        for name in selected
+        if name not in exclude
+        and not any(pattern.search(name) for pattern in exclude_patterns)
+        and name not in right_on
+    ]
+    outputs = [
+        f"{name}{collision_suffix}" if name in known_columns else name
+        for name in selected
+    ]
     if len(outputs) != len(set(outputs)) or any(name in known_columns for name in outputs):
         raise ValidationError(
             "Join output column collision cannot be resolved by suffix.",
             code="join.output_column_collision",
             context={"path": path, "columns": outputs},
         )
-    return outputs
+    resolved_policy = (
+        {"include": list(dict.fromkeys([*right_on, *selected]))}
+        if source_columns
+        else dict(policy)
+    )
+    return outputs, resolved_policy
+
+
+def _join_collision_suffix(config: dict[str, Any], *, right_source: str) -> str:
+    """Return the suffix used only when a right output name collides with the left schema."""
+
+    configured = str(config.get("suffix") or "").strip()
+    return configured or f"_{right_source}"
 
 
 def _assertion_columns(rules: list[dict[str, Any]], *, path: str) -> tuple[str, ...]:
@@ -1615,9 +1799,12 @@ def _validate_explicit_physical_boundaries(
             reference = str(operation.config.get("coordinates_from") or "")
             if reference:
                 referenced = by_id.get(reference)
-                if referenced is None or referenced.kind is not OperationKind.ACTIVE_ROW_SELECTION:
+                if referenced is None or referenced.kind not in {
+                    OperationKind.ACTIVE_ROW_SELECTION,
+                    OperationKind.BUILD_SIDECAR,
+                }:
                     raise ValidationError(
-                        "materialize coordinates_from must reference active_row_selection.",
+                        "materialize coordinates_from must reference active_row_selection or build_sidecar.",
                         code="materialize.invalid_coordinate_source",
                         context={"operation_id": operation.operation_id, "reference": reference},
                     )
@@ -1639,6 +1826,7 @@ def _validate_explicit_physical_boundaries(
         OperationKind.LIST_RESTORE,
         OperationKind.PIVOT,
         OperationKind.JOIN,
+        OperationKind.UNNEST,
     }
     for operation in operations:
         if operation.kind not in heavy_kinds:

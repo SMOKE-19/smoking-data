@@ -11,7 +11,7 @@ def run_yaml(
     config_path: str | Path | None = None,
     project_root: str | Path | None = None,
 ) -> StageResult:
-    """Run the canonical Pipeline v6 definition that produces a 0401 snapshot."""
+    """Run the canonical Pipeline v8 definition that produces one 0401 snapshot file."""
     from smoking_data.runtime.runner import run_pipeline_yaml
 
     return run_pipeline_yaml(

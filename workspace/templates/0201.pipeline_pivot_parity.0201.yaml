@@ -11,7 +11,6 @@ output:
     root_dir: DATA/parity/curated/output
     format: parquet
     compression: zstd
-    write_policy: atomic_replace
     physical_layout:
       profile: curated_reuse_v1
       adaptation_scope: generation_fixed
@@ -35,6 +34,10 @@ define_upstream:
 build_sidecar:
   alias: select_all_rows
   source: main
+  partition_by: [partition]
+  part_boundary:
+    target_rows: 2
+    preserve_groups: [partition, row_key, metric]
   columns: auto
   operations:
   - op: active_row_selection
@@ -53,12 +56,6 @@ build_sidecar:
 
 materialize:
   alias: materialize_pivot_payload
-  source: main
-  coordinates: select_all_rows
-  partition_by: [partition]
-  part_boundary:
-    target_rows: 2
-    preserve_groups: [partition, row_key, metric]
   workers: 1
   max_tasks_per_child: 1
   operations:
@@ -84,12 +81,6 @@ materialize:
     first_duplicate_policy: error
     null_column_key_policy: label
 
-save_dataset:
-  alias: write_pivot
-  input: materialize_pivot_payload
-  partition_by: [partition]
-  operations: []
-
 execution:
   memory:
     hard_limit_mb: 4096
@@ -101,9 +92,6 @@ execution:
       materialize:
         target_peak_memory_mb: 3584
         workers: {min: 1, max: 2}
-      save_dataset:
-        target_peak_memory_mb: 512
-        workers: {min: 1, max: 1}
   reset_before_run: true
   # probe·candidate·active sidecar와 physical plan은 전체 입력으로 만들고 최종 task만 제한한다.
   # 같은 root_dir의 전체 결과를 부분 dataset으로 대체하므로 테스트 전용 경로 사용을 권장한다.

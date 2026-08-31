@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-REMOTE_MANIFEST_VERSION = "smoking-data.remote-dataset-bundle.v1"
+REMOTE_MANIFEST_VERSION = "smoking-data.remote-dataset-bundle.v2"
 REMOTE_POINTER_VERSION = "smoking-data.remote-dataset-pointer.v1"
-PUBLICATION_RECEIPT_VERSION = "smoking-data.publication-receipt.v1"
+PUBLICATION_RECEIPT_VERSION = "smoking-data.publication-receipt.v2"
 
 
 def canonical_json(payload: Any) -> bytes:
@@ -60,7 +60,6 @@ def build_remote_manifest(
     local_manifest_sha256: str,
     definition_sha256: str,
     schema_fingerprint: str,
-    commit_kind: str,
     objects: Iterable[RemoteObject],
     target_identity: dict[str, Any],
     representations: dict[str, Any],
@@ -83,7 +82,6 @@ def build_remote_manifest(
         "local_manifest_sha256": local_manifest_sha256,
         "definition_sha256": definition_sha256,
         "schema_fingerprint": schema_fingerprint,
-        "commit_kind": commit_kind,
         "target": target_identity,
         "objects": object_rows,
         "representations": representations,

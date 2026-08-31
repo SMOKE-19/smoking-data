@@ -14,6 +14,7 @@ from typing import Any
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from smoking_data.backends.rust_engine import (
@@ -21,6 +22,7 @@ from smoking_data.backends.rust_engine import (
     execute_curated_task,
     validate_dataset_assertions,
 )
+from smoking_data.backends.streaming_sbdf import SbdfExportRequest, export_sbdf_with_result
 from smoking_data.core.barriers import (
     BarrierState,
     ensure_complete_group_within_budget,
@@ -118,6 +120,7 @@ from smoking_data.runtime.naming import (
     task_id,
 )
 from smoking_data.runtime.object_store.remote_upstream import materialize_remote_parquet_files
+from smoking_data.runtime.output_contract import resolve_physical_writer_output
 from smoking_data.runtime.output_physical_layout import (
     TASK_ADAPTIVE,
     previous_output_physical_layout_matches,
@@ -184,6 +187,7 @@ INTERNAL_DISABLE_TASK_TELEMETRY_ENV = "SMOKING_DATA_INTERNAL_DISABLE_TASK_TELEME
 INTERNAL_DISABLE_ACTIVE_SIDECAR_PLAN_ENV = "SMOKING_DATA_INTERNAL_DISABLE_ACTIVE_SIDECAR_PLAN"
 INTERNAL_FORCE_ACTIVE_SIDECAR_PLAN_ENV = "SMOKING_DATA_INTERNAL_FORCE_ACTIVE_SIDECAR_PLAN"
 SELECTOR_TARGET_ROWS_PER_BUCKET = 100_000
+SNAPSHOT_PARTITION_COLUMN = "__smoking_data_snapshot_partition"
 
 
 def can_run(preset: str) -> bool:
@@ -203,12 +207,14 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     payload = _mapping(source.get("payload"), section="source.payload")
     row_selection = _mapping(raw.get("row_selection"), section="row_selection", allow_missing=True)
     pivot = _mapping(raw.get("pivot"), section="pivot", allow_missing=True)
-    output = _mapping(raw.get("output"), section="output")
+    output = resolve_physical_writer_output(raw, asset_code="0201")
+    single_file_output = bool((raw.get("__pipeline") or {}).get("single_file_output"))
+    physical_raw = {**raw, "output": output}
     list_restore = _mapping(raw.get("list_restore"), section="list_restore", allow_missing=True)
     _validate_reserved_payload_columns(payload)
     expression_ir = _compile_expression_ir(payload.get("add_calc"))
     expression_ir_hash = _expression_ir_hash(expression_ir)
-    logical_plan = compile_0201_logical_plan(raw, expression_ir=expression_ir)
+    logical_plan = compile_0201_logical_plan(physical_raw, expression_ir=expression_ir)
     logical_plan_hash = str(
         (raw.get("__pipeline") or {}).get("logical_plan_hash") or logical_plan.plan_hash
     )
@@ -686,7 +692,9 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                             **base_payload,
                             "writer_input_contract": _writer_input_contract(
                                 physical_by_id[task.task_id],
-                                partition_columns=[partition_column],
+                                partition_columns=(
+                                    [] if single_file_output else [partition_column]
+                                ),
                                 output_columns=list(
                                     base_payload.get("writer_output_columns_hint") or []
                                 ),
@@ -759,9 +767,10 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             "test_run": test_run_profile,
             "adaptive_task_boundary_decision": adaptive_task_boundary_decision,
             "output_physical_layout": output_physical_layout,
+            "artifact_format": str(output.get("format") or "parquet"),
         },
     )
-    if test_run_limit is not None:
+    if test_run_limit is not None or single_file_output:
         staged_results, dirty_tasks = [], tasks
     else:
         staged_results, dirty_tasks = _stage_reusable_coordinate_tasks(
@@ -1030,6 +1039,18 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             transaction.manifest_context["output_physical_layout"] = output_physical_layout
         phase_profile["materialize_tasks_sec"] = time.perf_counter() - materialize_started
         task_results = [*staged_results, *task_results]
+        if single_file_output:
+            snapshot_started = time.perf_counter()
+            snapshot_profile = _compact_staged_snapshot_to_single_file(
+                transaction.staging_root,
+                compression=str(output.get("compression") or "zstd"),
+                row_group_rows=min(applied_output_row_group_rows.values(), default=1_000),
+            )
+            phase_profile["single_snapshot_compaction_sec"] = (
+                time.perf_counter() - snapshot_started
+            )
+            if transaction.manifest_context is not None:
+                transaction.manifest_context["single_file_output"] = snapshot_profile
         assertion_started = time.perf_counter()
         assertion_profile = _validate_staged_dataset_assertions(
             transaction,
@@ -1038,6 +1059,15 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             config=config,
         )
         phase_profile["dataset_assertion_sec"] = time.perf_counter() - assertion_started
+        if single_file_output and str(output.get("format") or "parquet") == "sbdf":
+            sbdf_started = time.perf_counter()
+            sbdf_profile = _convert_staged_snapshot_to_sbdf(
+                transaction,
+                config=dict(output.get("sbdf") or {}),
+            )
+            phase_profile["sbdf_artifact_sec"] = time.perf_counter() - sbdf_started
+            if transaction.manifest_context is not None:
+                transaction.manifest_context["sbdf_artifact"] = sbdf_profile
         _validate_probe_snapshot_barrier(
             probe_profile=probe_profile,
             source_paths=source_paths,
@@ -1148,6 +1178,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         task_results,
         staging_root=transaction.staging_root,
         final_root=output_dir,
+        single_output_path=(output_files[0] if single_file_output and output_files else None),
     )
     task_phase_profile = _task_phase_profile(task_results)
     rust_phase_profile = _rust_task_phase_profile(task_results)
@@ -1756,6 +1787,9 @@ def _post_operation_row_multiplier(operations: list[dict[str, Any]]) -> int:
         if operation.get("kind") == "unpivot":
             config = operation.get("config") or {}
             multiplier *= max(1, len(config.get("value_columns") or []))
+        elif operation.get("kind") == "unnest":
+            config = operation.get("config") or {}
+            multiplier *= max(1, int(config.get("max_elements_per_row") or 1024))
     return multiplier
 
 
@@ -1922,6 +1956,7 @@ def indexed_curated_task_worker(task: TaskSpec) -> TaskResult:
     writer_payload = {
         **payload["payload"],
         "writer_input_contract": payload.get("writer_input_contract"),
+        "source_projection_columns_hint": payload.get("writer_output_columns_hint") or [],
         "expression_ir": payload.get("expression_ir"),
         "ordered_operations": payload.get("ordered_operations") or [],
         "compression": payload.get("compression") or "zstd",
@@ -2067,12 +2102,161 @@ def _remap_transaction_task_outputs(
     *,
     staging_root: Path,
     final_root: Path,
+    single_output_path: Path | None = None,
 ) -> list[TaskResult]:
     remapped: list[TaskResult] = []
     for result in task_results:
-        output_paths = [final_root / path.relative_to(staging_root) for path in result.output_paths]
+        output_paths = (
+            [single_output_path]
+            if single_output_path is not None
+            else [final_root / path.relative_to(staging_root) for path in result.output_paths]
+        )
         remapped.append(replace(result, output_paths=output_paths))
     return remapped
+
+
+def _compact_staged_snapshot_to_single_file(
+    staging_root: Path,
+    *,
+    compression: str,
+    row_group_rows: int,
+) -> dict[str, Any]:
+    """Stream bounded task parts into one schema-unified 0401 snapshot file."""
+
+    source_paths = [
+        path for path in sorted(staging_root.rglob("*.parquet")) if path.is_file()
+    ]
+    if not source_paths:
+        raise RuntimeError("0401 snapshot transaction contains no Parquet task outputs.")
+    schemas = [pq.ParquetFile(path).schema_arrow for path in source_paths]
+    try:
+        schema = pa.unify_schemas(schemas, promote_options="permissive")
+    except TypeError:  # pragma: no cover - older supported PyArrow fallback
+        schema = pa.unify_schemas(schemas)
+    temporary = staging_root / ".snapshot.parquet.tmp"
+    output_path = staging_root / "snapshot.parquet"
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    try:
+        writer = pq.ParquetWriter(
+            temporary,
+            schema,
+            compression=None if compression == "uncompressed" else compression,
+        )
+        for source_path in source_paths:
+            parquet = pq.ParquetFile(source_path)
+            for batch in parquet.iter_batches(batch_size=max(1, row_group_rows)):
+                table = pa.Table.from_batches([batch])
+                arrays: list[pa.ChunkedArray] = []
+                for field in schema:
+                    if field.name not in table.column_names:
+                        arrays.append(pa.chunked_array([pa.nulls(table.num_rows, type=field.type)]))
+                        continue
+                    column = table.column(field.name)
+                    arrays.append(
+                        column
+                        if column.type == field.type
+                        else pc.cast(column, target_type=field.type, safe=True)
+                    )
+                aligned = pa.Table.from_arrays(arrays, schema=schema)
+                writer.write_table(aligned, row_group_size=max(1, row_group_rows))
+                rows += aligned.num_rows
+        writer.close()
+        writer = None
+        os.replace(temporary, output_path)
+        for source_path in source_paths:
+            source_path.unlink()
+        for directory in sorted(
+            (path for path in staging_root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+    except BaseException:
+        if writer is not None:
+            writer.close()
+        temporary.unlink(missing_ok=True)
+        raise
+    return {
+        "mode": "streaming_parquet_single_file",
+        "input_parts": len(source_paths),
+        "output_parts": 1,
+        "rows": rows,
+        "relative_path": output_path.relative_to(staging_root).as_posix(),
+        "row_group_rows": max(1, row_group_rows),
+        "schema_unified_by_name": True,
+    }
+
+
+def _convert_staged_snapshot_to_sbdf(
+    transaction: DatasetTransaction,
+    *,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert the validated 0401 Parquet staging file to the committed SBDF artifact."""
+
+    parquet_path = transaction.staging_root / "snapshot.parquet"
+    if not parquet_path.is_file():
+        raise RuntimeError("0401 SBDF conversion requires snapshot.parquet staging output.")
+    row_key_columns = [str(value) for value in config.get("row_key_columns") or []]
+    if not row_key_columns:
+        raise ValidationError(
+            "0401 SBDF output requires output.artifact.sbdf.row_key_columns.",
+            code="output.sbdf_key_columns_required",
+        )
+    schema = pq.ParquetFile(parquet_path).schema_arrow
+    missing = [name for name in row_key_columns if name not in schema.names]
+    if missing:
+        raise ValidationError(
+            "0401 SBDF row key columns are missing from the final snapshot.",
+            code="output.sbdf_key_column_missing",
+            context={"missing": missing, "available": schema.names},
+        )
+    sbdf_path = transaction.staging_root / "snapshot.sbdf"
+    sidecar_path = (
+        transaction.staging_root / "_smoking_data" / "sbdf-keys" / "snapshot.keys.parquet"
+    )
+    ensure_dir(sidecar_path.parent)
+    result = export_sbdf_with_result(
+        SbdfExportRequest(
+            parquet_files=[parquet_path],
+            sbdf_path=sbdf_path,
+            row_key_columns=row_key_columns,
+            sidecar_path=sidecar_path,
+            table_id=f"0401:{transaction.transaction_id}",
+            batch_size=int(config.get("batch_size") or 50_000),
+            encoding_rle=bool(config.get("encoding_rle", True)),
+        )
+    )
+    if not result.output_path.is_file() or not sidecar_path.is_file():
+        raise RuntimeError("smoking-sbdf did not produce the 0401 artifact and key sidecar.")
+    source_rows = int(pq.ParquetFile(parquet_path).metadata.num_rows)
+    if int(result.row_count) != source_rows:
+        raise RuntimeError(
+            f"0401 Parquet/SBDF row count mismatch: parquet={source_rows}, sbdf={result.row_count}"
+        )
+    parquet_path.unlink()
+    relative = sbdf_path.relative_to(transaction.staging_root).as_posix()
+    sidecar_relative = sidecar_path.relative_to(transaction.staging_root).as_posix()
+    if transaction.manifest_context is not None:
+        transaction.manifest_context["sbdf_parts"] = {
+            relative: {
+                "rows": source_rows,
+                "schema": str(schema),
+                "key_sidecar_relative_path": sidecar_relative,
+            }
+        }
+    return {
+        "mode": "parquet_staging_to_sbdf_atomic_commit",
+        "output_parts": 1,
+        "rows": source_rows,
+        "relative_path": relative,
+        "key_sidecar_relative_path": sidecar_relative,
+        "row_key_columns": row_key_columns,
+    }
 
 
 def _coordinate_task_fingerprint(
@@ -3936,9 +4120,18 @@ def _build_source_candidate_sidecar(
     average_payload_bytes: int,
 ) -> pl.DataFrame:
     raw_lf = pl.scan_parquet(source_path)
-    collisions = reserved_columns.intersection(raw_lf.collect_schema().names())
+    source_names = raw_lf.collect_schema().names()
+    collisions = reserved_columns.intersection(source_names)
     if collisions:
         raise ValidationError(f"0201 source uses reserved coordinate columns: {sorted(collisions)}")
+    if SNAPSHOT_PARTITION_COLUMN in selector_columns:
+        if SNAPSHOT_PARTITION_COLUMN in source_names:
+            raise ValidationError(
+                f"0401 source uses reserved snapshot column: {SNAPSHOT_PARTITION_COLUMN}"
+            )
+        raw_lf = raw_lf.with_columns(
+            pl.lit("snapshot", dtype=pl.String).alias(SNAPSHOT_PARTITION_COLUMN)
+        )
     transformed = _apply_payload_lf(
         raw_lf.with_row_index(SOURCE_ROW_INDEX_COLUMN),
         payload=planner_payload,
@@ -4394,6 +4587,15 @@ def _write_curated_part_rust_direct(
     required_source_columns.update(
         _post_operation_source_columns(pre_pivot_operations) - generated_columns
     )
+    post_generated_columns = _post_operation_output_columns(
+        [*pre_pivot_operations, *post_operations]
+    )
+    required_source_columns.update(
+        str(column)
+        for column in payload.get("source_projection_columns_hint") or []
+        if str(column) not in generated_columns
+        and str(column) not in post_generated_columns
+    )
     if restore_enabled:
         required_source_columns.update(
             [
@@ -4489,6 +4691,12 @@ def _post_operation_source_columns(operations: list[dict[str, Any]]) -> set[str]
         elif kind == "unpivot":
             columns.update(source_name(str(item)) for item in config.get("id_columns") or [])
             columns.update(source_name(str(item)) for item in config.get("value_columns") or [])
+        elif kind == "unnest":
+            columns.update(
+                source_name(str(item.get("source") or ""))
+                for item in config.get("columns") or []
+                if isinstance(item, dict)
+            )
         elif kind == "data_assertion":
             for rule in config.get("rules") or []:
                 if not isinstance(rule, dict):
@@ -4496,6 +4704,36 @@ def _post_operation_source_columns(operations: list[dict[str, Any]]) -> set[str]
                 columns.update(source_name(str(item)) for item in rule.get("columns") or [])
                 if rule.get("column"):
                     columns.add(source_name(str(rule["column"])))
+    columns.discard("")
+    return columns
+
+
+def _post_operation_output_columns(operations: list[dict[str, Any]]) -> set[str]:
+    columns: set[str] = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        kind = str(operation.get("kind") or "")
+        config = operation.get("config") or {}
+        if not isinstance(config, dict):
+            continue
+        if kind == "rename_columns":
+            mapping = config.get("resolved_mapping") or config.get("mapping") or {}
+            if isinstance(mapping, dict):
+                columns.update(str(item) for item in mapping.values())
+        elif kind == "unpivot":
+            columns.update(
+                {
+                    str(config.get("name_column") or ""),
+                    str(config.get("value_column") or ""),
+                }
+            )
+        elif kind == "unnest":
+            columns.update(
+                str(item.get("output") or item.get("source") or "")
+                for item in config.get("columns") or []
+                if isinstance(item, dict)
+            )
     columns.discard("")
     return columns
 

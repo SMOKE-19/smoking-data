@@ -12,6 +12,25 @@ def resolve_project_path(value: str | Path, *, project_root: Path) -> Path:
     return path.resolve()
 
 
+def infer_project_root(path: str | Path) -> Path:
+    """Find the workspace root used for relative config and data paths.
+
+    An explicit ``--project-root`` remains authoritative.  Otherwise an Asset
+    or Chain YAML is resolved against the nearest initialized workspace, which
+    keeps CLI execution independent of the caller's current directory.
+    """
+
+    resolved = Path(path).expanduser().resolve()
+    for parent in (resolved.parent, *resolved.parents):
+        if (parent / ".smoking-data" / "config.yaml").is_file():
+            return parent
+        if parent.name == "settings":
+            return parent.parent
+        if (parent / "pyproject.toml").exists():
+            return parent
+    return resolved.parent
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path

@@ -28,12 +28,16 @@ ENGINE_CONTRIBUTION = WorkspaceContribution(
         "pipeline-v6.schema.json": [
             "**/*.0301.yaml",
             "**/*.0301.yml",
-            "**/*.0401.yaml",
-            "**/*.0401.yml",
         ],
         "pipeline-v7.schema.json": ["**/*.0201.yaml", "**/*.0201.yml"],
+        "pipeline-v8.schema.json": ["**/*.0401.yaml", "**/*.0401.yml"],
         "calculated-fact-v2.schema.json": ["**/*.0102.yaml", "**/*.0102.yml"],
-        "asset-chain-v2.schema.json": ["**/*.chain.yaml", "**/*.chain.yml"],
+        "asset-chain-v2.schema.json": [
+            "**/*.chain.yaml",
+            "**/*.chain.yml",
+            "**/chain.*.yaml",
+            "**/chain.*.yml",
+        ],
         "schedule-v1.schema.json": ["**/*.schedule.yaml", "**/*.schedule.yml"],
         "layout-migration-v1.schema.json": [
             "**/*.layout-migration.yaml",

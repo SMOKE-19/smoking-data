@@ -50,14 +50,13 @@
         "artifact": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "root_dir", "format", "compression", "write_policy"],
+          "required": ["type", "root_dir", "format", "compression", "physical_layout"],
           "properties": {
             "type": {"const": "calculated_fact_dataset"},
             "root_dir": {"$ref": "#/$defs/name"},
             "format": {"const": "parquet"},
             "compression": {"const": "zstd"},
-            "write_policy": {"const": "append_generation"},
-            "physical_layout": {"type": "object"},
+            "physical_layout": {"$ref": "#/$defs/physicalLayout"},
             "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
           }
         },
@@ -280,6 +279,16 @@
       "properties": {
         "target_peak_memory_mb": {"$ref": "#/$defs/positiveInteger"},
         "workers": {"$ref": "#/$defs/workerRange"}
+      }
+    },
+    "physicalLayout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "adaptation_scope", "row_group_rows"],
+      "properties": {
+        "profile": {"type": "string", "minLength": 1},
+        "adaptation_scope": {"const": "generation_fixed"},
+        "row_group_rows": {"oneOf": [{"const": "auto"}, {"type": "integer", "minimum": 1}]}
       }
     },
     "execution": {

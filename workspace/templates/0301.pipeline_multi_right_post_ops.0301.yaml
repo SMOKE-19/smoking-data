@@ -11,7 +11,6 @@ output:
     root_dir: f"{data_root}/{asset_code}/{job_name}"
     format: parquet
     compression: zstd
-    write_policy: atomic_replace
     physical_layout:
       profile: joined_reuse_v1
       adaptation_scope: generation_fixed
@@ -19,7 +18,7 @@ output:
   logging:
     root_dir: f"{log_root}/{asset_code}"
 
-operations:
+define_upstream:
 - op: define_dataset
   alias: left
   paths:
@@ -59,74 +58,77 @@ operations:
 #   alias: right_b
 #   definition: 0201.right_b.0201.yaml
 
-- op: materialize
-  alias: materialize_left_parts
-  inputs: {source: left}
+build_sidecar:
+  alias: join_keyspace
+  method: union_distinct_keys
+  sources: [left]
+  keys: [partition, join_key]
   partition_by: [partition]
   part_boundary:
     target_rows: 20000
     target_key_groups: 500
     preserve_groups: [partition, join_key]
+
+materialize:
+  alias: materialize_left_parts
   workers: 1
   max_tasks_per_child: 4
+  operations:
 
-- op: join
-  alias: join_right_a
-  inputs: {left: materialize_left_parts, right: right_a}
-  how: left
-  left_on: [join_key]
-  right_on: [join_key_r]
-  right_partition_column: partition_r
+  - op: join
+    alias: join_left
+    input_right: left
+    left_on: [partition, join_key]
+    right_on: [partition, join_key]
 
-- op: join
-  alias: join_right_b
-  inputs: {left: join_right_a, right: right_b}
-  how: full
-  left_on: [join_key]
-  right_on: [join_key_r]
-  right_partition_column: partition_r
+  - op: join
+    alias: join_right_a
+    input_right: right_a
+    left_on: [join_key]
+    right_on: [join_key_r]
 
-- op: rename_columns
-  alias: rename_joined
-  inputs: {data: join_right_b}
-  mapping:
-    right_value: right_value_a
+  - op: join
+    alias: join_right_b
+    input_right: right_b
+    left_on: [join_key]
+    right_on: [join_key_r]
 
-- op: include_columns
-  alias: select_join_output
-  inputs: {data: rename_joined}
-  columns:
-  - partition
-  - join_key
-  - right_value_a
-  - measure_a
-  - measure_b
+  - op: rename_columns
+    alias: rename_joined
+    inputs: {data: join_right_b}
+    mapping:
+      right_value: right_value_a
 
-- op: unpivot
-  alias: joined_unpivot
-  inputs: {data: select_join_output}
-  id_columns: [partition, join_key, right_value_a]
-  value_columns: [measure_a, measure_b]
-  name_column: metric_name
-  value_column: metric_value
-  coercion: strict
-  preserve_nulls: true
+  - op: include_columns
+    alias: select_join_output
+    inputs: {data: rename_joined}
+    columns:
+    - partition
+    - join_key
+    - right_value_a
+    - measure_a
+    - measure_b
 
-- op: data_assertion
-  alias: validate_join_output
-  inputs: {data: joined_unpivot}
-  rules:
-  - id: partition_required
-    kind: not_null
-    column: partition
-  - id: metric_name_required
-    kind: not_null
-    column: metric_name
+  - op: unpivot
+    alias: joined_unpivot
+    inputs: {data: select_join_output}
+    id_columns: [partition, join_key, right_value_a]
+    value_columns: [measure_a, measure_b]
+    name_column: metric_name
+    value_column: metric_value
+    coercion: strict
+    preserve_nulls: true
 
-- op: save_dataset
-  alias: write_output
-  inputs: {data: validate_join_output}
-  partition_by: [partition]
+  - op: data_assertion
+    alias: validate_join_output
+    inputs: {data: joined_unpivot}
+    rules:
+    - id: partition_required
+      kind: not_null
+      column: partition
+    - id: metric_name_required
+      kind: not_null
+      column: metric_name
 
 execution:
   memory_budget_mb: 4096

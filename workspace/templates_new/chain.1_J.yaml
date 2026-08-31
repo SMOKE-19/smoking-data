@@ -1,0 +1,52 @@
+yaml:
+  schema_version: smoking-data.asset-chain.v2
+
+chain:
+  name: analysis_1_J
+
+# inputs는 실행 의존관계다. 실제 upstream dataset은 각 Definition의 define_upstream이 소유한다.
+assets:
+- id: source_1_y
+  asset_code: "0101"
+  definition: 0101.1_Y.yaml
+
+- id: source_2_b
+  asset_code: "0101"
+  definition: 0101.2_B.yaml
+
+- id: source_3_m
+  asset_code: "0101"
+  definition: 0101.3_M.yaml
+
+- id: curated_1_y
+  asset_code: "0201"
+  definition: 0201.1_Y.yaml
+  inputs: {source: source_1_y}
+
+- id: curated_2_b
+  asset_code: "0201"
+  definition: 0201.2_B.yaml
+  inputs: {source: source_2_b}
+
+- id: curated_3_m
+  asset_code: "0201"
+  definition: 0201.3_M.yaml
+  inputs: {source: source_3_m}
+
+- id: joined_1_j
+  asset_code: "0301"
+  definition: 0301.1_J.yaml
+  inputs:
+    main: curated_1_y
+    profile: curated_2_b
+    category: curated_3_m
+
+- id: snapshot_1_j
+  asset_code: "0401"
+  definition: 0401.1_J.yaml
+  inputs: {source: joined_1_j}
+
+execution:
+  failure_policy: stop_downstream
+  unchanged_policy: skip
+  max_parallel_assets: 1

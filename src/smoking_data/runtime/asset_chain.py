@@ -16,7 +16,12 @@ from smoking_data.runtime.asset_config import asset_config_fingerprint
 from smoking_data.runtime.asset_contract import asset_contract_fingerprint
 from smoking_data.runtime.config import RuntimeConfig, load_config
 from smoking_data.runtime.events import append_stage_event
-from smoking_data.runtime.paths import ensure_dir, file_sha256, resolve_project_path
+from smoking_data.runtime.paths import (
+    ensure_dir,
+    file_sha256,
+    infer_project_root,
+    resolve_project_path,
+)
 
 ASSET_CHAIN_SCHEMA_VERSION = "smoking-data.asset-chain.v2"
 ASSET_CHAIN_RESULT_SCHEMA_VERSION = "smoking-data.asset-chain-result.v1"
@@ -245,7 +250,8 @@ def run_asset_chain(
     config_path: str | Path | None = None,
     project_root: str | Path | None = None,
 ) -> AssetChainResult:
-    config = load_config(config_path=config_path, project_root=project_root)
+    effective_project_root = project_root or infer_project_root(yaml_path)
+    config = load_config(config_path=config_path, project_root=effective_project_root)
     spec = load_asset_chain(yaml_path, config=config)
     metadata_path = _metadata_path(spec, config=config)
     log_path = _log_path(spec, config=config)
@@ -662,7 +668,7 @@ def _validate_definition_schema(path: Path, *, asset_code: str, asset_id: str) -
         "0103": "smoking-data.csv-source.v1",
         "0201": "smoking-data.pipeline.v7",
         "0301": "smoking-data.pipeline.v6",
-        "0401": "smoking-data.pipeline.v6",
+        "0401": "smoking-data.pipeline.v8",
     }.get(asset_code)
     if expected is None:
         raise ValidationError(

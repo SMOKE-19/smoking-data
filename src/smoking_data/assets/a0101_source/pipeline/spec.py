@@ -330,15 +330,55 @@ def _validate_output_shape(raw: dict[str, object]) -> None:
     artifact = _mapping(output.get("artifact"), path="output.artifact")
     _reject_unknown_keys(
         artifact,
-        {"type", "root_dir", "format", "write_policy", "file_name_rule", "parquet_writer", "publication"},
+        {
+            "type",
+            "root_dir",
+            "format",
+            "compression",
+            "write_policy",  # hidden compatibility input; omitted from public schema
+            "physical_layout",
+            "file_name_rule",
+            "parquet_writer",
+            "publication",
+        },
         path="output.artifact",
     )
     if artifact.get("type") != "source_dataset":
         raise ValueError("output.artifact.type은 'source_dataset'이어야 합니다.")
     if artifact.get("format") != "parquet":
         raise ValueError("output.artifact.format은 'parquet'이어야 합니다.")
-    if artifact.get("write_policy") != "atomic_replace":
-        raise ValueError("output.artifact.write_policy는 'atomic_replace'여야 합니다.")
+    if artifact.get("write_policy") not in {None, "atomic_replace"}:
+        raise ValueError(
+            "legacy output.artifact.write_policy는 'atomic_replace'만 허용하며 신규 YAML에서는 제거해야 합니다."
+        )
+    compression = str(artifact.get("compression") or "zstd").lower()
+    if compression not in {"snappy", "zstd", "uncompressed"}:
+        raise ValueError(
+            "output.artifact.compression은 snappy, zstd, uncompressed 중 하나여야 합니다."
+        )
+    physical_layout = _mapping(
+        artifact.get("physical_layout") or {}, path="output.artifact.physical_layout"
+    )
+    _reject_unknown_keys(
+        physical_layout,
+        {"profile", "adaptation_scope", "row_group_rows"},
+        path="output.artifact.physical_layout",
+    )
+    if not str(physical_layout.get("profile") or "").strip():
+        raise ValueError("output.artifact.physical_layout.profile은 비어 있지 않아야 합니다.")
+    if physical_layout.get("adaptation_scope") != "generation_fixed":
+        raise ValueError(
+            "output.artifact.physical_layout.adaptation_scope는 'generation_fixed'여야 합니다."
+        )
+    row_group_rows = physical_layout.get("row_group_rows", "auto")
+    if row_group_rows != "auto" and (
+        not isinstance(row_group_rows, int)
+        or isinstance(row_group_rows, bool)
+        or row_group_rows < 1
+    ):
+        raise ValueError(
+            "output.artifact.physical_layout.row_group_rows는 auto 또는 1 이상의 정수여야 합니다."
+        )
     file_name_rule = artifact.get("file_name_rule")
     if file_name_rule is not None:
         _reject_unknown_keys(
@@ -354,8 +394,8 @@ def _validate_output_shape(raw: dict[str, object]) -> None:
             {
                 "index",
                 "engine",
-                "compression",
-                "row_group_size",
+                "compression",  # hidden legacy input
+                "row_group_size",  # hidden legacy input
                 "write_page_index",
                 "write_statistics",
                 "data_page_size",
@@ -364,12 +404,6 @@ def _validate_output_shape(raw: dict[str, object]) -> None:
             },
             path="output.artifact.parquet_writer",
         )
-        compression = str(parquet_writer.get("compression") or "zstd").lower()
-        if compression not in {"snappy", "zstd", "uncompressed"}:
-            raise ValueError(
-                "output.artifact.parquet_writer.compression은 "
-                "snappy, zstd, uncompressed 중 하나여야 합니다."
-            )
     PublicationSpec.from_mapping(artifact.get("publication"))
     for section_name, rule_name in (("logging", "logging"),):
         section = _mapping(output.get(section_name), path=f"output.{section_name}")
@@ -461,11 +495,23 @@ def _parse_retryable_error_substrings(resolved: dict[str, object]) -> list[str]:
 
 def _parse_parquet_writer_options(resolved: dict[str, object]) -> dict[str, object]:
     payload = get_value(resolved, "output", "artifact", "parquet_writer")
+    artifact = get_value(resolved, "output", "artifact")
+    if not isinstance(artifact, dict):
+        raise ValueError("output.artifact 는 dict 여야 합니다.")
     if payload is None:
-        return {}
+        payload = {}
     if not isinstance(payload, dict):
         raise ValueError("output.artifact.parquet_writer 는 dict 여야 합니다.")
-    return {str(key): value for key, value in payload.items()}
+    options = {str(key): value for key, value in payload.items()}
+    options["compression"] = str(artifact.get("compression") or "zstd")
+    physical_layout = artifact.get("physical_layout")
+    if isinstance(physical_layout, dict):
+        row_group_rows = physical_layout.get("row_group_rows")
+        if row_group_rows not in {None, "auto"}:
+            options["row_group_size"] = row_group_rows
+        else:
+            options.pop("row_group_size", None)
+    return options
 
 
 def _parse_test_run_final_task_limit(resolved: dict[str, object]) -> int | None:

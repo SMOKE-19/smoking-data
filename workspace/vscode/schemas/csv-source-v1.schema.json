@@ -118,7 +118,7 @@
             "root_dir": {"type": "string", "minLength": 1},
             "format": {"const": "parquet"},
             "compression": {"enum": ["zstd", "snappy", "uncompressed"]},
-            "write_policy": {"const": "atomic_replace"},
+            "physical_layout": {"$ref": "#/$defs/physicalLayout"},
             "file_name_rule": {
               "type": "object",
               "additionalProperties": false,
@@ -138,12 +138,7 @@
                 }
               }
             },
-            "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"},
-            "parquet_writer": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {"row_group_size": {"type": "integer", "minimum": 1}}
-            }
+            "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
           }
         },
         "logging": {"type": "object"}
@@ -156,6 +151,16 @@
     }
   },
   "$defs": {
+    "physicalLayout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "adaptation_scope", "row_group_rows"],
+      "properties": {
+        "profile": {"type": "string", "minLength": 1},
+        "adaptation_scope": {"const": "generation_fixed"},
+        "row_group_rows": {"oneOf": [{"const": "auto"}, {"type": "integer", "minimum": 1}]}
+      }
+    },
     "httpDownload": {
       "type": "object",
       "additionalProperties": false,

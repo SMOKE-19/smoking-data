@@ -28,7 +28,6 @@ def build_source_tasks(
     step: int | float | None = None,
 ) -> list[SourceTask]:
     spec = spec_or_path if isinstance(spec_or_path, SourceSpec) else load_source_spec(spec_or_path)
-    project_root = spec.project.project_root
     is_http = spec.request.query_mode in {"http_json", "http_ndjson", "http_xml"}
     template_sql = (
         _http_provenance_text(spec)

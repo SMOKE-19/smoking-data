@@ -38,14 +38,16 @@ output:
     type: source_dataset
     root_dir: f"{asset_data_root}/{table_id}_{job_name}"
     format: parquet
-    write_policy: atomic_replace
+    compression: zstd
+    physical_layout:
+      profile: source_ingest_v1
+      adaptation_scope: generation_fixed
+      row_group_rows: 1000
     file_name_rule:
       raw_dataset: f"{job_name}__<date_from>-<date_to>"
     parquet_writer:
       index: false
       engine: pyarrow
-      compression: zstd
-      row_group_size: 1000
       write_page_index: true
       write_statistics: true
       data_page_size: 1048576

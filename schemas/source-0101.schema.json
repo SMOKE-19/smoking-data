@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "smoking-data.source.v4",
-  "title": "Smoking Data Source 0101 v4",
+  "$id": "smoking-data.source.v5",
+  "title": "Smoking Data Source 0101 v5",
   "type": "object",
   "additionalProperties": false,
   "required": ["yaml", "job", "source", "output"],
@@ -12,7 +12,7 @@
       "additionalProperties": false,
       "required": ["schema_version", "asset_code"],
       "properties": {
-        "schema_version": {"const": "smoking-data.source.v4", "description": "0101 Source YAML 공개 계약 버전"},
+        "schema_version": {"const": "smoking-data.source.v5", "description": "0101 Source YAML 공개 계약 버전"},
         "asset_code": {"const": "0101", "description": "Source Asset 코드"}
       }
     },
@@ -20,7 +20,7 @@
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["table_id", "api_request"],
+      "required": ["api_request"],
       "properties": {
         "table_id": {"type": "string", "minLength": 1},
         "api_request": {
@@ -33,6 +33,57 @@
             "adapter": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "default": "spi", "description": "설치된 SOURCE adapter entry point 식별자"},
             "adapter_options": {"type": "object", "additionalProperties": true, "description": "선택한 adapter에 전달할 불투명 실행 옵션"},
             "spi": {"type": "object", "additionalProperties": true, "description": "구버전 호환용 adapter 옵션 별칭. 신규 Definition에서는 adapter_options를 사용"},
+            "sql": {
+              "type": "object",
+              "description": "SQL build에 필요한 0101 전체 명세. select 항목 순서와 name/expr 순서를 보존합니다.",
+              "additionalProperties": false,
+              "required": ["table_id", "date_window"],
+              "properties": {
+                "table_id": {"type": "string", "minLength": 1},
+                "select": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name"],
+                    "properties": {
+                      "name": {"type": "string", "minLength": 1},
+                      "expr": {"type": "string", "minLength": 1}
+                    }
+                  }
+                },
+                "filters": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "common": {"type": "array", "items": {"type": "string"}},
+                    "sub_job": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["sub_job_name", "sub_job_filtering"],
+                        "properties": {
+                          "sub_job_name": {"type": "string", "minLength": 1},
+                          "sub_job_filtering": {"type": "array", "items": {"type": "string"}}
+                        }
+                      }
+                    }
+                  }
+                },
+                "sql_file_path": {"type": "string", "minLength": 1},
+                "date_window": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["step", "date_window"],
+                  "properties": {
+                    "column": {"type": "string", "minLength": 1},
+                    "step": {"type": "number", "exclusiveMinimum": 0},
+                    "date_window": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+                  }
+                }
+              }
+            },
             "payload": {
               "type": "object",
               "description": "structured query의 select와 canonical filters",
@@ -155,7 +206,8 @@
             "type": {"const": "source_dataset"},
             "root_dir": {"type": "string", "minLength": 1},
             "format": {"const": "parquet"},
-            "write_policy": {"const": "atomic_replace"},
+            "compression": {"type": "string", "enum": ["snappy", "zstd", "uncompressed"], "default": "zstd"},
+            "physical_layout": {"$ref": "#/$defs/physicalLayout"},
             "file_name_rule": {
               "type": "object",
               "additionalProperties": false,
@@ -236,13 +288,22 @@
       "properties": {
         "index": {"type": "boolean"},
         "engine": {"type": "string", "enum": ["pyarrow", "fastparquet"]},
-        "compression": {"type": "string", "enum": ["snappy", "zstd", "uncompressed"], "default": "zstd"},
-        "row_group_size": {"type": "integer", "minimum": 1},
         "write_page_index": {"type": "boolean"},
         "write_statistics": {"type": "boolean"},
         "data_page_size": {"type": "integer", "minimum": 1},
         "max_rows_per_page": {"type": "integer", "minimum": 1},
         "use_dictionary": {"oneOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}]}
+      }
+    },
+    "physicalLayout": {
+      "type": "object",
+      "description": "게시 Parquet의 재사용 프로필과 row-group 결정 범위",
+      "additionalProperties": false,
+      "required": ["profile", "adaptation_scope", "row_group_rows"],
+      "properties": {
+        "profile": {"type": "string", "minLength": 1},
+        "adaptation_scope": {"const": "generation_fixed"},
+        "row_group_rows": {"oneOf": [{"const": "auto"}, {"type": "integer", "minimum": 1}]}
       }
     }
   }

@@ -6,6 +6,7 @@ use arrow_array::{
     UInt32Array,
 };
 use arrow_cast::display::array_value_to_string;
+use arrow_ipc::{reader::FileReader as IpcFileReader, writer::FileWriter as IpcFileWriter};
 use arrow_row::{RowConverter, Rows, SortField};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::{concat::concat_batches, take::take, zip::zip};
@@ -56,6 +57,8 @@ struct JoinTaskConfig {
     post_operations: Vec<PostOperation>,
     #[serde(default)]
     join_backend: JoinBackend,
+    #[serde(default)]
+    right_staging_mode: RightStagingMode,
 }
 
 fn default_true() -> bool {
@@ -68,6 +71,28 @@ enum JoinBackend {
     #[default]
     ArrowNative,
     Polars,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RightStagingMode {
+    Off,
+    #[default]
+    Auto,
+    Force,
+}
+
+#[derive(Debug, Default)]
+struct RightStagingProfile {
+    staged_sources: usize,
+    skipped_sources: usize,
+    input_rows: usize,
+    output_rows: usize,
+    peak_input_batch_rows: usize,
+    peak_staged_bytes: u64,
+    write_sec: f64,
+    read_sec: f64,
+    filter_sec: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -133,6 +158,7 @@ struct RightSource {
     suffix: String,
     #[serde(default)]
     keep_right_partition_column: bool,
+    staging_estimated_match_rows: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -203,6 +229,7 @@ pub(crate) fn enrich_many_to_one_lookup(
         how: "left".to_string(),
         suffix: format!(".{alias}"),
         keep_right_partition_column: false,
+        staging_estimated_match_rows: None,
     };
     join_batches(left, right.clone(), &source, None, JoinBackend::ArrowNative)
         .map(|result| result.batch)
@@ -486,6 +513,15 @@ fn task_counters(
         ("binary_row_key_sources".to_string(), 0.0),
         ("display_key_sources".to_string(), 0.0),
         ("right_read_sec".to_string(), 0.0),
+        ("right_staging_sources".to_string(), 0.0),
+        ("right_staging_skipped_sources".to_string(), 0.0),
+        ("right_staging_input_rows".to_string(), 0.0),
+        ("right_staging_output_rows".to_string(), 0.0),
+        ("right_staging_peak_input_batch_rows".to_string(), 0.0),
+        ("right_staging_peak_bytes".to_string(), 0.0),
+        ("right_staging_write_sec".to_string(), 0.0),
+        ("right_staging_read_sec".to_string(), 0.0),
+        ("right_staging_filter_sec".to_string(), 0.0),
         ("left_schema_sec".to_string(), 0.0),
         ("left_read_sec".to_string(), 0.0),
         ("left_reader_setup_sec".to_string(), 0.0),
@@ -567,6 +603,228 @@ fn supports_bounded_join(config: &JoinTaskConfig) -> bool {
             .all(|operation| operation.kind != "unpivot")
 }
 
+fn mapped_right_key_rows(
+    source: &RightSource,
+    key_rows: &[HashMap<String, Value>],
+) -> Option<Vec<HashMap<String, Value>>> {
+    if key_rows.is_empty()
+        || source.left_on.is_empty()
+        || source.left_on.len() != source.right_on.len()
+        || !key_rows
+            .iter()
+            .all(|row| source.left_on.iter().all(|name| row.contains_key(name)))
+    {
+        return None;
+    }
+    Some(
+        key_rows
+            .iter()
+            .map(|row| {
+                source
+                    .left_on
+                    .iter()
+                    .zip(&source.right_on)
+                    .map(|(left, right)| (right.clone(), row[left].clone()))
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+fn selected_parquet_rows(
+    paths: &[String],
+    selected_row_groups: Option<&HashMap<String, Vec<usize>>>,
+) -> Result<usize, String> {
+    let mut rows = 0usize;
+    for path in paths {
+        let file = File::open(path).map_err(|error| format!("open {path}: {error}"))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|error| format!("read parquet metadata {path}: {error}"))?;
+        let row_groups = selected_row_groups
+            .and_then(|items| items.get(path))
+            .cloned()
+            .unwrap_or_else(|| (0..builder.metadata().num_row_groups()).collect());
+        for index in row_groups {
+            let row_group = builder.metadata().row_groups().get(index).ok_or_else(|| {
+                format!(
+                    "row group {index} exceeds row group count {} for {path}",
+                    builder.metadata().num_row_groups()
+                )
+            })?;
+            rows = rows.saturating_add(row_group.num_rows().max(0) as usize);
+        }
+    }
+    Ok(rows)
+}
+
+fn should_stage_right_source(
+    config: &JoinTaskConfig,
+    source: &RightSource,
+    input_batch_rows: usize,
+) -> Result<Option<Vec<HashMap<String, Value>>>, String> {
+    if config.right_staging_mode == RightStagingMode::Off {
+        return Ok(None);
+    }
+    let Some(mapped_keys) = mapped_right_key_rows(source, &config.key_rows) else {
+        return Ok(None);
+    };
+    if config.right_staging_mode == RightStagingMode::Force {
+        return Ok(Some(mapped_keys));
+    }
+    let candidate_rows = selected_parquet_rows(&source.files, Some(&source.row_groups))?;
+    let Some(estimated_match_rows) = source.staging_estimated_match_rows else {
+        return Ok(None);
+    };
+    Ok((candidate_rows > input_batch_rows
+        && estimated_match_rows.saturating_mul(2) <= candidate_rows)
+        .then_some(mapped_keys))
+}
+
+fn stage_filtered_right_to_ipc(
+    config: &JoinTaskConfig,
+    source: &RightSource,
+    source_index: usize,
+    input_batch_rows: usize,
+    required: &[String],
+    mapped_keys: &[HashMap<String, Value>],
+) -> Result<
+    (
+        RecordBatch,
+        usize,
+        ReadProjectionProfile,
+        RightStagingProfile,
+    ),
+    String,
+> {
+    let (full_schema, row_groups_touched) =
+        parquet_union_schema(&source.files, Some(&source.row_groups))?;
+    let selected = selected_column_names(
+        full_schema.as_ref(),
+        &source.columns,
+        required,
+        &source.name,
+    )?;
+    let schema = projected_schema(full_schema.as_ref(), &selected)?;
+    let projection_names = selected.iter().cloned().collect::<HashSet<_>>();
+    let output_path = Path::new(&config.output_path);
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "create right staging directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let output_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("join-output");
+    let staging_path = parent.join(format!(
+        ".{output_name}.right-{source_index}-{}.arrow",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&staging_path);
+    let result = (|| {
+        let file = File::create(&staging_path).map_err(|error| {
+            format!(
+                "create right Arrow staging {}: {error}",
+                staging_path.display()
+            )
+        })?;
+        let mut writer = IpcFileWriter::try_new(file, &schema).map_err(|error| {
+            format!(
+                "initialize right Arrow staging {}: {error}",
+                staging_path.display()
+            )
+        })?;
+        let mut profile = RightStagingProfile {
+            staged_sources: 1,
+            ..RightStagingProfile::default()
+        };
+        let write_started = Instant::now();
+        for_each_parquet_batch(
+            &source.files,
+            Some(&source.row_groups),
+            input_batch_rows,
+            &schema,
+            Some(&projection_names),
+            |batch| {
+                profile.input_rows = profile.input_rows.saturating_add(batch.num_rows());
+                profile.peak_input_batch_rows = profile.peak_input_batch_rows.max(batch.num_rows());
+                let filter_started = Instant::now();
+                let mut filtered = batch;
+                if !config.right_partition_key.is_empty() {
+                    filtered = filter_column_value(
+                        &filtered,
+                        &config.right_partition_key,
+                        &config.partition_value,
+                    )?;
+                }
+                filtered = filter_key_rows(&filtered, &source.right_on, mapped_keys)?.0;
+                profile.filter_sec += filter_started.elapsed().as_secs_f64();
+                profile.output_rows = profile.output_rows.saturating_add(filtered.num_rows());
+                if filtered.num_rows() > 0 {
+                    writer.write(&filtered).map_err(|error| {
+                        format!(
+                            "write right Arrow staging {}: {error}",
+                            staging_path.display()
+                        )
+                    })?;
+                }
+                Ok(())
+            },
+        )?;
+        writer.finish().map_err(|error| {
+            format!(
+                "finish right Arrow staging {}: {error}",
+                staging_path.display()
+            )
+        })?;
+        drop(writer);
+        profile.write_sec = write_started.elapsed().as_secs_f64();
+        profile.peak_staged_bytes = fs::metadata(&staging_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        let read_started = Instant::now();
+        let file = File::open(&staging_path).map_err(|error| {
+            format!(
+                "open right Arrow staging {}: {error}",
+                staging_path.display()
+            )
+        })?;
+        let reader = IpcFileReader::try_new(file, None).map_err(|error| {
+            format!(
+                "read right Arrow staging {}: {error}",
+                staging_path.display()
+            )
+        })?;
+        let batches = reader
+            .map(|batch| batch.map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch = if batches.is_empty() {
+            RecordBatch::new_empty(schema.clone())
+        } else {
+            concat_batches(&schema, &batches).map_err(|error| error.to_string())?
+        };
+        profile.read_sec = read_started.elapsed().as_secs_f64();
+        Ok((
+            batch,
+            row_groups_touched,
+            ReadProjectionProfile {
+                sources: source.files.len(),
+                total_columns: full_schema
+                    .fields()
+                    .len()
+                    .saturating_mul(source.files.len()),
+                projected_columns: selected.len().saturating_mul(source.files.len()),
+            },
+            profile,
+        ))
+    })();
+    let _ = fs::remove_file(&staging_path);
+    result
+}
+
 fn execute_join_task_bounded(config: &JoinTaskConfig) -> Result<HashMap<String, f64>, String> {
     let input_batch_rows = config.input_batch_rows.unwrap_or(65_536).max(1);
     let mut right_batches = Vec::with_capacity(config.right_sources.len());
@@ -575,24 +833,52 @@ fn execute_join_task_bounded(config: &JoinTaskConfig) -> Result<HashMap<String, 
     let mut source_files = config.left_files.len();
     let mut row_groups_touched = 0usize;
     let mut projection_profile = ReadProjectionProfile::default();
+    let mut right_staging_profile = RightStagingProfile::default();
     let mut right_read_sec = 0.0;
-    for source in &config.right_sources {
+    for (source_index, source) in config.right_sources.iter().enumerate() {
         let right_read_started = Instant::now();
         source_files += source.files.len();
         let mut required = source.right_on.clone();
         if !config.right_partition_key.is_empty() {
             required.push(config.right_partition_key.clone());
         }
-        let (mut right, touched, source_projection) = read_parquet_union_projected(
-            &source.files,
-            Some(&source.row_groups),
-            &source.columns,
-            &required,
-            &source.name,
-        )?;
+        let staged_keys = should_stage_right_source(config, source, input_batch_rows)?;
+        let staging_enabled = staged_keys.is_some();
+        let (mut right, touched, source_projection) = if let Some(mapped_keys) = staged_keys {
+            let (right, touched, projection, profile) = stage_filtered_right_to_ipc(
+                config,
+                source,
+                source_index,
+                input_batch_rows,
+                &required,
+                &mapped_keys,
+            )?;
+            right_staging_profile.staged_sources += profile.staged_sources;
+            right_staging_profile.input_rows += profile.input_rows;
+            right_staging_profile.output_rows += profile.output_rows;
+            right_staging_profile.peak_input_batch_rows = right_staging_profile
+                .peak_input_batch_rows
+                .max(profile.peak_input_batch_rows);
+            right_staging_profile.peak_staged_bytes = right_staging_profile
+                .peak_staged_bytes
+                .max(profile.peak_staged_bytes);
+            right_staging_profile.write_sec += profile.write_sec;
+            right_staging_profile.read_sec += profile.read_sec;
+            right_staging_profile.filter_sec += profile.filter_sec;
+            (right, touched, projection)
+        } else {
+            right_staging_profile.skipped_sources += 1;
+            read_parquet_union_projected(
+                &source.files,
+                Some(&source.row_groups),
+                &source.columns,
+                &required,
+                &source.name,
+            )?
+        };
         row_groups_touched += touched;
         projection_profile.accumulate(&source_projection);
-        if !config.right_partition_key.is_empty() {
+        if !staging_enabled && !config.right_partition_key.is_empty() {
             right =
                 filter_column_value(&right, &config.right_partition_key, &config.partition_value)?;
         }
@@ -809,6 +1095,42 @@ fn execute_join_task_bounded(config: &JoinTaskConfig) -> Result<HashMap<String, 
         projection_profile.projected_columns as f64,
     );
     counters.insert("right_read_sec".to_string(), right_read_sec);
+    counters.insert(
+        "right_staging_sources".to_string(),
+        right_staging_profile.staged_sources as f64,
+    );
+    counters.insert(
+        "right_staging_skipped_sources".to_string(),
+        right_staging_profile.skipped_sources as f64,
+    );
+    counters.insert(
+        "right_staging_input_rows".to_string(),
+        right_staging_profile.input_rows as f64,
+    );
+    counters.insert(
+        "right_staging_output_rows".to_string(),
+        right_staging_profile.output_rows as f64,
+    );
+    counters.insert(
+        "right_staging_peak_input_batch_rows".to_string(),
+        right_staging_profile.peak_input_batch_rows as f64,
+    );
+    counters.insert(
+        "right_staging_peak_bytes".to_string(),
+        right_staging_profile.peak_staged_bytes as f64,
+    );
+    counters.insert(
+        "right_staging_write_sec".to_string(),
+        right_staging_profile.write_sec,
+    );
+    counters.insert(
+        "right_staging_read_sec".to_string(),
+        right_staging_profile.read_sec,
+    );
+    counters.insert(
+        "right_staging_filter_sec".to_string(),
+        right_staging_profile.filter_sec,
+    );
     counters.insert("left_schema_sec".to_string(), left_schema_sec);
     counters.insert("left_read_sec".to_string(), left_read_sec);
     counters.insert(
@@ -2291,6 +2613,7 @@ mod tests {
             how: "left".to_string(),
             suffix: "_right".to_string(),
             keep_right_partition_column: false,
+            staging_estimated_match_rows: None,
         }
     }
 

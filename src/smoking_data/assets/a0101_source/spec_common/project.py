@@ -15,6 +15,7 @@ from smoking_data.runtime.asset_contract import (
     partition_grid_anchor,
 )
 from smoking_data.runtime.config import resolve_config_paths
+from smoking_data.runtime.paths import infer_project_root as infer_runtime_project_root
 
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 
@@ -92,15 +93,9 @@ def load_project_paths(yaml_path: str | Path) -> ProjectPaths:
 
 
 def infer_project_root(path: Path) -> Path:
-    resolved = path.resolve()
-    for parent in (resolved.parent, *resolved.parents):
-        if (parent / ".smoking-data" / "config.yaml").is_file():
-            return parent
-        if parent.name == "settings":
-            return parent.parent
-        if (parent / "pyproject.toml").exists():
-            return parent
-    return resolved.parent
+    """Backward-compatible 0101 entry point for the shared workspace resolver."""
+
+    return infer_runtime_project_root(path)
 
 
 def _resolve_path(path_str: str, *, base_dir: Path) -> Path:

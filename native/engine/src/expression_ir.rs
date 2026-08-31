@@ -374,15 +374,21 @@ fn validate_node(node: &ExpressionNode) -> Result<(), String> {
                 let preceding = object
                     .get("preceding")
                     .and_then(|value| value.as_u64())
-                    .ok_or_else(|| "window frame preceding must be a non-negative integer".to_string())?;
+                    .ok_or_else(|| {
+                        "window frame preceding must be a non-negative integer".to_string()
+                    })?;
                 let following = object
                     .get("following")
                     .and_then(|value| value.as_u64())
-                    .ok_or_else(|| "window frame following must be a non-negative integer".to_string())?;
+                    .ok_or_else(|| {
+                        "window frame following must be a non-negative integer".to_string()
+                    })?;
                 let minimum = object
                     .get("minimum_periods")
                     .and_then(|value| value.as_u64())
-                    .ok_or_else(|| "window frame minimum_periods must be a positive integer".to_string())?;
+                    .ok_or_else(|| {
+                        "window frame minimum_periods must be a positive integer".to_string()
+                    })?;
                 if minimum == 0 || minimum > preceding + following + 1 {
                     return Err("window frame minimum_periods is outside the frame".to_string());
                 }

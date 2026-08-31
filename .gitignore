@@ -45,6 +45,7 @@ for_agents/
 *.whl
 *.download
 *.part
+smoking_data_spi_cli_source_*.txt
 .smoking-data/adapters.yaml
 
 # Credentials and local environment files

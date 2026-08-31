@@ -26,6 +26,7 @@ CURATED_KINDS = frozenset(
         OperationKind.RENAME_COLUMNS,
         OperationKind.DATA_ASSERTION,
         OperationKind.UNPIVOT,
+        OperationKind.UNNEST,
         OperationKind.PIVOT,
         OperationKind.WRITE_DATASET,
     }
@@ -98,6 +99,14 @@ def lower_pipeline_spec(spec: PipelineSpec) -> tuple[str, PresetSpec, dict[str, 
         "writer_output_columns": _infer_curated_writer_output_columns(spec)
         if target == "curated"
         else [],
+        "writer_partition_columns": list(
+            next(
+                operation.config["partition_by"]
+                for operation in operations
+                if operation.kind is OperationKind.WRITE_DATASET
+            )
+        ),
+        "single_file_output": spec.asset_code == "0401",
         "join_post_operations": _infer_join_post_operations(spec) if target == "join" else [],
         "explicit_physical_boundaries": _explicit_physical_boundaries(spec),
         "probe_manifests": dict(spec.raw.get("__probe_manifests") or {}),
@@ -242,6 +251,14 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
                     "config": operation.config,
                 }
             )
+        elif operation.kind is OperationKind.UNNEST:
+            post_operations.append(
+                {
+                    "operation_id": operation.operation_id,
+                    "kind": operation.kind.value,
+                    "config": operation.config,
+                }
+            )
     if post_operations:
         payload["post_operations"] = post_operations
         payload["final_post_projection"] = True
@@ -257,7 +274,9 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
             context={"partition_by": partition_by},
         )
     sort_first_config = {
-        "enabled": selector is not None,
+        "enabled": (
+            selector is not None and selector.config.get("method") != "all_rows"
+        ),
         "operation_id": selector.operation_id if selector is not None else None,
         "group_keys": list(selector.config.get("group_keys") or [])
         if selector is not None
@@ -266,7 +285,26 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
         "expression_ir": selector.config.get("expression_ir") if selector is not None else None,
         "tie_policy": "source_path_row_index",
     }
-    if operation_phases:
+    if selector_payload and (
+        selector is None or selector.config.get("method") == "all_rows"
+    ):
+        for key, value in selector_payload.items():
+            existing = payload.get(key)
+            if isinstance(value, list) and isinstance(existing, list):
+                payload[key] = [*value, *existing]
+            elif existing is None:
+                payload[key] = value
+            elif existing != value:
+                raise ValidationError(
+                    "build_sidecar payload conflicts with materialize payload.",
+                    code="physical_kernel.conflicting_payload_operation",
+                    context={"key": key},
+                )
+    if (
+        operation_phases
+        and selector is not None
+        and selector.config.get("method") != "all_rows"
+    ):
         sort_first_config["payload"] = selector_payload
     return {
         "preset": "0201",
@@ -286,13 +324,11 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
         "pivot": pivot,
         "execution": _lower_execution(spec),
         "output": {
-            "output_dir": sink.path,
-            "partition_column": partition_by[0],
-            "overwrite": sink.overwrite,
-            "compression": sink.compression,
-            "physical_layout": dict(
-                spec.raw["output"]["artifact"]["physical_layout"]
-            ),
+            "artifact": {
+                **dict(spec.raw["output"]["artifact"]),
+                "root_dir": sink.path,
+            },
+            "logging": dict(spec.raw["output"].get("logging") or {}),
         },
     }
 
@@ -351,6 +387,13 @@ def _infer_curated_writer_output_columns(spec: PipelineSpec) -> list[str]:
             )
             columns = [column for column in columns if column]
             continue
+        if kind is OperationKind.UNNEST:
+            mapping = {
+                str(item["source"]): str(item["output"])
+                for item in operation.config.get("columns") or []
+            }
+            columns = [mapping.get(column, column) for column in columns]
+            continue
         if kind is OperationKind.PIVOT:
             return []
         for output in operation.output_columns:
@@ -407,7 +450,14 @@ def _validate_curated_operation_order(
     prior_phase = -1
     for index, operation in enumerate(operations):
         if operation.kind is OperationKind.FILTER:
-            phase = 0
+            phase = (
+                5
+                if phase_contract
+                and any(
+                    prior.kind is OperationKind.MATERIALIZE for prior in operations[:index]
+                )
+                else 0
+            )
         elif phase_contract and any(
             prior.kind is OperationKind.MATERIALIZE for prior in operations[:index]
         ) and operation.kind in {
@@ -438,7 +488,11 @@ def _validate_curated_operation_order(
             phase = 5 if pivot_index is not None and index < pivot_index else 7
         elif operation.kind is OperationKind.PIVOT:
             phase = 6
-        elif operation.kind in {OperationKind.RENAME_COLUMNS, OperationKind.UNPIVOT}:
+        elif operation.kind in {
+            OperationKind.RENAME_COLUMNS,
+            OperationKind.UNPIVOT,
+            OperationKind.UNNEST,
+        }:
             phase = 7
         elif operation.kind is OperationKind.DATA_ASSERTION:
             phase = 8
@@ -518,16 +572,6 @@ def _lower_join(spec: PipelineSpec) -> dict[str, Any]:
         )
     joins = [operation for operation in operations if operation.kind is OperationKind.JOIN]
     first = joins[0]
-    right_partition_columns = {
-        str(operation.config.get("right_partition_column") or partition_by[0])
-        for operation in joins
-    }
-    if len(right_partition_columns) != 1:
-        raise ValidationError(
-            "All right sources in one join pipeline must use the same partition column.",
-            code="join.right_partition_mismatch",
-            context={"columns": sorted(right_partition_columns)},
-        )
     right_sources = []
     for operation in joins:
         source = spec.sources[str(operation.config["right_source"])]
@@ -538,34 +582,40 @@ def _lower_join(spec: PipelineSpec) -> dict[str, Any]:
                 "join": {
                     "left_on": list(operation.config["left_on"]),
                     "right_on": list(operation.config["right_on"]),
-                    "how": operation.config.get("how", "left"),
+                    "how": "left",
                 },
                 "suffix": operation.config.get("suffix", f"_{source.name}"),
                 "columns": operation.config.get("columns") or {},
             }
         )
     left = spec.sources[left_names[0]]
+    if left.keyspace is None:
+        raise ValidationError(
+            "0301 lowering requires a build_sidecar keyspace source.",
+            code="join_keyspace.required",
+        )
     return {
         "preset": "0301",
         "job": {"name": spec.job_name},
-        "left": {"upstream": {"paths": list(left.paths), "recursive": True}},
+        "left": {
+            "upstream": {"paths": list(left.paths), "recursive": True},
+            **({"keyspace": dict(left.keyspace)} if left.keyspace is not None else {}),
+        },
         "right_sources": right_sources,
         "join": {
             "left_on": list(first.config["left_on"]),
             "right_on": list(first.config["right_on"]),
-            "how": first.config.get("how", "left"),
+            "how": "left",
             "left_partition_key_column": partition_by[0],
-            "right_partition_key_column": next(iter(right_partition_columns)),
+            "right_partition_key_column": "",
         },
         "execution": _lower_execution(spec),
         "output": {
-            "output_dir": sink.path,
-            "partition_column": partition_by[0],
-            "overwrite": sink.overwrite,
-            "compression": sink.compression,
-            "physical_layout": dict(
-                spec.raw["output"]["artifact"]["physical_layout"]
-            ),
+            "artifact": {
+                **dict(spec.raw["output"]["artifact"]),
+                "root_dir": sink.path,
+            },
+            "logging": dict(spec.raw["output"].get("logging") or {}),
         },
     }
 

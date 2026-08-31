@@ -1,5 +1,5 @@
 yaml:
-  schema_version: smoking-data.pipeline.v6
+  schema_version: smoking-data.pipeline.v8
   asset_code: "0401"
 
 job:
@@ -9,9 +9,11 @@ output:
   artifact:
     type: analysis_snapshot
     root_dir: f"{data_root}/{asset_code}/{job_name}"
-    format: parquet
-    compression: zstd
-    write_policy: atomic_replace
+    format: sbdf
+    sbdf:
+      row_key_columns: [partition, join_key, right_value_a]
+      batch_size: 50000
+      encoding_rle: true
     physical_layout:
       profile: analysis_snapshot_adaptive_v1
       adaptation_scope: task_adaptive
@@ -19,7 +21,7 @@ output:
   logging:
     root_dir: f"{log_root}/{asset_code}"
 
-operations:
+define_upstream:
 - op: define_asset
   alias: joined_metrics
   definition: 0301.pipeline_multi_right_join.0301.yaml
@@ -32,63 +34,52 @@ operations:
 #   missing_columns: insert_null
 #   incompatible_dtypes: error
 
-# 최종 분석 축을 한 part 안에서 완결시킨 뒤 wide snapshot으로 변환한다.
-- op: materialize
-  alias: materialize_snapshot_input
-  inputs: {source: joined_metrics}
-  partition_by: [partition]
+build_sidecar:
+  alias: select_snapshot_rows
+  source: joined_metrics
+  columns: auto
   part_boundary:
     target_rows: 20000
-    preserve_groups: [partition, join_key, right_value_a]
+    target_key_groups: 500
+    preserve_groups: [partition, join_key, right_value_a, metric_name]
+
+# 선택된 coordinate payload만 읽어 최종 분석 축을 완결하고 snapshot.sbdf로 원자적 커밋한다.
+materialize:
+  alias: materialize_snapshot_input
   workers: 1
   max_tasks_per_child: 1
+  operations:
+  # columns를 생략하면 입력 스키마의 모든 LIST/LargeList 칼럼을 자동 탐색해 strict zip한다.
+  # - op: unnest
+  #   alias: explode_all_list_columns
+  #   max_elements_per_row: 1024
+  - op: include_columns
+    alias: select_snapshot_columns
+    columns:
+    - partition
+    - join_key
+    - right_value_a
+    - metric_name
+    - metric_value
+    - latest_updated_at.max
 
-- op: include_columns
-  alias: select_snapshot_columns
-  inputs: {data: materialize_snapshot_input}
-  columns:
-  - partition
-  - join_key
-  - right_value_a
-  - metric_name
-  - metric_value
-  - latest_updated_at.max
-
-- op: pivot
-  alias: pivot_analysis_metrics
-  inputs: {data: select_snapshot_columns}
-  row_keys: [partition, join_key, right_value_a]
-  column_keys: [metric_name]
-  value_keys:
-  - name: value
-    source_column: metric_value
-    aggregation: first
-    column_name_rule: <column_key_value>__<value_key_name>
-  value_keys_without_column:
-  - name: latest_updated_at
-    source_column: latest_updated_at.max
-    aggregation: max
-    column_name_rule: <value_key_name>.<agg>
-  first_duplicate_policy: error
-  null_column_key_policy: error
-  column_key_separator: __
-
-# 게시 전에 분석 행의 필수 키와 최종 grain을 검증한다.
-- op: data_assertion
-  alias: validate_snapshot
-  inputs: {data: pivot_analysis_metrics}
-  rules:
-  - id: snapshot_key_required
-    kind: not_null
-    columns: [partition, join_key, latest_updated_at.max]
-  - id: snapshot_grain_unique
-    kind: unique
-    columns: [partition, join_key, right_value_a]
-
-- op: save_dataset
-  alias: write_analysis_snapshot
-  inputs: {data: validate_snapshot}
-  partition_by: [partition]
+  - op: pivot
+    alias: pivot_analysis_metrics
+    row_keys: [partition, join_key, right_value_a]
+    column_keys: [metric_name]
+    value_keys:
+    - name: value
+      source_column: metric_value
+      aggregation: first
+      column_name_rule: <column_key_value>__<value_key_name>
+    value_keys_without_column:
+    - name: latest_updated_at
+      source_column: latest_updated_at.max
+      aggregation: max
+      column_name_rule: <value_key_name>.<agg>
+    first_duplicate_policy: error
+    null_column_key_policy: error
+    column_key_separator: __
 
 execution:
   memory_budget_mb: 4096

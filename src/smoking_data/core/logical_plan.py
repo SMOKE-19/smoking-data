@@ -264,10 +264,10 @@ def compile_0301_logical_plan(raw: dict[str, Any]) -> LogicalOperationPlan:
     default_how = _join_type(join.get("how") or "left", path="join.how")
     left_partition_key = str(join.get("left_partition_key_column") or "").strip()
     right_partition_key = str(join.get("right_partition_key_column") or "").strip()
-    if bool(left_partition_key) != bool(right_partition_key):
+    if right_partition_key and not left_partition_key:
         raise ValidationError(
-            "left_partition_key_column and right_partition_key_column must be defined together.",
-            code="join.partition_key_pair_required",
+            "right_partition_key_column requires a left partition key.",
+            code="join.left_partition_key_required",
             context={"path": "join"},
         )
     default_left_on, default_right_on = _join_keys(
@@ -795,7 +795,15 @@ def _validate_0201_yaml_shape(raw: dict[str, Any]) -> None:
     output = _mapping(raw.get("output"), path="output")
     _reject_unknown(
         output,
-        {"output_dir", "partition_column", "overwrite", "compression", "physical_layout"},
+        {
+            "output_dir",
+            "partition_column",
+            "overwrite",
+            "compression",
+            "format",
+            "sbdf",
+            "physical_layout",
+        },
         path="output",
     )
 
@@ -917,13 +925,17 @@ def _validate_upstream(value: Any, *, path: str) -> None:
 
 def _validate_join_source(value: Any, *, path: str, require_name: bool) -> None:
     source = _mapping(value, path=path)
-    allowed = {"upstream", "columns", "join", "suffix"}
+    allowed = {"upstream", "columns", "join", "suffix", "keyspace"}
     if require_name:
         allowed.add("name")
     _reject_unknown(source, allowed, path=path)
     _validate_upstream(source.get("upstream"), path=f"{path}.upstream")
     columns = _mapping(source.get("columns"), path=f"{path}.columns", allow_missing=True)
-    _reject_unknown(columns, {"include", "exclude", "regex"}, path=f"{path}.columns")
+    _reject_unknown(
+        columns,
+        {"include", "exclude", "regex", "exclude_regex"},
+        path=f"{path}.columns",
+    )
     source_join = _mapping(source.get("join"), path=f"{path}.join", allow_missing=True)
     _reject_unknown(
         source_join,

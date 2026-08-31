@@ -19,7 +19,7 @@ from smoking_data.backends.rust_engine import CuratedTaskRequest, execute_curate
 from smoking_data.core.exceptions import ValidationError
 from smoking_data.core.results import StageResult
 from smoking_data.runtime.config import load_config
-from smoking_data.runtime.paths import ensure_dir
+from smoking_data.runtime.paths import ensure_dir, infer_project_root
 from smoking_data.runtime.task_telemetry import (
     TaskTelemetryHandle,
     start_task_telemetry_supervisor,
@@ -292,16 +292,17 @@ def run_yaml(
 ) -> StageResult:
     definition = Path(definition_path).expanduser().resolve()
     job_name = definition.stem
+    effective_project_root = project_root or infer_project_root(definition)
     try:
         plan = preflight_calculated_fact_yaml(
             definition,
             config_path=config_path,
-            project_root=project_root,
+            project_root=effective_project_root,
         )
         job_name = plan.spec.job_name
         config = load_config(
             config_path=config_path,
-            project_root=project_root,
+            project_root=effective_project_root,
             asset_code="0102",
         )
         result = _execute_plan(plan, config=config, trigger_type=trigger_type)
@@ -318,7 +319,6 @@ def run_yaml(
                 asset_code="0102",
                 job_name=plan.spec.job_name,
                 definition_sha256=plan.spec.canonical_hash,
-                commit_kind="append_generation",
             )
             result.details["remote_publication"] = (
                 {

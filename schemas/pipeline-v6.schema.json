@@ -4,7 +4,7 @@
   "title": "Smoking Data Operation DAG Pipeline v6",
   "type": "object",
   "additionalProperties": false,
-  "required": ["yaml", "job", "operations", "output"],
+  "required": ["yaml", "job", "output"],
   "properties": {
     "yaml": {
       "type": "object",
@@ -13,10 +13,18 @@
       "required": ["schema_version", "asset_code"],
       "properties": {
         "schema_version": {"const": "smoking-data.pipeline.v6"},
-        "asset_code": {"type": "string", "enum": ["0301", "0401"]}
+        "asset_code": {"const": "0301"}
       }
     },
     "job": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}}},
+    "define_upstream": {
+      "type": "array",
+      "minItems": 1,
+      "description": "0301 입력 dataset 선언. downstream operation DAG와 분리한다.",
+      "items": {"$ref": "#/$defs/upstreamOperation"}
+    },
+    "build_sidecar": {"$ref": "#/$defs/joinKeyspaceSidecar"},
+    "materialize": {"$ref": "#/$defs/joinMaterialize"},
     "operations": {
       "type": "array",
       "minItems": 1,
@@ -42,11 +50,13 @@
   "allOf": [
     {
       "if": {"properties": {"yaml": {"properties": {"asset_code": {"const": "0301"}}}}},
-      "then": {"properties": {"output": {"properties": {"artifact": {"properties": {"type": {"const": "joined_dataset"}, "physical_layout": {"properties": {"adaptation_scope": {"const": "generation_fixed"}}}}}}}}}
-    },
-    {
-      "if": {"properties": {"yaml": {"properties": {"asset_code": {"const": "0401"}}}}},
-      "then": {"properties": {"output": {"properties": {"artifact": {"properties": {"type": {"const": "analysis_snapshot"}}}}}, "execution": {"not": {"required": ["test_run"]}}}}
+      "then": {
+        "required": ["define_upstream", "build_sidecar", "materialize"],
+        "not": {"required": ["operations"]},
+        "properties": {
+          "output": {"properties": {"artifact": {"properties": {"type": {"const": "joined_dataset"}, "physical_layout": {"properties": {"adaptation_scope": {"const": "generation_fixed"}}}}}}}
+        }
+      }
     }
   ],
   "$defs": {
@@ -57,6 +67,98 @@
       "additionalProperties": false,
       "required": ["final_task_limit"],
       "properties": {"final_task_limit": {"type": "integer", "minimum": 1, "default": 1}}
+    },
+    "upstreamOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "alias"],
+      "properties": {
+        "op": {"type": "string", "enum": ["define_asset", "define_dataset"]},
+        "alias": {"type": "string", "minLength": 1},
+        "definition": {"type": "string", "minLength": 1},
+        "source_identity": {"type": "object"},
+        "select": {"type": "object"},
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "format": {"const": "parquet"},
+        "union_by_name": {"const": true},
+        "missing_columns": {"const": "insert_null"},
+        "incompatible_dtypes": {"const": "error"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"op": {"const": "define_asset"}}, "required": ["op"]},
+          "then": {"required": ["definition"], "not": {"anyOf": [{"required": ["paths"]}, {"required": ["format"]}]}}
+        },
+        {
+          "if": {"properties": {"op": {"const": "define_dataset"}}, "required": ["op"]},
+          "then": {"required": ["paths"], "not": {"required": ["definition"]}}
+        }
+      ]
+    },
+    "joinKeyspaceSidecar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "method", "sources", "keys", "partition_by", "part_boundary"],
+      "properties": {
+        "alias": {"type": "string", "minLength": 1},
+        "method": {"const": "union_distinct_keys"},
+        "sources": {"$ref": "#/$defs/stringArray", "minItems": 1, "uniqueItems": true},
+        "keys": {"$ref": "#/$defs/stringArray", "uniqueItems": true},
+        "partition_by": {"$ref": "#/$defs/stringArray", "minItems": 1, "maxItems": 1},
+        "part_boundary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_rows", "preserve_groups"],
+          "properties": {
+            "target_rows": {"type": "integer", "minimum": 1},
+            "target_key_groups": {"type": "integer", "minimum": 1},
+            "preserve_groups": {"$ref": "#/$defs/stringArray"}
+          }
+        },
+        "null_key_policy": {"type": "string", "enum": ["error", "drop"], "default": "error"}
+      }
+    },
+    "joinMaterialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "workers", "max_tasks_per_child", "operations"],
+      "properties": {
+        "alias": {"type": "string", "minLength": 1},
+        "workers": {"type": "integer", "minimum": 1},
+        "max_tasks_per_child": {"type": "integer", "minimum": 1},
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "allOf": [
+              {"$ref": "#/$defs/operation"},
+              {
+                "not": {
+                  "properties": {"op": {"enum": ["define_asset", "define_dataset", "define_keyspace", "materialize", "save_dataset"]}},
+                  "required": ["op"]
+                }
+              },
+              {
+                "if": {
+                  "properties": {"op": {"const": "join"}},
+                  "required": ["op"]
+                },
+                "then": {
+                  "required": ["input_right"],
+                  "not": {
+                    "anyOf": [
+                      {"required": ["inputs"]},
+                      {"required": ["how"]},
+                      {"required": ["right_partition_column"]},
+                      {"required": ["columns"]}
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
     },
     "operation": {
       "type": "object",
@@ -105,8 +207,31 @@
         "how": {"type": "string", "enum": ["inner", "left", "right", "full", "cross"]},
         "left_on": {"$ref": "#/$defs/stringArray"},
         "right_on": {"$ref": "#/$defs/stringArray"},
+        "input_right": {
+          "type": "string",
+          "minLength": 1,
+          "description": "0301 순차 join의 오른쪽 upstream alias. 왼쪽 입력은 직전 operation 결과로 자동 연결한다."
+        },
         "right_partition_column": {"type": "string"},
-        "suffix": {"type": "string"},
+        "include_columns": {
+          "description": "list이면 정확한 칼럼명, string이면 정규식 include 필터로 처리한다.",
+          "oneOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"type": "string", "minLength": 1}
+          ]
+        },
+        "exclude_columns": {
+          "description": "list이면 정확한 칼럼명, string이면 정규식 exclude 필터로 처리한다.",
+          "oneOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"type": "string", "minLength": 1}
+          ]
+        },
+        "suffix": {
+          "type": "string",
+          "minLength": 1,
+          "description": "선택 사항. 오른쪽 출력 칼럼명이 기존 칼럼과 충돌할 때만 사용한다. 생략하면 충돌 칼럼에 _<right alias>를 붙이고 비충돌 칼럼명은 유지한다."
+        },
         "reference_parquet": {"type": "string"},
         "source_column": {"type": "string"},
         "reference_input_column": {"type": "string"},
@@ -161,7 +286,6 @@
             "root_dir": {"type": "string", "minLength": 1},
             "format": {"const": "parquet"},
             "compression": {"type": "string", "enum": ["snappy", "zstd", "uncompressed"], "default": "zstd"},
-            "write_policy": {"type": "string", "enum": ["atomic_replace", "error_if_exists"]},
             "physical_layout": {"$ref": "#/$defs/physicalLayout"},
             "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
           }

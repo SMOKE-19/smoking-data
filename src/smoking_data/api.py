@@ -97,7 +97,7 @@ def validate_definition(
                 ok=True,
                 definition_path=path,
                 kind="chain",
-                schema_version=spec.schema_version,
+                schema_version=schema_version,
                 job_name=spec.name,
                 yaml_sha256=yaml_sha256,
                 graph_sha256=spec.graph_hash,

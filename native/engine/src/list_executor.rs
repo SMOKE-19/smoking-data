@@ -41,7 +41,10 @@ pub fn expand_list_rows(
                 array.data_type()
             ))
         })?;
-        if matches!(list.values().data_type(), arrow_schema::DataType::List(_)) {
+        if matches!(
+            list.values().data_type(),
+            arrow_schema::DataType::List(_) | arrow_schema::DataType::LargeList(_)
+        ) {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "list.unsupported_nested_type: nested List source {source}"
             )));
@@ -132,13 +135,9 @@ fn parent_indices(list: &ListArray) -> Result<UInt32Array, ArrowError> {
 }
 
 fn ensure_same_shape(left: &ListArray, right: &ListArray) -> Result<(), ArrowError> {
-    if left.len() != right.len()
-        || left.value_offsets() != right.value_offsets()
-        || (0..left.len()).any(|index| left.is_null(index) != right.is_null(index))
-    {
+    if left.len() != right.len() || left.value_offsets() != right.value_offsets() {
         return Err(ArrowError::InvalidArgumentError(
-            "list.shape_mismatch: strict zipped Lists require identical offsets and null shape"
-                .into(),
+            "list.shape_mismatch: zipped Lists require identical per-row element counts".into(),
         ));
     }
     Ok(())

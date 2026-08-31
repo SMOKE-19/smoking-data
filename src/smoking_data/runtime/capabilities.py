@@ -9,6 +9,7 @@ from smoking_data.core.operations import OPERATION_PROPERTIES
 from smoking_data.core.pipeline_dag import (
     CURATED_PIPELINE_SCHEMA_VERSION,
     PIPELINE_SCHEMA_VERSION,
+    SNAPSHOT_PIPELINE_SCHEMA_VERSION,
 )
 from spotfire_expr_normalizer.semantics import canonical_function_semantics
 
@@ -44,10 +45,14 @@ def get_capabilities() -> dict[str, Any]:
             "0103": "smoking-data.csv-source.v1",
             "0201": CURATED_PIPELINE_SCHEMA_VERSION,
             "0301": PIPELINE_SCHEMA_VERSION,
-            "0401": PIPELINE_SCHEMA_VERSION,
+            "0401": SNAPSHOT_PIPELINE_SCHEMA_VERSION,
             "chain": "smoking-data.asset-chain.v2",
         },
-        "pipeline_schemas": [PIPELINE_SCHEMA_VERSION, CURATED_PIPELINE_SCHEMA_VERSION],
+        "pipeline_schemas": [
+            PIPELINE_SCHEMA_VERSION,
+            CURATED_PIPELINE_SCHEMA_VERSION,
+            SNAPSHOT_PIPELINE_SCHEMA_VERSION,
+        ],
         "operations": operations,
         "expression_features": expressions,
         "baseline_contracts": {

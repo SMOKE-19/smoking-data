@@ -11,7 +11,6 @@ output:
     root_dir: f"{data_root}/{asset_code}/{job_name}"
     format: parquet
     compression: zstd
-    write_policy: atomic_replace
     physical_layout:
       profile: joined_reuse_v1
       adaptation_scope: generation_fixed
@@ -19,7 +18,7 @@ output:
   logging:
     root_dir: f"{log_root}/{asset_code}"
 
-operations:
+define_upstream:
 - op: define_dataset
   alias: left
   paths:
@@ -46,29 +45,33 @@ operations:
 #   alias: right_a
 #   definition: 0201.right_a.0201.yaml
 
-- op: materialize
-  alias: materialize_left_parts
-  inputs: {source: left}
+build_sidecar:
+  alias: join_keyspace
+  method: union_distinct_keys
+  sources: [left]
+  keys: [partition, join_key]
   partition_by: [partition]
   part_boundary:
     target_rows: 20000
     target_key_groups: 500
     preserve_groups: [partition, join_key]
+
+materialize:
+  alias: materialize_left_parts
   workers: 1
   max_tasks_per_child: 4
+  operations:
+  - op: join
+    alias: join_left
+    input_right: left
+    left_on: [partition, join_key]
+    right_on: [partition, join_key]
 
-- op: join
-  alias: join_right_a
-  inputs: {left: materialize_left_parts, right: right_a}
-  how: left
-  left_on: [join_key]
-  right_on: [join_key_r]
-  right_partition_column: partition_r
-
-- op: save_dataset
-  alias: write_output
-  inputs: {data: join_right_a}
-  partition_by: [partition]
+  - op: join
+    alias: join_right_a
+    input_right: right_a
+    left_on: [join_key]
+    right_on: [join_key_r]
 
 execution:
   memory_budget_mb: 4096

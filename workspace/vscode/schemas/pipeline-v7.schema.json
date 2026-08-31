@@ -4,7 +4,7 @@
   "title": "Smoking Data 0201 Phase Pipeline v7",
   "type": "object",
   "additionalProperties": false,
-  "required": ["yaml", "job", "define_upstream", "build_sidecar", "materialize", "save_dataset", "output"],
+  "required": ["yaml", "job", "define_upstream", "build_sidecar", "materialize", "output"],
   "properties": {
     "yaml": {
       "type": "object",
@@ -29,7 +29,6 @@
     "combine_upstream": {"$ref": "#/$defs/combineUpstream"},
     "build_sidecar": {"$ref": "#/$defs/buildSidecar"},
     "materialize": {"$ref": "#/$defs/materialize"},
-    "save_dataset": {"$ref": "#/$defs/saveDataset"},
     "output": {"$ref": "#/$defs/output"},
     "execution": {"$ref": "#/$defs/execution"}
   },
@@ -142,10 +141,21 @@
     "buildSidecar": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["alias", "source", "operations"],
+      "required": ["alias", "source", "partition_by", "part_boundary", "operations"],
       "properties": {
         "alias": {"type": "string", "minLength": 1},
         "source": {"type": "string", "minLength": 1},
+        "partition_by": {"$ref": "#/$defs/stringArray"},
+        "part_boundary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_rows"],
+          "properties": {
+            "target_rows": {"type": "integer", "minimum": 1},
+            "target_key_groups": {"type": "integer", "minimum": 1},
+            "preserve_groups": {"$ref": "#/$defs/stringArray"}
+          }
+        },
         "columns": {},
         "execution": {
           "type": "object",
@@ -169,26 +179,11 @@
     "materialize": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["alias", "source", "coordinates", "partition_by", "part_boundary", "operations"],
+      "required": ["alias", "operations"],
       "properties": {
         "alias": {"type": "string", "minLength": 1},
-        "source": {"type": "string", "minLength": 1},
-        "coordinates": {"type": "string", "minLength": 1},
-        "partition_by": {"$ref": "#/$defs/stringArray"},
-        "part_boundary": {"type": "object"},
         "workers": {"type": "integer", "minimum": 1},
         "max_tasks_per_child": {"type": "integer", "minimum": 1},
-        "operations": {"type": "array", "items": {"$ref": "#/$defs/operation"}}
-      }
-    },
-    "saveDataset": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["input", "partition_by", "operations"],
-      "properties": {
-        "alias": {"type": "string", "minLength": 1},
-        "input": {"type": "string", "minLength": 1},
-        "partition_by": {"$ref": "#/$defs/stringArray"},
         "operations": {"type": "array", "items": {"$ref": "#/$defs/operation"}}
       }
     },
@@ -200,13 +195,12 @@
         "artifact": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "root_dir", "format", "compression", "write_policy"],
+          "required": ["type", "root_dir", "format", "compression", "physical_layout"],
           "properties": {
             "type": {"const": "curated_dataset"},
             "root_dir": {"type": "string", "minLength": 1},
             "format": {"const": "parquet"},
             "compression": {"enum": ["snappy", "zstd", "uncompressed"]},
-            "write_policy": {"enum": ["atomic_replace", "error_if_exists"]},
             "physical_layout": {"$ref": "#/$defs/physicalLayout"},
             "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
           }
@@ -233,8 +227,7 @@
               "additionalProperties": false,
               "properties": {
                 "build_sidecar": {"$ref": "#/$defs/phaseMemory"},
-                "materialize": {"$ref": "#/$defs/phaseMemory"},
-                "save_dataset": {"$ref": "#/$defs/phaseMemory"}
+                "materialize": {"$ref": "#/$defs/phaseMemory"}
               }
             }
           }

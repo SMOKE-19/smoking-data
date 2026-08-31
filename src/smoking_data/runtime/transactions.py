@@ -103,11 +103,9 @@ class DatasetTransaction:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         parts: list[dict[str, Any]] = []
         total_rows = 0
-        paths = [
-            path
-            for path in sorted(self.staging_root.rglob("*.parquet"))
-            if path.is_file()
-        ]
+        artifact_format = str((self.manifest_context or {}).get("artifact_format") or "parquet")
+        suffix = ".sbdf" if artifact_format == "sbdf" else ".parquet"
+        paths = [path for path in sorted(self.staging_root.rglob(f"*{suffix}")) if path.is_file()]
         checksum_workers = min(4, len(paths))
         checksum_started = time.perf_counter()
         if checksum_workers > 1:
@@ -117,24 +115,52 @@ class DatasetTransaction:
             checksums = {path: file_sha256(path) for path in paths}
         checksum_sec = time.perf_counter() - checksum_started
         metadata_started = time.perf_counter()
+        sbdf_parts = dict((self.manifest_context or {}).get("sbdf_parts") or {})
         for path in paths:
             if not path.is_file() or path.stat().st_size == 0:
                 raise RuntimeError(f"Dataset transaction contains an invalid part: {path}")
-            parquet = pq.ParquetFile(path)
-            rows = int(parquet.metadata.num_rows)
+            relative_path = path.relative_to(self.staging_root).as_posix()
+            if artifact_format == "sbdf":
+                sbdf_part = dict(sbdf_parts.get(relative_path) or {})
+                rows = int(sbdf_part.get("rows") or 0)
+                schema = str(sbdf_part.get("schema") or "")
+                if rows < 0 or not schema:
+                    raise RuntimeError(f"SBDF transaction metadata is incomplete: {path}")
+            else:
+                parquet = pq.ParquetFile(path)
+                rows = int(parquet.metadata.num_rows)
+                schema = str(parquet.schema_arrow)
             total_rows += rows
-            parts.append(
-                {
-                    "relative_path": path.relative_to(self.staging_root).as_posix(),
-                    "rows": rows,
-                    "size_bytes": path.stat().st_size,
-                    "sha256": checksums[path],
-                    "schema": str(parquet.schema_arrow),
-                }
-            )
+            part = {
+                "relative_path": relative_path,
+                "rows": rows,
+                "size_bytes": path.stat().st_size,
+                "sha256": checksums[path],
+                "schema": schema,
+            }
+            if artifact_format == "sbdf":
+                part["format"] = "sbdf"
+                part["key_sidecar_relative_path"] = str(
+                    sbdf_part.get("key_sidecar_relative_path") or ""
+                )
+            parts.append(part)
         parquet_metadata_sec = time.perf_counter() - metadata_started
         receipt_started = time.perf_counter()
-        parts = normalize_manifest_parts({"parts": parts})
+        normalized_parts = normalize_manifest_parts({"parts": parts})
+        if artifact_format == "sbdf":
+            extra_by_path = {str(item["relative_path"]): item for item in parts}
+            parts = [
+                {
+                    **item,
+                    "format": "sbdf",
+                    "key_sidecar_relative_path": extra_by_path[str(item["relative_path"])][
+                        "key_sidecar_relative_path"
+                    ],
+                }
+                for item in normalized_parts
+            ]
+        else:
+            parts = normalized_parts
         receipt, change_counts = build_dataset_change_receipt(
             previous_manifest=previous_manifest,
             current_parts=parts,

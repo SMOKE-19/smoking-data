@@ -3,7 +3,7 @@ yaml:
   asset_code: "0101"
 
 job:
-  name: source_0101_passthrough_structured
+  name: 1_Y
 
 source:
   api_request:
@@ -17,29 +17,38 @@ source:
     sql:
       table_id: basic_source
       select:
-      - name: text_1
-      - name: text_2
-      - name: int_1_alias
-        expr: int_1
-      - name: text_3
-      - name: event_date
-        expr: CAST(timestamp_1 AS DATE)
+      - name: text_li
+      - name: text_pr
+      - name: bucket
+        expr: LEFT(text_ro, 3)
+      - name: text_ro
+      - name: int_wa
+        expr: CAST(int_wa AS INTEGER)
+      - name: text_st
+      - name: text_te
+      - name: integer_go
+      - name: integer_ne
+      - name: text_pg
+      - name: datetime_tk
+      - name: updated_at
       filters:
         common:
-        - text_2 IS NOT NULL
-        sub_job:
-        - sub_job_name: text_1_a
-          sub_job_filtering:
-          - text_1 LIKE 'A%'
-        - sub_job_name: text_1_b
-          sub_job_filtering:
-          - text_1 LIKE 'B%'
+        - text_li = 'LI_1'
+        - text_pr = 'PR_A'
+        - text_st IN ('ST_1', 'ST_2', 'ST_3')
+        # sub_job:
+        # - sub_job_name: text_1_a
+        #   sub_job_filtering:
+        #   - text_1 LIKE 'A%'
+        # - sub_job_name: text_1_b
+        #   sub_job_filtering:
+        #   - text_1 LIKE 'B%'
       date_window:
-        column: CAST(timestamp_1 AS DATE)
-        step: 1
+        column: datetime_tk
+        step: 30
         date_window:
-        - '(2025-01-01, 2025-01-01)'
-        - '(2025-01-02, 2025-01-02)'
+        - '(-7, 0)'
+        # - '(2025-01-02, 2025-01-02)'
 execution:
   reset_before_run: false
   write_source_profile_json: false
@@ -93,6 +102,18 @@ output:
       max_rows_per_page: 1000
       # 카디널리티가 낮은 칼럼만 선택하려면 예: [text_1, text_2]
       use_dictionary: false
+    publication:
+      enabled: true
+      target: analytics_s3
+      dataset_prefix: assets/0101/basic_source_1_Y
+      mode: mirror_after_local_commit
+      failure_policy: required
+      parquet:
+        enabled: true
+        random_access_index:
+          level: key
+          key_columns: [bucket, text_ro, int_wa, text_st]
+          planning_columns: [datetime_tk, text_te, updated_at]
   logging:
     root_dir: f"{log_root}/{asset_code}/{table_id}"
     file_name_rule:

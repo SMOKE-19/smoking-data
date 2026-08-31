@@ -44,7 +44,7 @@ from smoking_data.runtime.operation_registry import (
     record_execution,
     record_execution_profiled,
 )
-from smoking_data.runtime.paths import reset_path, resolve_project_path
+from smoking_data.runtime.paths import infer_project_root, reset_path, resolve_project_path
 from smoking_data.runtime.yaml_loader import PresetSpec, load_pipeline_spec, load_preset_spec
 
 
@@ -59,9 +59,10 @@ def run_preset_yaml(
     Public callers should use ``run_pipeline_yaml`` with ``smoking-data.pipeline.v6``.
     """
 
+    effective_project_root = project_root or infer_project_root(yaml_path)
     config = load_config(
         config_path=config_path,
-        project_root=project_root,
+        project_root=effective_project_root,
         asset_code=asset_code_from_definition_path(yaml_path),
     )
     spec = load_preset_spec(yaml_path, config=config)
@@ -131,9 +132,10 @@ def run_pipeline_yaml(
             context={"trigger_type": trigger_type, "expected": sorted(TRIGGER_TYPES)},
         )
     phase_started = time.perf_counter()
+    effective_project_root = project_root or infer_project_root(yaml_path)
     config = load_config(
         config_path=config_path,
-        project_root=project_root,
+        project_root=effective_project_root,
         asset_code=asset_code_from_definition_path(yaml_path),
     )
     pipeline_phases["config_load_sec"] = time.perf_counter() - phase_started
@@ -184,7 +186,6 @@ def run_pipeline_yaml(
     phase_started = time.perf_counter()
     if reset_reason in {"explicit", "yaml_changed"}:
         _reset_pipeline_outputs(pipeline_spec, config=config)
-    _validate_pipeline_sink_write_policy(pipeline_spec, config=config)
     pipeline_phases["output_prepare_sec"] = time.perf_counter() - phase_started
     event_path = log_path_for(pipeline_spec, config=config)
     append_stage_event(
@@ -316,7 +317,11 @@ def run_pipeline_yaml(
     from smoking_data.runtime.object_store.config import PublicationSpec
     from smoking_data.runtime.object_store.publication import publish_committed_dataset
 
-    publication = PublicationSpec.from_mapping(artifact.get("publication"))
+    artifact_sbdf = artifact.get("sbdf") or {}
+    publication = PublicationSpec.from_mapping(
+        artifact.get("publication"),
+        sbdf_row_key_columns=tuple(artifact_sbdf.get("row_key_columns") or ()),
+    )
     if publication is not None:
         output_root = resolve_project_path(
             str(artifact["root_dir"]), project_root=config.project_root
@@ -546,17 +551,6 @@ def _reset_pipeline_outputs(spec: Any, *, config: Any) -> None:
         reset_path(resolve_project_path(sink.path, project_root=config.project_root))
 
 
-def _validate_pipeline_sink_write_policy(spec: Any, *, config: Any) -> None:
-    for sink in spec.sinks.values():
-        path = resolve_project_path(sink.path, project_root=config.project_root)
-        if not sink.overwrite and path.exists() and any(path.rglob("*.parquet")):
-            raise SmokingDataError(
-                f"Pipeline sink already exists and overwrite=false: {path}",
-                code="sink.already_exists",
-                context={"sink": sink.name, "path": str(path)},
-            )
-
-
 def _validate_pipeline_against_source_schemas(spec: Any, *, config: Any) -> Any:
     import pyarrow.parquet as pq
 
@@ -565,6 +559,11 @@ def _validate_pipeline_against_source_schemas(spec: Any, *, config: Any) -> Any:
     source_columns: dict[str, tuple[str, ...]] = {}
     source_dtypes: dict[str, dict[str, str]] = {}
     for name, source in spec.sources.items():
+        keyspace_keys = (
+            [str(item) for item in source.keyspace.get("keys") or []]
+            if source.keyspace is not None
+            else []
+        )
         roots = [
             resolve_project_path(path, project_root=config.project_root) for path in source.paths
         ]
@@ -579,8 +578,18 @@ def _validate_pipeline_against_source_schemas(spec: Any, *, config: Any) -> Any:
         dtypes: dict[str, str] = {}
         for item in files:
             schema = pq.ParquetFile(item.path).schema_arrow
+            if keyspace_keys:
+                missing = [key for key in keyspace_keys if schema.get_field_index(key) < 0]
+                if missing:
+                    raise SmokingDataError(
+                        "Join keyspace source is missing required key columns.",
+                        code="join_keyspace.missing_key",
+                        context={"source": name, "columns": missing, "path": str(item.path)},
+                    )
             for field in schema:
                 column = field.name
+                if keyspace_keys and column not in keyspace_keys:
+                    continue
                 dtype = str(field.type)
                 if column in dtypes and dtypes[column] != dtype:
                     raise SmokingDataError(
@@ -597,7 +606,7 @@ def _validate_pipeline_against_source_schemas(spec: Any, *, config: Any) -> Any:
                 dtypes[column] = dtype
                 if column not in columns:
                     columns.append(column)
-        source_columns[name] = tuple(columns)
+        source_columns[name] = tuple(keyspace_keys or columns)
         source_dtypes[name] = dtypes
     expression_irs = {
         operation.operation_id: operation.config["expression_ir"]
@@ -765,13 +774,14 @@ def _definition_kind(yaml_path: str | Path) -> str:
 
 def _run_definition_cli(args: argparse.Namespace) -> int:
     try:
+        effective_project_root = args.project_root or infer_project_root(args.yaml_path)
         if _definition_kind(args.yaml_path) == "chain":
             from smoking_data.runtime.asset_chain import run_asset_chain
 
             chain_result = run_asset_chain(
                 args.yaml_path,
                 config_path=args.config_path,
-                project_root=args.project_root,
+                project_root=effective_project_root,
             )
             payload = chain_result.to_dict()
             ok = chain_result.ok
@@ -780,7 +790,7 @@ def _run_definition_cli(args: argparse.Namespace) -> int:
             if asset_code == "0101":
                 from smoking_data.assets.a0101_source import execute_yaml
 
-                source_result = execute_yaml(args.yaml_path, project_root=args.project_root)
+                source_result = execute_yaml(args.yaml_path, project_root=effective_project_root)
                 payload = source_result.to_dict()
                 ok = source_result.ok
             elif asset_code == "0102":
@@ -789,7 +799,7 @@ def _run_definition_cli(args: argparse.Namespace) -> int:
                 result = run_yaml(
                     args.yaml_path,
                     config_path=args.config_path,
-                    project_root=args.project_root,
+                    project_root=effective_project_root,
                     trigger_type=args.trigger_type,
                 )
                 payload = result.to_dict()
@@ -800,7 +810,7 @@ def _run_definition_cli(args: argparse.Namespace) -> int:
                 result = run_yaml(
                     args.yaml_path,
                     config_path=args.config_path,
-                    project_root=args.project_root,
+                    project_root=effective_project_root,
                     trigger_type=args.trigger_type,
                 )
                 payload = result.to_dict()
@@ -809,7 +819,7 @@ def _run_definition_cli(args: argparse.Namespace) -> int:
                 result = run_pipeline_yaml(
                     args.yaml_path,
                     config_path=args.config_path,
-                    project_root=args.project_root,
+                    project_root=effective_project_root,
                     trigger_type=args.trigger_type,
                 )
                 payload = result.to_dict()
@@ -1391,7 +1401,11 @@ def _main_verify_migrated_chain(argv: list[str]) -> int:
     if args.tasks != 1:
         parser.error("migrated Chain verification requires exactly one smoke task per Asset")
     chain_path = Path(args.chain_yaml).expanduser().resolve()
-    project_root = Path(args.project_root or chain_path.parent).expanduser().resolve()
+    project_root = (
+        Path(args.project_root).expanduser().resolve()
+        if args.project_root is not None
+        else infer_project_root(chain_path)
+    )
     try:
         document = yaml.safe_load(chain_path.read_text(encoding="utf-8")) or {}
         if not isinstance(document, dict):
@@ -1511,7 +1525,11 @@ def _main_migrate_chain_run(argv: list[str]) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     chain_path = Path(args.chain_yaml).expanduser().resolve()
-    project_root = Path(args.project_root or chain_path.parent).expanduser().resolve()
+    project_root = (
+        Path(args.project_root).expanduser().resolve()
+        if args.project_root is not None
+        else infer_project_root(chain_path)
+    )
     migration_dir = Path(args.migration_dir)
     if not migration_dir.is_absolute():
         migration_dir = project_root / migration_dir
@@ -1699,7 +1717,11 @@ def _main_smoke_run(argv: list[str]) -> int:
         parser.error("--tasks must be >= 1")
     try:
         source_path = Path(args.yaml_path).expanduser().resolve()
-        project_root = Path(args.project_root or source_path.parent).expanduser().resolve()
+        project_root = (
+            Path(args.project_root).expanduser().resolve()
+            if args.project_root is not None
+            else infer_project_root(source_path)
+        )
         payload = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
         if not isinstance(payload, dict):
             raise ValueError("Smoke YAML root must be an object.")
@@ -1778,10 +1800,11 @@ def _main_chain_validate(argv: list[str]) -> int:
     parser.add_argument("--project-root", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    effective_project_root = args.project_root or infer_project_root(args.yaml_path)
     try:
         config = load_config(
             config_path=args.config_path,
-            project_root=args.project_root,
+            project_root=effective_project_root,
             asset_code=asset_code_from_definition_path(args.yaml_path),
         )
         spec = load_asset_chain(args.yaml_path, config=config)
@@ -1957,11 +1980,12 @@ def _main_chain_run(argv: list[str]) -> int:
     parser.add_argument("--project-root", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    effective_project_root = args.project_root or infer_project_root(args.yaml_path)
     try:
         result = run_asset_chain(
             args.yaml_path,
             config_path=args.config_path,
-            project_root=args.project_root,
+            project_root=effective_project_root,
         )
         payload = result.to_dict()
         exit_code = 0 if result.ok else 1
@@ -2258,6 +2282,7 @@ def _main_validate(argv: list[str]) -> int:
     parser.add_argument("--project-root", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    effective_project_root = args.project_root or infer_project_root(args.yaml_path)
     try:
         raw_document = yaml.safe_load(Path(args.yaml_path).read_text(encoding="utf-8")) or {}
         raw_header = raw_document.get("yaml") if isinstance(raw_document, dict) else None
@@ -2281,7 +2306,7 @@ def _main_validate(argv: list[str]) -> int:
 
             config = load_config(
                 config_path=args.config_path,
-                project_root=args.project_root,
+                project_root=effective_project_root,
                 asset_code=asset_code_from_definition_path(args.yaml_path),
             )
             spec = load_asset_chain(args.yaml_path, config=config)
@@ -2325,7 +2350,7 @@ def _main_validate(argv: list[str]) -> int:
         elif asset_code_from_definition_path(args.yaml_path) == "0103":
             from smoking_data.assets.a0103_csv_source import load_csv_source_spec
 
-            spec = load_csv_source_spec(args.yaml_path, project_root=args.project_root)
+            spec = load_csv_source_spec(args.yaml_path, project_root=effective_project_root)
             payload = {
                 "ok": True,
                 "kind": "asset",
@@ -2340,7 +2365,7 @@ def _main_validate(argv: list[str]) -> int:
         else:
             config = load_config(
                 config_path=args.config_path,
-                project_root=args.project_root,
+                project_root=effective_project_root,
                 asset_code=asset_code_from_definition_path(args.yaml_path),
             )
             spec = load_pipeline_spec(args.yaml_path, config=config)

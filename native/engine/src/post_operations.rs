@@ -1,4 +1,7 @@
-use arrow_array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray, UInt32Array};
+use crate::list_executor::expand_list_rows;
+use arrow_array::{
+    Array, ArrayRef, Float64Array, ListArray, RecordBatch, StringArray, UInt32Array,
+};
 use arrow_cast::{cast, display::array_value_to_string};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::{interleave::interleave, take::take};
@@ -43,6 +46,23 @@ struct UnpivotConfig {
     coercion: String,
     #[serde(default = "default_true")]
     preserve_nulls: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnnestBinding {
+    source: String,
+    output: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnnestConfig {
+    #[serde(default)]
+    columns: Vec<UnnestBinding>,
+    #[serde(default)]
+    all_list_columns: bool,
+    max_elements_per_row: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -107,6 +127,7 @@ pub fn execute_post_operations(
             "exclude_columns" => exclude_columns(batch, operation)?,
             "rename_columns" => rename_columns(batch, operation)?,
             "unpivot" => unpivot(batch, operation)?,
+            "unnest" => unnest(batch, operation)?,
             "data_assertion" => {
                 validate_assertions(&batch, operation)?;
                 batch
@@ -120,6 +141,92 @@ pub fn execute_post_operations(
         };
     }
     Ok(batch)
+}
+
+fn unnest(batch: RecordBatch, operation: &PostOperation) -> Result<RecordBatch, String> {
+    let config: UnnestConfig =
+        serde_json::from_value(operation.config.clone()).map_err(|error| {
+            format!(
+                "invalid unnest config for {}: {error}",
+                operation.operation_id
+            )
+        })?;
+    let columns = if config.all_list_columns {
+        if !config.columns.is_empty() {
+            return Err("unnest automatic mode must not define explicit columns".to_string());
+        }
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| {
+                matches!(
+                    field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                )
+            })
+            .map(|field| UnnestBinding {
+                source: field.name().to_string(),
+                output: field.name().to_string(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        config.columns
+    };
+    if columns.is_empty() {
+        return Err("unnest found no Arrow List or LargeList columns".to_string());
+    }
+    let mut normalized_columns = batch.columns().to_vec();
+    let mut normalized_fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+    for binding in &columns {
+        let index = batch
+            .schema()
+            .index_of(&binding.source)
+            .map_err(|_| format!("unnest source column not found: {}", binding.source))?;
+        let array = &normalized_columns[index];
+        if let DataType::LargeList(item) = array.data_type() {
+            let target = DataType::List(item.clone());
+            normalized_columns[index] = cast(array, &target).map_err(|error| {
+                format!(
+                    "unnest LargeList offsets cannot be represented as List for {}: {error}",
+                    binding.source
+                )
+            })?;
+            let original = &normalized_fields[index];
+            normalized_fields[index] = Arc::new(
+                Field::new(original.name(), target, original.is_nullable())
+                    .with_metadata(original.metadata().clone()),
+            );
+        }
+        let array = &normalized_columns[index];
+        let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            format!(
+                "unnest source must be Arrow List or LargeList: column={}, dtype={}",
+                binding.source,
+                array.data_type()
+            )
+        })?;
+        for offsets in list.value_offsets().windows(2) {
+            let element_count = usize::try_from(offsets[1] - offsets[0])
+                .map_err(|_| format!("unnest source has negative offsets: {}", binding.source))?;
+            if element_count > config.max_elements_per_row {
+                return Err(format!(
+                    "unnest max_elements_per_row exceeded: column={}, actual={}, limit={}",
+                    binding.source, element_count, config.max_elements_per_row
+                ));
+            }
+        }
+    }
+    let bindings = columns
+        .iter()
+        .map(|binding| (binding.source.clone(), binding.output.clone()))
+        .collect::<Vec<_>>();
+    let normalized_batch =
+        RecordBatch::try_new(Arc::new(Schema::new(normalized_fields)), normalized_columns)
+            .map_err(|error| format!("unnest normalized batch is invalid: {error}"))?;
+    expand_list_rows(&normalized_batch, &bindings)
+        .map(|(expanded, _)| expanded)
+        .map_err(|error| format!("unnest failed for {}: {error}", operation.operation_id))
 }
 
 fn configured_columns(operation: &PostOperation) -> Result<Vec<String>, String> {
@@ -835,7 +942,7 @@ fn structured_assertion_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{types::Int64Type, Int64Array, StringArray};
 
     fn batch() -> RecordBatch {
         RecordBatch::try_from_iter(vec![
@@ -900,5 +1007,151 @@ mod tests {
             }],
         );
         assert!(error.is_ok());
+    }
+
+    #[test]
+    fn unnest_expands_lists_and_preserves_empty_and_null_parent_semantics() {
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(10), Some(20)]),
+            Some(Vec::<Option<i64>>::new()),
+            None,
+            Some(vec![None]),
+        ]);
+        let input = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+            ("values", Arc::new(lists) as ArrayRef),
+        ])
+        .expect("list batch");
+
+        let output = execute_post_operations(
+            input,
+            &[PostOperation {
+                operation_id: "explode_values".into(),
+                kind: "unnest".into(),
+                config: serde_json::json!({
+                    "columns":[{"source":"values","output":"value"}],
+                    "max_elements_per_row": 2
+                }),
+            }],
+        )
+        .expect("unnest");
+
+        assert_eq!(output.num_rows(), 3);
+        let ids = output
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 1, 4]);
+        let values = output
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 10);
+        assert_eq!(values.value(1), 20);
+        assert!(values.is_null(2));
+    }
+
+    #[test]
+    fn unnest_rejects_rows_over_the_declared_element_limit() {
+        let lists =
+            ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1), Some(2)])]);
+        let input = RecordBatch::try_from_iter(vec![("values", Arc::new(lists) as ArrayRef)])
+            .expect("list batch");
+
+        let error = execute_post_operations(
+            input,
+            &[PostOperation {
+                operation_id: "explode_values".into(),
+                kind: "unnest".into(),
+                config: serde_json::json!({
+                    "columns":[{"source":"values","output":"value"}],
+                    "max_elements_per_row": 1
+                }),
+            }],
+        )
+        .expect_err("element limit");
+
+        assert!(error.contains("max_elements_per_row exceeded"));
+    }
+
+    #[test]
+    fn unnest_automatic_mode_expands_every_list_column_with_original_names() {
+        let left = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(Vec::<Option<i64>>::new()),
+        ]);
+        let right = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(10), Some(20)]),
+            None,
+        ]);
+        let input = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+            ("left", Arc::new(left) as ArrayRef),
+            ("right", Arc::new(right) as ArrayRef),
+        ])
+        .expect("list batch");
+
+        let output = execute_post_operations(
+            input,
+            &[PostOperation {
+                operation_id: "explode_all_lists".into(),
+                kind: "unnest".into(),
+                config: serde_json::json!({
+                    "columns": [],
+                    "all_list_columns": true,
+                    "max_elements_per_row": 2
+                }),
+            }],
+        )
+        .expect("automatic unnest");
+
+        assert_eq!(output.num_rows(), 2);
+        assert_eq!(
+            output.schema().field_with_name("left").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            output
+                .schema()
+                .field_with_name("right")
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
+    }
+
+    #[test]
+    fn unnest_automatic_mode_rejects_different_per_row_list_lengths() {
+        let left = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
+        let right =
+            ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1), Some(2)])]);
+        let input = RecordBatch::try_from_iter(vec![
+            ("left", Arc::new(left) as ArrayRef),
+            ("right", Arc::new(right) as ArrayRef),
+        ])
+        .expect("list batch");
+
+        let error = execute_post_operations(
+            input,
+            &[PostOperation {
+                operation_id: "explode_all_lists".into(),
+                kind: "unnest".into(),
+                config: serde_json::json!({
+                    "columns": [],
+                    "all_list_columns": true,
+                    "max_elements_per_row": 2
+                }),
+            }],
+        )
+        .expect_err("shape mismatch");
+
+        assert!(error.contains("list.shape_mismatch"));
     }
 }

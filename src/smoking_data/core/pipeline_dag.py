@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from hashlib import sha256
@@ -10,12 +11,13 @@ from smoking_data.core.exceptions import ValidationError
 
 PIPELINE_SCHEMA_VERSION = "smoking-data.pipeline.v6"
 CURATED_PIPELINE_SCHEMA_VERSION = "smoking-data.pipeline.v7"
+SNAPSHOT_PIPELINE_SCHEMA_VERSION = "smoking-data.pipeline.v8"
 CANONICAL_OPERATION_VERSION = "smoking-data.operation-canonical.v1"
 PIPELINE_ASSET_CODES = frozenset({"0201", "0301", "0401"})
 PIPELINE_SCHEMA_VERSION_BY_ASSET = {
     "0201": CURATED_PIPELINE_SCHEMA_VERSION,
     "0301": PIPELINE_SCHEMA_VERSION,
-    "0401": PIPELINE_SCHEMA_VERSION,
+    "0401": SNAPSHOT_PIPELINE_SCHEMA_VERSION,
 }
 PUBLIC_EXECUTION_KEYS = frozenset(
     {
@@ -36,6 +38,28 @@ PUBLIC_EXECUTION_KEYS = frozenset(
     }
 )
 ROOT_KEYS = frozenset({"yaml", "job", "operations", "output", "execution"})
+JOIN_ROOT_KEYS = frozenset(
+    {
+        "yaml",
+        "job",
+        "define_upstream",
+        "build_sidecar",
+        "materialize",
+        "output",
+        "execution",
+    }
+)
+SNAPSHOT_ROOT_KEYS = frozenset(
+    {
+        "yaml",
+        "job",
+        "define_upstream",
+        "build_sidecar",
+        "materialize",
+        "output",
+        "execution",
+    }
+)
 CURATED_ROOT_KEYS = frozenset(
     {
         "yaml",
@@ -60,6 +84,7 @@ _PORTS: dict[str, tuple[str, ...]] = {
     "define_dataset": (),
     "define_asset": (),
     "define_combined": (),
+    "define_keyspace": (),
     "build_sidecar": ("source",),
     "active_row_selection": ("sidecar",),
     "materialize": ("source",),
@@ -105,10 +130,18 @@ def normalize_pipeline_document(
             code="yaml.unsupported_schema_version",
             context={"expected": [expected_version], "actual": version or None},
         )
+    if asset_code == "0401":
+        raw = _apply_0401_sbdf_output_defaults(raw)
     operation_phases: dict[str, str] = {}
     if asset_code == "0201" and not legacy_curated_internal:
         _reject_unknown(raw, CURATED_ROOT_KEYS, path="$")
         raw, operation_phases = _expand_curated_phase_document(raw)
+    elif asset_code == "0301":
+        _reject_unknown(raw, JOIN_ROOT_KEYS, path="$")
+        raw, operation_phases = _expand_join_materialize_document(raw)
+    elif asset_code == "0401":
+        _reject_unknown(raw, SNAPSHOT_ROOT_KEYS, path="$")
+        raw, operation_phases = _expand_snapshot_materialize_document(raw)
     else:
         _reject_unknown(raw, ROOT_KEYS, path="$")
     job = _mapping(raw.get("job"), path="job")
@@ -171,6 +204,15 @@ def normalize_pipeline_document(
             inputs = _mapping(inputs, path=f"{path}.inputs")
         required = _PORTS.get(kind, ("data",))
         allowed = set(required)
+        if kind == "define_keyspace":
+            required = tuple(sorted(inputs))
+            allowed = set(required)
+            if len(required) < 1 or any(not port.startswith("member_") for port in required):
+                raise ValidationError(
+                    "define_keyspace requires at least one member_<n> dataset input.",
+                    code="join_keyspace.invalid_sources",
+                    context={"operation_id": operation_id, "ports": sorted(inputs)},
+                )
         if kind == "materialize":
             allowed.add("coordinates")
         unknown_ports = sorted(set(inputs).difference(allowed))
@@ -199,7 +241,7 @@ def normalize_pipeline_document(
             _require_upstream_kind(
                 indexed,
                 inputs["coordinates"],
-                {"active_row_selection"},
+                {"active_row_selection", "build_sidecar"},
                 operation_id,
                 "coordinates",
             )
@@ -231,7 +273,12 @@ def normalize_pipeline_document(
                 )
             expected_artifact = _expected_input_artifact(kind, str(port))
             actual_artifact = _output_artifact(str(indexed[upstream]["op"]))
-            if actual_artifact != expected_artifact:
+            direct_sidecar_coordinates = (
+                kind == "materialize"
+                and str(port) == "coordinates"
+                and str(indexed[upstream]["op"]) == "build_sidecar"
+            )
+            if actual_artifact != expected_artifact and not direct_sidecar_coordinates:
                 raise ValidationError(
                     "Input port references an incompatible artifact.",
                     code="dag.input_artifact_mismatch",
@@ -335,6 +382,622 @@ def normalize_pipeline_document(
         "operation_phases": operation_phases,
     }
     return normalized, graph
+
+
+def _expand_join_materialize_document(
+    raw: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Lower the public 0301 materialize phase to the internal flat DAG."""
+
+    upstreams = raw.get("define_upstream")
+    if not isinstance(upstreams, list) or not upstreams:
+        raise ValidationError(
+            "define_upstream must be a non-empty list.",
+            code="yaml.invalid_type",
+            context={"path": "define_upstream"},
+        )
+    operations: list[dict[str, Any]] = []
+    phases: dict[str, str] = {}
+    upstream_aliases: list[str] = []
+    for index, value in enumerate(upstreams):
+        path = f"define_upstream[{index}]"
+        operation = dict(_mapping(value, path=path))
+        _reject_unknown(
+            operation,
+            {
+                "op",
+                "alias",
+                "definition",
+                "paths",
+                "format",
+                "union_by_name",
+                "missing_columns",
+                "incompatible_dtypes",
+                "source_identity",
+                "select",
+            },
+            path=path,
+        )
+        kind = _required_string(operation.get("op"), path=f"{path}.op")
+        if kind not in {"define_asset", "define_dataset"}:
+            raise ValidationError(
+                "define_upstream accepts only define_asset or define_dataset.",
+                code="operation.unsupported",
+                context={"path": f"{path}.op", "operation": kind},
+            )
+        alias = _required_string(operation.get("alias"), path=f"{path}.alias")
+        operations.append(operation)
+        upstream_aliases.append(alias)
+        phases[alias] = "define_upstream"
+
+    if raw.get("build_sidecar") is None:
+        raise ValidationError(
+            "0301 requires build_sidecar keyspace planning.",
+            code="join_keyspace.required",
+            context={"path": "build_sidecar"},
+        )
+    sidecar = _mapping(raw.get("build_sidecar"), path="build_sidecar")
+    keyspace_alias: str | None = None
+    keyspace_partition_by: list[str] | None = None
+    keyspace_boundary: dict[str, Any] | None = None
+    if sidecar:
+        _reject_unknown(
+            sidecar,
+            {
+                "alias",
+                "method",
+                "sources",
+                "keys",
+                "partition_by",
+                "part_boundary",
+                "null_key_policy",
+            },
+            path="build_sidecar",
+        )
+        keyspace_alias = _required_string(sidecar.get("alias"), path="build_sidecar.alias")
+        method = str(sidecar.get("method") or "union_distinct_keys").strip().lower()
+        if method != "union_distinct_keys":
+            raise ValidationError(
+                "0301 build_sidecar currently requires method=union_distinct_keys.",
+                code="join_keyspace.unsupported_method",
+                context={"path": "build_sidecar.method", "value": method},
+            )
+        source_aliases = _string_list(sidecar.get("sources"), path="build_sidecar.sources")
+        if len(set(source_aliases)) != len(source_aliases):
+            raise ValidationError(
+                "build_sidecar.sources requires unique upstream aliases.",
+                code="join_keyspace.invalid_sources",
+                context={"sources": source_aliases},
+            )
+        unknown_sources = sorted(set(source_aliases).difference(upstream_aliases))
+        if unknown_sources:
+            raise ValidationError(
+                "build_sidecar.sources references unknown upstream aliases.",
+                code="operation.unknown_source",
+                context={"path": "build_sidecar.sources", "sources": unknown_sources},
+            )
+        keys = _string_list(sidecar.get("keys"), path="build_sidecar.keys")
+        if len(set(keys)) != len(keys):
+            raise ValidationError(
+                "build_sidecar.keys must be unique.",
+                code="join_keyspace.duplicate_key",
+                context={"keys": keys},
+            )
+        keyspace_partition_by = _string_list(
+            sidecar.get("partition_by"), path="build_sidecar.partition_by"
+        )
+        if len(keyspace_partition_by) != 1 or keyspace_partition_by[0] not in keys:
+            raise ValidationError(
+                "0301 build_sidecar.partition_by requires one keyspace key.",
+                code="join_keyspace.invalid_partition",
+                context={"partition_by": keyspace_partition_by, "keys": keys},
+            )
+        keyspace_boundary = dict(
+            _mapping(sidecar.get("part_boundary"), path="build_sidecar.part_boundary")
+        )
+        _reject_unknown(
+            keyspace_boundary,
+            {"target_rows", "target_key_groups", "preserve_groups"},
+            path="build_sidecar.part_boundary",
+        )
+        preserve_groups = _string_list(
+            keyspace_boundary.get("preserve_groups"),
+            path="build_sidecar.part_boundary.preserve_groups",
+        )
+        if not set(keys).issubset(preserve_groups):
+            raise ValidationError(
+                "build_sidecar.part_boundary.preserve_groups must contain all keyspace keys.",
+                code="join_keyspace.incomplete_preserve_groups",
+                context={"keys": keys, "preserve_groups": preserve_groups},
+            )
+        null_key_policy = str(sidecar.get("null_key_policy") or "error").strip().lower()
+        if null_key_policy not in {"error", "drop"}:
+            raise ValidationError(
+                "build_sidecar.null_key_policy must be error or drop.",
+                code="join_keyspace.invalid_null_policy",
+                context={"value": null_key_policy},
+            )
+        operations.append(
+            {
+                "op": "define_keyspace",
+                "alias": keyspace_alias,
+                "inputs": {
+                    f"member_{index}": source_alias
+                    for index, source_alias in enumerate(source_aliases)
+                },
+                "method": method,
+                "sources": source_aliases,
+                "keys": keys,
+                "partition_by": keyspace_partition_by,
+                "part_boundary": keyspace_boundary,
+                "null_key_policy": null_key_policy,
+            }
+        )
+        phases[keyspace_alias] = "build_sidecar"
+
+    materialize = _mapping(raw.get("materialize"), path="materialize")
+    _reject_unknown(
+        materialize,
+        {"alias", "workers", "max_tasks_per_child", "operations"},
+        path="materialize",
+    )
+    alias = _required_string(materialize.get("alias"), path="materialize.alias")
+    source = str(keyspace_alias or "").strip()
+    boundary = keyspace_boundary
+    if boundary is None or keyspace_partition_by is None:
+        raise ValidationError(
+            "0301 requires build_sidecar keyspace planning.",
+            code="join_keyspace.required",
+        )
+    preserve_groups = _string_list(
+        boundary.get("preserve_groups"),
+        path=(
+            "build_sidecar.part_boundary.preserve_groups"
+        ),
+    )
+    partition_by = keyspace_partition_by
+    operations.append(
+        {
+            "op": "materialize",
+            "alias": alias,
+            "inputs": {"source": source},
+            "partition_by": partition_by,
+            "part_boundary": dict(boundary),
+            "workers": materialize.get("workers", 1),
+            "max_tasks_per_child": materialize.get("max_tasks_per_child", 1),
+        }
+    )
+    phases[alias] = "materialize"
+
+    nested = materialize.get("operations") or []
+    if not isinstance(nested, list):
+        raise ValidationError(
+            "materialize.operations must be a list.",
+            code="yaml.invalid_type",
+            context={"path": "materialize.operations"},
+        )
+    current = alias
+    join_count = 0
+    forbidden = {
+        "define_asset",
+        "define_dataset",
+        "define_keyspace",
+        "materialize",
+        "save_dataset",
+    }
+    for index, value in enumerate(nested):
+        path = f"materialize.operations[{index}]"
+        operation = dict(_mapping(value, path=path))
+        kind = _required_string(operation.get("op"), path=f"{path}.op")
+        if kind in forbidden:
+            raise ValidationError(
+                "0301 materialize.operations accepts only join and payload operations.",
+                code="operation.unsupported",
+                context={"path": f"{path}.op", "operation": kind},
+            )
+        nested_alias = _required_string(operation.get("alias"), path=f"{path}.alias")
+        if kind == "join":
+            join_count += 1
+            forbidden_join_fields = sorted(
+                field
+                for field in ("how", "right_partition_column", "columns", "inputs")
+                if field in operation
+            )
+            if forbidden_join_fields:
+                raise ValidationError(
+                    "0301 join infers the left input and accepts only input_right plus direct column filters.",
+                    code="join_keyspace.removed_join_field",
+                    context={"path": path, "fields": forbidden_join_fields},
+                )
+            operation["columns"] = _normalize_join_column_filters(
+                operation.pop("include_columns", None),
+                operation.pop("exclude_columns", None),
+                path=path,
+            )
+            input_right = _required_string(
+                operation.pop("input_right", None),
+                path=f"{path}.input_right",
+            )
+            operation["inputs"] = {"left": current, "right": input_right}
+            operation["how"] = "left"
+        if kind != "join" and operation.get("inputs") is None:
+            operation["inputs"] = {"data": current}
+        operations.append(operation)
+        phases[nested_alias] = "materialize"
+        current = nested_alias
+
+    if join_count < 1:
+        raise ValidationError(
+            "0301 materialize.operations requires at least one join.",
+            code="join_keyspace.join_required",
+            context={"path": "materialize.operations"},
+        )
+
+    save_alias = "save_dataset"
+    operations.append(
+        {
+            "op": "save_dataset",
+            "alias": save_alias,
+            "inputs": {"data": current},
+            "partition_by": partition_by,
+        }
+    )
+    phases[save_alias] = "save_dataset"
+    return (
+        {
+            "yaml": raw["yaml"],
+            "job": raw["job"],
+            "operations": operations,
+            "output": raw["output"],
+            "execution": dict(raw.get("execution") or {}),
+        },
+        phases,
+    )
+
+
+def _normalize_join_column_filters(
+    include_columns: Any,
+    exclude_columns: Any,
+    *,
+    path: str,
+) -> dict[str, list[str]]:
+    policy: dict[str, list[str]] = {}
+    for field, value, exact_key, regex_key in (
+        ("include_columns", include_columns, "include", "regex"),
+        ("exclude_columns", exclude_columns, "exclude", "exclude_regex"),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, str):
+            pattern = value.strip()
+            if not pattern:
+                raise ValidationError(
+                    f"{field} regex must not be empty.",
+                    code="join.invalid_column_regex",
+                    context={"path": f"{path}.{field}"},
+                )
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValidationError(
+                    f"Invalid {field} regex.",
+                    code="join.invalid_column_regex",
+                    context={"path": f"{path}.{field}", "pattern": pattern},
+                ) from error
+            policy[regex_key] = [pattern]
+            continue
+        values = _string_list(value, path=f"{path}.{field}")
+        if len(values) != len(set(values)):
+            raise ValidationError(
+                f"{field} requires unique column names.",
+                code="join.duplicate_column_filter",
+                context={"path": f"{path}.{field}", "columns": values},
+            )
+        policy[exact_key] = values
+    return policy
+
+
+_SNAPSHOT_PARTITION_COLUMN = "__smoking_data_snapshot_partition"
+
+
+def _expand_snapshot_materialize_document(
+    raw: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Lower the public 0401 coordinate-selected snapshot to the internal DAG."""
+
+    upstreams = raw.get("define_upstream")
+    if not isinstance(upstreams, list) or len(upstreams) != 1:
+        raise ValidationError(
+            "0401 define_upstream must contain exactly one source.",
+            code="yaml.invalid_type",
+            context={"path": "define_upstream", "count": len(upstreams or [])},
+        )
+    upstream = dict(_mapping(upstreams[0], path="define_upstream[0]"))
+    _reject_unknown(
+        upstream,
+        {
+            "op",
+            "alias",
+            "definition",
+            "paths",
+            "format",
+            "union_by_name",
+            "missing_columns",
+            "incompatible_dtypes",
+        },
+        path="define_upstream[0]",
+    )
+    kind = _required_string(upstream.get("op"), path="define_upstream[0].op")
+    if kind not in {"define_asset", "define_dataset"}:
+        raise ValidationError(
+            "0401 define_upstream accepts only define_asset or define_dataset.",
+            code="operation.unsupported",
+            context={"path": "define_upstream[0].op", "operation": kind},
+        )
+    source_alias = _required_string(
+        upstream.get("alias"), path="define_upstream[0].alias"
+    )
+
+    operations: list[dict[str, Any]] = [upstream]
+    phases: dict[str, str] = {source_alias: "define_upstream"}
+
+    sidecar = _mapping(raw.get("build_sidecar"), path="build_sidecar")
+    _reject_unknown(
+        sidecar,
+        {"alias", "source", "columns", "part_boundary", "operations", "execution"},
+        path="build_sidecar",
+    )
+    sidecar_alias = _required_string(sidecar.get("alias"), path="build_sidecar.alias")
+    sidecar_source = _required_string(sidecar.get("source"), path="build_sidecar.source")
+    if sidecar_source != source_alias:
+        raise ValidationError(
+            "0401 build_sidecar.source must reference define_upstream.alias.",
+            code="build_sidecar.invalid_source",
+            context={"source": sidecar_source, "expected": source_alias},
+        )
+    boundary = _mapping(
+        sidecar.get("part_boundary"), path="build_sidecar.part_boundary"
+    )
+    _reject_unknown(
+        boundary,
+        {"target_rows", "target_key_groups", "preserve_groups"},
+        path="build_sidecar.part_boundary",
+    )
+    target_rows = boundary.get("target_rows")
+    if not isinstance(target_rows, int) or isinstance(target_rows, bool) or target_rows < 1:
+        raise ValidationError(
+            "build_sidecar.part_boundary.target_rows must be an integer >= 1.",
+            code="yaml.invalid_type",
+            context={
+                "path": "build_sidecar.part_boundary.target_rows",
+                "value": target_rows,
+            },
+        )
+    preserve_groups = (
+        _string_list(
+            boundary.get("preserve_groups"),
+            path="build_sidecar.part_boundary.preserve_groups",
+        )
+        if boundary.get("preserve_groups") is not None
+        else []
+    )
+    target_key_groups = boundary.get("target_key_groups")
+    if target_key_groups is not None and (
+        not isinstance(target_key_groups, int)
+        or isinstance(target_key_groups, bool)
+        or target_key_groups < 1
+    ):
+        raise ValidationError(
+            "build_sidecar.part_boundary.target_key_groups must be an integer >= 1.",
+            code="yaml.invalid_type",
+            context={
+                "path": "build_sidecar.part_boundary.target_key_groups",
+                "value": target_key_groups,
+            },
+        )
+    sidecar_operations = sidecar.get("operations") or []
+    if not isinstance(sidecar_operations, list):
+        raise ValidationError(
+            "0401 build_sidecar.operations must be a list when provided.",
+            code="yaml.invalid_type",
+            context={"path": "build_sidecar.operations"},
+        )
+    current = sidecar_source
+    for index, value in enumerate(sidecar_operations):
+        path = f"build_sidecar.operations[{index}]"
+        operation = dict(_mapping(value, path=path))
+        kind = _required_string(operation.get("op"), path=f"{path}.op")
+        if kind not in {"filter", "type_cast", "add_calc"}:
+            raise ValidationError(
+                "0401 build_sidecar supports only filter, type_cast, and add_calc.",
+                code="operation.unsupported",
+                context={"path": f"{path}.op", "operation": kind},
+            )
+        alias = str(
+            operation.pop("alias", "") or f"{sidecar_alias}__{index + 1:02d}_{kind}"
+        )
+        operation["alias"] = alias
+        operation["inputs"] = {"data": current}
+        operations.append(operation)
+        phases[alias] = "build_sidecar"
+        current = alias
+    operations.append(
+        {
+            "op": "build_sidecar",
+            "alias": sidecar_alias,
+            "inputs": {"source": current},
+            "columns": sidecar.get("columns", "auto"),
+        }
+    )
+    phases[sidecar_alias] = "build_sidecar"
+
+    sidecar_execution = _mapping(
+        sidecar.get("execution") or {}, path="build_sidecar.execution"
+    )
+    _reject_unknown(
+        sidecar_execution,
+        {"workers", "worker_recycle"},
+        path="build_sidecar.execution",
+    )
+    sidecar_workers = sidecar_execution.get("workers", 1)
+    if (
+        not isinstance(sidecar_workers, int)
+        or isinstance(sidecar_workers, bool)
+        or sidecar_workers < 1
+    ):
+        raise ValidationError(
+            "build_sidecar.execution.workers must be an integer >= 1.",
+            code="yaml.invalid_type",
+            context={"path": "build_sidecar.execution.workers", "value": sidecar_workers},
+        )
+    worker_recycle = _mapping(
+        sidecar_execution.get("worker_recycle") or {},
+        path="build_sidecar.execution.worker_recycle",
+    )
+    _reject_unknown(
+        worker_recycle,
+        {"mode", "max_source_files", "max_projected_bytes_mb"},
+        path="build_sidecar.execution.worker_recycle",
+    )
+    recycle_mode = str(worker_recycle.get("mode") or "adaptive").strip().lower()
+    if recycle_mode != "adaptive":
+        raise ValidationError(
+            "build_sidecar worker recycle mode must be adaptive.",
+            code="build_sidecar.unsupported_worker_recycle_mode",
+            context={
+                "path": "build_sidecar.execution.worker_recycle.mode",
+                "value": recycle_mode,
+            },
+        )
+    for key, default in (("max_source_files", 16), ("max_projected_bytes_mb", 512)):
+        value = worker_recycle.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValidationError(
+                f"build_sidecar.execution.worker_recycle.{key} must be an integer >= 1.",
+                code="yaml.invalid_type",
+                context={
+                    "path": f"build_sidecar.execution.worker_recycle.{key}",
+                    "value": value,
+                },
+            )
+
+    materialize = _mapping(raw.get("materialize"), path="materialize")
+    _reject_unknown(
+        materialize,
+        {"alias", "workers", "max_tasks_per_child", "operations"},
+        path="materialize",
+    )
+    materialize_alias = _required_string(
+        materialize.get("alias"), path="materialize.alias"
+    )
+    nested = materialize.get("operations") or []
+    if not isinstance(nested, list):
+        raise ValidationError(
+            "materialize.operations must be a list.",
+            code="yaml.invalid_type",
+            context={"path": "materialize.operations"},
+        )
+    allowed = {
+        "filter",
+        "type_cast",
+        "add_calc",
+        "reference_replace",
+        "list_restore",
+        "include_columns",
+        "exclude_columns",
+        "rename_columns",
+        "unpivot",
+        "unnest",
+        "pivot",
+    }
+    boundary_alias = f"{materialize_alias}__boundary"
+    operations.append(
+        {
+            "op": "materialize",
+            "alias": boundary_alias,
+            "inputs": {"source": source_alias, "coordinates": sidecar_alias},
+            "partition_by": [_SNAPSHOT_PARTITION_COLUMN],
+            "part_boundary": {
+                "target_rows": target_rows,
+                "target_key_groups": target_key_groups,
+                "preserve_groups": [
+                    _SNAPSHOT_PARTITION_COLUMN,
+                    *(
+                        group
+                        for group in preserve_groups
+                        if group != _SNAPSHOT_PARTITION_COLUMN
+                    ),
+                ],
+            },
+            "workers": materialize.get("workers", 1),
+            "max_tasks_per_child": materialize.get("max_tasks_per_child", 1),
+        }
+    )
+    phases[boundary_alias] = "materialize"
+
+    current = boundary_alias
+    payload_index = 0
+    for index, value in enumerate(nested):
+        path = f"materialize.operations[{index}]"
+        operation = dict(_mapping(value, path=path))
+        forbidden = sorted(
+            key for key in ("inputs", "partition_by") if key in operation
+        )
+        if forbidden:
+            raise ValidationError(
+                "0401 materialize operations infer their input and do not accept inputs or partition_by.",
+                code="yaml.unknown_key",
+                context={"path": path, "keys": forbidden},
+            )
+        operation_kind = _required_string(operation.get("op"), path=f"{path}.op")
+        if operation_kind not in allowed:
+            raise ValidationError(
+                "Unsupported 0401 materialize operation.",
+                code="operation.unsupported",
+                context={"path": f"{path}.op", "operation": operation_kind},
+            )
+        payload_index += 1
+        alias = str(
+            operation.pop("alias", "")
+            or f"{materialize_alias}__{payload_index:02d}_{operation_kind}"
+        )
+        operation["alias"] = alias
+        operation["inputs"] = {"data": current}
+        operations.append(operation)
+        phases[alias] = "materialize"
+        current = alias
+
+    save_alias = f"{materialize_alias}__write_snapshot"
+    operations.append(
+        {
+            "op": "save_dataset",
+            "alias": save_alias,
+            "inputs": {"data": current},
+            "partition_by": [_SNAPSHOT_PARTITION_COLUMN],
+        }
+    )
+    phases[save_alias] = "save_dataset"
+    execution = dict(raw.get("execution") or {})
+    execution.update(
+        {
+            "sidecar_workers": sidecar_workers,
+            "sidecar_worker_recycle_mode": recycle_mode,
+            "sidecar_max_source_files": int(worker_recycle.get("max_source_files", 16)),
+            "sidecar_max_projected_bytes_mb": int(
+                worker_recycle.get("max_projected_bytes_mb", 512)
+            ),
+        }
+    )
+    return (
+        {
+            "yaml": raw["yaml"],
+            "job": raw["job"],
+            "operations": operations,
+            "output": raw["output"],
+            "execution": execution,
+        },
+        phases,
+    )
 
 
 def _expand_curated_phase_document(
@@ -499,11 +1162,42 @@ def _expand_curated_phase_document(
     sidecar = _mapping(raw.get("build_sidecar"), path="build_sidecar")
     _reject_unknown(
         sidecar,
-        {"alias", "source", "columns", "operations", "execution"},
+        {
+            "alias",
+            "source",
+            "partition_by",
+            "part_boundary",
+            "columns",
+            "operations",
+            "execution",
+        },
         path="build_sidecar",
     )
     sidecar_alias = _required_string(sidecar.get("alias"), path="build_sidecar.alias")
     sidecar_source = _required_string(sidecar.get("source"), path="build_sidecar.source")
+    legacy_materialize_value = raw.get("materialize")
+    legacy_materialize = (
+        legacy_materialize_value if isinstance(legacy_materialize_value, dict) else {}
+    )
+    sidecar_partition_value = sidecar.get("partition_by")
+    if sidecar_partition_value is None:
+        sidecar_partition_value = legacy_materialize.get("partition_by")
+    sidecar_partition_by = _string_list(
+        sidecar_partition_value,
+        path=(
+            "build_sidecar.partition_by"
+            if sidecar.get("partition_by") is not None
+            else "materialize.partition_by"
+        ),
+    )
+    sidecar_boundary = _mapping(
+        sidecar.get("part_boundary"), path="build_sidecar.part_boundary"
+    )
+    _reject_unknown(
+        sidecar_boundary,
+        {"target_rows", "target_key_groups", "preserve_groups"},
+        path="build_sidecar.part_boundary",
+    )
     sidecar_execution = _mapping(
         sidecar.get("execution") or {}, path="build_sidecar.execution"
     )
@@ -613,7 +1307,6 @@ def _expand_curated_phase_document(
             "source",
             "coordinates",
             "partition_by",
-            "part_boundary",
             "workers",
             "max_tasks_per_child",
             "operations",
@@ -621,16 +1314,40 @@ def _expand_curated_phase_document(
         path="materialize",
     )
     materialize_alias = _required_string(materialize.get("alias"), path="materialize.alias")
-    materialize_source = _required_string(materialize.get("source"), path="materialize.source")
-    coordinates = _required_string(
-        materialize.get("coordinates"), path="materialize.coordinates"
-    )
+    explicit_materialize_source = str(materialize.get("source") or "").strip()
+    if explicit_materialize_source and explicit_materialize_source != sidecar_source:
+        raise ValidationError(
+            "materialize.source must match build_sidecar.source when provided.",
+            code="materialize.invalid_payload_source",
+            context={
+                "source": explicit_materialize_source,
+                "expected": sidecar_source,
+            },
+        )
+    materialize_source = explicit_materialize_source or sidecar_source
+    explicit_coordinates = str(materialize.get("coordinates") or "").strip()
+    coordinates = explicit_coordinates or sidecar_alias
     if coordinates != sidecar_alias:
         raise ValidationError(
             "materialize.coordinates must reference build_sidecar.alias.",
             code="materialize.invalid_coordinate_source",
             context={"coordinates": coordinates, "expected": sidecar_alias},
         )
+    legacy_materialize_partition_by = materialize.get("partition_by")
+    if legacy_materialize_partition_by is not None:
+        legacy_partition_by = _string_list(
+            legacy_materialize_partition_by,
+            path="materialize.partition_by",
+        )
+        if legacy_partition_by != sidecar_partition_by:
+            raise ValidationError(
+                "Legacy materialize.partition_by must match build_sidecar.partition_by.",
+                code="materialize.invalid_partition_boundary",
+                context={
+                    "partition_by": legacy_partition_by,
+                    "expected": sidecar_partition_by,
+                },
+            )
     payload_operations = materialize.get("operations") or []
     if not isinstance(payload_operations, list):
         raise ValidationError(
@@ -644,8 +1361,8 @@ def _expand_curated_phase_document(
             "op": "materialize",
             "alias": boundary_alias,
             "inputs": {"source": materialize_source, "coordinates": coordinates},
-            "partition_by": materialize.get("partition_by"),
-            "part_boundary": materialize.get("part_boundary"),
+            "partition_by": sidecar_partition_by,
+            "part_boundary": sidecar_boundary,
             "workers": materialize.get("workers", 1),
             "max_tasks_per_child": materialize.get("max_tasks_per_child", 1),
         }
@@ -662,7 +1379,9 @@ def _expand_curated_phase_document(
         "rename_columns",
         "unpivot",
         "pivot",
+        "data_assertion",
     }
+    assertion_started = False
     for index, value in enumerate(payload_operations):
         path = f"materialize.operations[{index}]"
         operation = dict(_mapping(value, path=path))
@@ -673,6 +1392,13 @@ def _expand_curated_phase_document(
                 code="operation.unsupported",
                 context={"path": f"{path}.op", "operation": kind},
             )
+        if assertion_started and kind != "data_assertion":
+            raise ValidationError(
+                "materialize data_assertion operations must be the final operations.",
+                code="operation.invalid_phase_order",
+                context={"path": f"{path}.op", "operation": kind},
+            )
+        assertion_started = assertion_started or kind == "data_assertion"
         alias = str(
             operation.pop("alias", "")
             or (materialize_alias if index == len(payload_operations) - 1 else f"{materialize_alias}__{index + 1:02d}_{kind}")
@@ -680,18 +1406,36 @@ def _expand_curated_phase_document(
         operation["alias"] = alias
         operation["inputs"] = {"data": current}
         operations.append(operation)
-        phases[alias] = "materialize"
+        phases[alias] = "save_dataset" if kind == "data_assertion" else "materialize"
         current = alias
 
-    save = _mapping(raw.get("save_dataset"), path="save_dataset")
+    legacy_save_value = raw.get("save_dataset")
+    save = (
+        _mapping(legacy_save_value, path="save_dataset")
+        if legacy_save_value is not None
+        else {}
+    )
     _reject_unknown(save, {"alias", "input", "partition_by", "operations"}, path="save_dataset")
-    save_input = _required_string(save.get("input"), path="save_dataset.input")
-    if save_input != materialize_alias:
-        raise ValidationError(
-            "save_dataset.input must reference materialize.alias.",
-            code="save_dataset.invalid_input",
-            context={"input": save_input, "expected": materialize_alias},
+    if save:
+        save_input = _required_string(save.get("input"), path="save_dataset.input")
+        if save_input != materialize_alias:
+            raise ValidationError(
+                "save_dataset.input must reference materialize.alias.",
+                code="save_dataset.invalid_input",
+                context={"input": save_input, "expected": materialize_alias},
+            )
+        legacy_save_partition_by = _string_list(
+            save.get("partition_by"), path="save_dataset.partition_by"
         )
+        if legacy_save_partition_by != sidecar_partition_by:
+            raise ValidationError(
+                "Legacy save_dataset.partition_by must match build_sidecar.partition_by.",
+                code="save_dataset.invalid_partition_boundary",
+                context={
+                    "partition_by": legacy_save_partition_by,
+                    "expected": sidecar_partition_by,
+                },
+            )
     validation_operations = save.get("operations") or []
     if not isinstance(validation_operations, list):
         raise ValidationError(
@@ -720,7 +1464,7 @@ def _expand_curated_phase_document(
             "op": "save_dataset",
             "alias": save_alias,
             "inputs": {"data": current},
-            "partition_by": save.get("partition_by"),
+            "partition_by": sidecar_partition_by,
         }
     )
     phases[save_alias] = "save_dataset"
@@ -822,6 +1566,8 @@ def _canonical_nodes(
                 "source_column": source.get("source_column"),
                 "duplicate_path_policy": source.get("duplicate_path_policy"),
             }
+        elif kind == "define_keyspace":
+            config = dict(sources[alias].get("keyspace") or {})
         spec_payload = {
             "canonicalization_version": CANONICAL_OPERATION_VERSION,
             "pipeline_schema_version": pipeline_schema_version,
@@ -864,7 +1610,57 @@ def _compile_sources(
     result: dict[str, dict[str, Any]] = {}
     for operation_id, operation in indexed.items():
         kind = str(operation["op"])
-        if kind not in {"define_dataset", "define_asset", "define_combined"}:
+        if kind not in {"define_dataset", "define_asset", "define_combined", "define_keyspace"}:
+            continue
+        if kind == "define_keyspace":
+            _reject_unknown(
+                operation,
+                {
+                    "alias",
+                    "op",
+                    "inputs",
+                    "method",
+                    "sources",
+                    "keys",
+                    "partition_by",
+                    "part_boundary",
+                    "null_key_policy",
+                },
+                path=f"operations[{operation_id}]",
+            )
+            member_aliases = [str(item) for item in operation.get("sources") or []]
+            missing_members = [alias for alias in member_aliases if alias not in result]
+            if len(member_aliases) < 1 or missing_members:
+                raise ValidationError(
+                    "define_keyspace members must reference prior dataset sources.",
+                    code="join_keyspace.invalid_sources",
+                    context={"members": member_aliases, "missing": missing_members},
+                )
+            members = [
+                {
+                    "name": alias,
+                    "paths": list(result[alias]["paths"]),
+                    "asset_definition": result[alias].get("asset_definition"),
+                    "asset_definition_hash": result[alias].get("asset_definition_hash"),
+                    "asset_code": result[alias].get("asset_code"),
+                }
+                for alias in member_aliases
+            ]
+            result[operation_id] = {
+                "kind": "parquet_dataset",
+                "paths": [path for member in members for path in member["paths"]],
+                "union_by_name": True,
+                "missing_columns": "insert_null",
+                "incompatible_dtypes": "error",
+                "keyspace": {
+                    "method": operation["method"],
+                    "members": members,
+                    "keys": list(operation["keys"]),
+                    "partition_by": list(operation["partition_by"]),
+                    "part_boundary": dict(operation["part_boundary"]),
+                    "null_key_policy": operation["null_key_policy"],
+                },
+            }
             continue
         if kind == "define_combined":
             _reject_unknown(
@@ -1085,12 +1881,11 @@ def _compile_sinks(
             path=f"operations[{operation_id}]",
         )
         artifact = output["artifact"]
-        write_policy = str(artifact["write_policy"])
         result[operation_id] = {
             "kind": "parquet_dataset",
             "path": str(artifact["root_dir"]),
             "compression": str(artifact["compression"]),
-            "overwrite": write_policy == "atomic_replace",
+            "overwrite": True,
         }
     return result
 
@@ -1106,8 +1901,9 @@ def _validate_output(value: Any, *, asset_code: str) -> dict[str, Any]:
             "root_dir",
             "format",
             "compression",
-            "write_policy",
+            "write_policy",  # accepted only as a hidden legacy input
             "physical_layout",
+            "sbdf",
             "publication",
         },
         path="output.artifact",
@@ -1120,24 +1916,33 @@ def _validate_output(value: Any, *, asset_code: str) -> dict[str, Any]:
             context={"asset_code": asset_code, "expected": expected_type},
         )
     root_dir = _required_string(artifact.get("root_dir"), path="output.artifact.root_dir")
-    if str(artifact.get("format") or "") != "parquet":
+    artifact_format = str(
+        artifact.get("format") or ("sbdf" if asset_code == "0401" else "parquet")
+    ).lower()
+    allowed_formats = {"parquet", "sbdf"} if asset_code == "0401" else {"parquet"}
+    if artifact_format not in allowed_formats:
         raise ValidationError(
-            "output.artifact.format must be parquet.",
+            f"output.artifact.format is unsupported for Asset {asset_code}.",
             code="output.unsupported_format",
+            context={
+                "asset_code": asset_code,
+                "allowed": sorted(allowed_formats),
+                "actual": artifact_format,
+            },
         )
-    compression = str(artifact.get("compression") or "").lower()
+    compression = str(artifact.get("compression") or "zstd").lower()
     if compression not in {"snappy", "zstd", "uncompressed"}:
         raise ValidationError(
             "Unsupported output artifact compression.",
             code="output.unsupported_compression",
             context={"value": compression},
         )
-    write_policy = str(artifact.get("write_policy") or "")
-    if write_policy not in {"atomic_replace", "error_if_exists"}:
+    legacy_write_policy = artifact.get("write_policy")
+    if legacy_write_policy not in {None, "atomic_replace"}:
         raise ValidationError(
-            "Unsupported output artifact write_policy.",
+            "Legacy output.artifact.write_policy only accepts atomic_replace; migrate the YAML to remove it.",
             code="output.unsupported_write_policy",
-            context={"value": write_policy},
+            context={"value": legacy_write_policy},
         )
     default_physical_layout = {
         "profile": {
@@ -1191,16 +1996,73 @@ def _validate_output(value: Any, *, asset_code: str) -> dict[str, Any]:
             context={"asset_code": asset_code, "allowed": sorted(allowed_scopes)},
         )
     logging = _output_auxiliary(output.get("logging"), path="output.logging")
+    sbdf: dict[str, Any] | None = None
+    if artifact_format == "sbdf":
+        sbdf = _mapping(artifact.get("sbdf"), path="output.artifact.sbdf")
+        _reject_unknown(
+            sbdf,
+            {"row_key_columns", "batch_size", "encoding_rle"},
+            path="output.artifact.sbdf",
+        )
+        row_key_columns = _string_list(
+            sbdf.get("row_key_columns"), path="output.artifact.sbdf.row_key_columns"
+        )
+        if not row_key_columns:
+            raise ValidationError(
+                "output.artifact.sbdf.row_key_columns must not be empty.",
+                code="output.sbdf_key_columns_required",
+            )
+        batch_size = sbdf.get("batch_size", 50_000)
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValidationError(
+                "output.artifact.sbdf.batch_size must be an integer >= 1.",
+                code="output.invalid_sbdf_batch_size",
+            )
+        encoding_rle = sbdf.get("encoding_rle", True)
+        if not isinstance(encoding_rle, bool):
+            raise ValidationError(
+                "output.artifact.sbdf.encoding_rle must be boolean.",
+                code="output.invalid_sbdf_encoding_rle",
+            )
+        sbdf = {
+            "row_key_columns": row_key_columns,
+            "batch_size": batch_size,
+            "encoding_rle": encoding_rle,
+        }
     from smoking_data.runtime.object_store.config import PublicationSpec
 
-    publication = PublicationSpec.from_mapping(artifact.get("publication"))
+    publication_mapping = artifact.get("publication")
+    if asset_code == "0401" and publication_mapping is not None:
+        publication_section = _mapping(
+            publication_mapping,
+            path="output.artifact.publication",
+        )
+        publication_sbdf = _mapping(
+            publication_section.get("sbdf") or {},
+            path="output.artifact.publication.sbdf",
+        )
+        _reject_unknown(
+            publication_sbdf,
+            {"enabled"},
+            path="output.artifact.publication.sbdf",
+        )
+    publication = PublicationSpec.from_mapping(
+        publication_mapping,
+        sbdf_row_key_columns=tuple((sbdf or {}).get("row_key_columns") or ()),
+    )
+    if artifact_format == "sbdf":
+        if publication is not None and publication.enabled:
+            if publication.parquet.enabled or not publication.sbdf.enabled:
+                raise ValidationError(
+                    "Asset 0401 SBDF publication requires parquet.enabled=false and sbdf.enabled=true.",
+                    code="output.invalid_sbdf_publication",
+                )
     return {
         "artifact": {
             "type": expected_type,
             "root_dir": root_dir,
-            "format": "parquet",
+            "format": artifact_format,
             "compression": compression,
-            "write_policy": write_policy,
             "physical_layout": {
                 "profile": profile,
                 "adaptation_scope": adaptation_scope,
@@ -1211,9 +2073,37 @@ def _validate_output(value: Any, *, asset_code: str) -> dict[str, Any]:
                 if publication is not None
                 else {}
             ),
+            **({"sbdf": sbdf} if sbdf is not None else {}),
         },
         "logging": logging,
     }
+
+
+def _apply_0401_sbdf_output_defaults(raw: dict[str, Any]) -> dict[str, Any]:
+    """Default 0401 to SBDF and derive stable key columns from its task boundary."""
+
+    output = dict(raw.get("output") or {})
+    artifact = dict(output.get("artifact") or {})
+    artifact_format = str(artifact.get("format") or "sbdf").lower()
+    artifact["format"] = artifact_format
+    if artifact_format == "sbdf" and not isinstance(artifact.get("sbdf"), dict):
+        sidecar = raw.get("build_sidecar")
+        boundary = sidecar.get("part_boundary") if isinstance(sidecar, dict) else None
+        preserve_groups = (
+            boundary.get("preserve_groups") if isinstance(boundary, dict) else None
+        )
+        row_key_columns = (
+            [str(value) for value in preserve_groups]
+            if isinstance(preserve_groups, list) and preserve_groups
+            else []
+        )
+        artifact["sbdf"] = {
+            "row_key_columns": row_key_columns,
+            "batch_size": 50_000,
+            "encoding_rle": True,
+        }
+    output["artifact"] = artifact
+    return {**raw, "output": output}
 
 
 def _output_auxiliary(value: Any, *, path: str) -> dict[str, str]:
@@ -1233,7 +2123,7 @@ def _lower_operations(
         operation.pop("alias", None)
         kind = str(operation["op"])
         inputs = dict(operation.pop("inputs", {}) or {})
-        if kind in {"define_dataset", "define_asset", "define_combined"}:
+        if kind in {"define_dataset", "define_asset", "define_combined", "define_keyspace"}:
             continue
         if kind == "save_dataset":
             result.append(
@@ -1277,8 +2167,12 @@ def _unique_source_ancestor(
     candidates = {
         item
         for item in (_ancestors(operation_id, dependencies) | {operation_id})
-        if indexed[item]["op"] in {"define_dataset", "define_asset", "define_combined"}
+        if indexed[item]["op"]
+        in {"define_dataset", "define_asset", "define_combined", "define_keyspace"}
     }
+    keyspaces = [item for item in candidates if indexed[item]["op"] == "define_keyspace"]
+    if len(keyspaces) == 1:
+        return keyspaces[0]
     if len(candidates) != 1:
         raise ValidationError(
             "Input must resolve to exactly one define_asset/define_dataset ancestor.",

@@ -18,7 +18,7 @@ from .config import ParquetPublicationSpec
 FILES_SCHEMA_VERSION = "smoking-data.remote-parquet-files.v1"
 ROW_GROUP_SCHEMA_VERSION = "smoking-data.remote-parquet-row-groups.v1"
 PAGE_SCHEMA_VERSION = "smoking-data.remote-parquet-pages.v1"
-KEY_SCHEMA_VERSION = "smoking-data.remote-parquet-keys.v1"
+KEY_SCHEMA_VERSION = "smoking-data.remote-parquet-keys.v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +31,7 @@ class BuiltIndex:
     page_index_complete: bool
     artifact_paths: tuple[Path, ...]
     key_types: dict[str, str]
+    planning_types: dict[str, str]
 
 
 def build_parquet_indexes(
@@ -54,6 +55,7 @@ def build_parquet_indexes(
     page_complete = True
     profiles: list[tuple[Path, str, str, pq.ParquetFile]] = []
     key_type_contract: dict[str, str] = {}
+    planning_type_contract: dict[str, str] = {}
     for part in sorted(parts, key=lambda item: str(item.get("relative_path") or "")):
         relative = str(part["relative_path"])
         path = (dataset_root / relative).resolve()
@@ -79,7 +81,8 @@ def build_parquet_indexes(
             continue
         parquet = pq.ParquetFile(path)
         if spec.key_columns:
-            missing = sorted(set(spec.key_columns) - set(parquet.schema_arrow.names))
+            indexed_columns = {*spec.key_columns, *spec.planning_columns}
+            missing = sorted(indexed_columns - set(parquet.schema_arrow.names))
             if missing:
                 raise SmokingDataError(
                     "Parquet key index columns are missing.",
@@ -97,6 +100,20 @@ def build_parquet_indexes(
                     context={"file_id": file_id},
                 )
             key_type_contract = current_key_types
+            current_planning_types = {
+                column: str(parquet.schema_arrow.field(column).type)
+                for column in spec.planning_columns
+            }
+            if (
+                planning_type_contract
+                and current_planning_types != planning_type_contract
+            ):
+                raise SmokingDataError(
+                    "Parquet planning columns have incompatible types across parts.",
+                    code="remote.planning_schema_mismatch",
+                    context={"file_id": file_id},
+                )
+            planning_type_contract = current_planning_types
         footer_start, footer_length, footer_fingerprint = _footer(path)
         schema_fingerprint = hashlib.sha256(str(parquet.schema_arrow).encode()).hexdigest()
         bucket = file_id[:2]
@@ -202,6 +219,7 @@ def build_parquet_indexes(
                 generation_id=generation_id,
                 file_id=file_id,
                 key_columns=spec.key_columns,
+                planning_columns=spec.planning_columns,
                 null_policy=spec.key_null_policy,
                 hash_buckets=spec.hash_buckets,
             )
@@ -215,6 +233,7 @@ def build_parquet_indexes(
         page_index_complete=page_complete,
         artifact_paths=tuple(artifacts),
         key_types=key_type_contract,
+        planning_types=planning_type_contract,
     )
 
 
@@ -303,10 +322,12 @@ def _spool_key_pieces(
     generation_id: str,
     file_id: str,
     key_columns: tuple[str, ...],
+    planning_columns: tuple[str, ...],
     null_policy: str,
     hash_buckets: int,
 ) -> int:
-    missing = sorted(set(key_columns) - set(parquet.schema_arrow.names))
+    indexed_columns = tuple(dict.fromkeys([*key_columns, *planning_columns]))
+    missing = sorted(set(indexed_columns) - set(parquet.schema_arrow.names))
     if missing:
         raise SmokingDataError(
             "Parquet key index columns are missing.",
@@ -316,7 +337,7 @@ def _spool_key_pieces(
     total = 0
     source_start = 0
     for row_group_id in range(parquet.metadata.num_row_groups):
-        table = parquet.read_row_group(row_group_id, columns=list(key_columns))
+        table = parquet.read_row_group(row_group_id, columns=list(indexed_columns))
         bucket_rows: dict[int, list[dict[str, Any]]] = {}
         for offset in range(table.num_rows):
             values = [table[column][offset].as_py() for column in key_columns]
@@ -331,6 +352,7 @@ def _spool_key_pieces(
             key_hash = _typed_key_hash(table.schema, key_columns, values)
             bucket = int(key_hash[:16], 16) & (hash_buckets - 1)
             row = {column: value for column, value in zip(key_columns, values, strict=True)}
+            row.update({column: table[column][offset].as_py() for column in planning_columns})
             row.update(
                 {
                     "sidecar_schema_version": KEY_SCHEMA_VERSION,

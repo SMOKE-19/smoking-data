@@ -47,7 +47,6 @@ def inspect_remote_publication(
         "manifest_key": handle.pointer.get("manifest_key"),
         "asset_code": handle.manifest.get("asset_code"),
         "job_name": handle.manifest.get("job_name"),
-        "commit_kind": handle.manifest.get("commit_kind"),
         "representations": handle.manifest.get("representations"),
         "sidecars": handle.manifest.get("sidecars"),
         "object_count": len(handle.manifest.get("objects") or []),
@@ -83,7 +82,6 @@ def retry_publication_receipt(
         asset_code=str(receipt.get("asset_code") or ""),
         job_name=str(receipt.get("job_name") or ""),
         definition_sha256=str(receipt.get("definition_sha256") or ""),
-        commit_kind=str(receipt.get("commit_kind") or "snapshot_replace"),
     )
     if result is None:
         raise SmokingDataError(

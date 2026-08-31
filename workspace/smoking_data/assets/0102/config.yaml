@@ -12,7 +12,6 @@ output:
     root_dir: f"{asset_data_root}/{job_name}"
     format: parquet
     compression: zstd
-    write_policy: append_generation
     physical_layout:
       profile: fact_append_v1
       adaptation_scope: generation_fixed

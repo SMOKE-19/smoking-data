@@ -85,6 +85,12 @@ paths:
 `contract`를 함께 관리한다. `paths` 값은 앞서 해석 가능한 다른 path 키를 참조할 수 있다. 실제 게시할
 생성물과 Definition 기본값인 `output`은 config 최상위에 바로 둔다.
 
+CLI/API 실행 시 `--project-root`를 지정하면 해당 경로가 우선한다. 생략하면 실행 대상 YAML에서
+상위로 올라가며 `.smoking-data/config.yaml`이 있는 초기화 workspace를 자동 탐색한다. 따라서
+`templates/` 안의 YAML을 다른 현재 디렉터리에서 실행해도 `DATA`, `.temp`, metadata, log는 YAML이
+속한 workspace 기준으로 해석된다. 초기화되지 않은 YAML은 YAML 파일의 부모 디렉터리를 fallback으로
+사용한다.
+
 `smoking-data init .`은 config 생성 후 작업공간 안으로 해석되는 `data_root`, `temp_root`,
 `metadata_root`, `log_root` 디렉터리를 함께 만든다. 기본값에서는 `DATA`, `.temp`,
 `.temp/metadata`, `.temp/logs`가 생성된다. 작업공간 밖을 가리키는 절대경로는 init이 임의 생성하지
@@ -134,7 +140,6 @@ output:
     root_dir: DATA/0201/curated
     format: parquet
     compression: zstd
-    write_policy: atomic_replace
     physical_layout:
       profile: curated_reuse_v1
       adaptation_scope: generation_fixed
@@ -145,6 +150,15 @@ output:
 
 `row_group_rows`는 `auto` 또는 1 이상의 정수다. 이전 공개 필드인
 `execution.output_row_group_rows`는 제거되었다.
+
+0101~0301은 Parquet output을 기본으로 사용한다. 0401은 `format: sbdf`와
+`sbdf.row_key_columns`를 사용하는 단일 SBDF snapshot이 기본이며, 실행 중 Parquet은 검증·병합용
+staging에만 존재한다. `sbdf`를 생략하면 `build_sidecar.part_boundary.preserve_groups`를 row key로
+상속하며, 명시한 `sbdf.row_key_columns`가 있으면 그 값을 우선한다. 공통 코어는 `type`, `root_dir`, `format`, `physical_layout`과
+`logging.root_dir`이고 Parquet output만 `compression`을 사용한다. 데이터셋 공개는 항상 staging 완료 후 원자적으로 수행하므로 `write_policy`를 YAML이나
+실행 메타데이터에 기록하지 않는다. 0102의 active generation/manifest는 변경분 재사용과 데이터셋
+해석에 필요한 내부 상태이며 공개 저장 정책 옵션이 아니다. 0101·0103의 `file_name_rule`과 0101의
+adapter별 `parquet_writer`는 소스 수집에만 필요한 확장 계약이다.
 
 로컬 commit 뒤 S3 immutable generation bundle을 게시하려면 `output.artifact`에 다음 opt-in 계약을
 추가한다. access key·secret key·session token은 YAML에 넣지 않는다.
@@ -160,6 +174,21 @@ publication:
     enabled: true
     random_access_index:
       level: row_group
+```
+
+최종 Parquet output에 downstream planning sidecar를 함께 게시하려면 index level을 `key`로 두고
+`key_columns`에 후속 Asset의 partition/group/join key를, `planning_columns`에 filter/sort 입력을
+선언한다. planning 칼럼은 null을 허용하며 key hash에는 포함되지 않는다. sidecar에는 최종 output의
+file, row-group, row offset 좌표가 기록되므로 실행 중 upstream 좌표를 담은 임시 build sidecar와
+혼용하지 않는다.
+
+```yaml
+parquet:
+  enabled: true
+  random_access_index:
+    level: key
+    key_columns: [bucket, row_key]
+    planning_columns: [updated_at]
 ```
 
 게시 상태는 로컬 receipt 또는 고정된 remote generation으로 조회한다.
@@ -192,13 +221,32 @@ cutover한다. 0401만 `task_adaptive`를 허용하며 기본 profile은
 `analysis_snapshot_adaptive_v1`이다. worker 수, input batch, prefetch와 메모리 admission은 이 물리
 레이아웃 제약과 별개로 실행마다 조정할 수 있다.
 
-0201~0401의 마지막 `save_dataset`은 데이터 흐름과 partition만 선언한다. 게시 경로·압축·쓰기
-정책은 중복하지 않고 루트 `output.artifact`만 진실 원천으로 사용한다.
+0201은 `build_sidecar.partition_by`를 task 조각과 최종 dataset partition의 단일 기준으로 사용하고,
+`build_sidecar.part_boundary`로 coordinate/payload task 크기와 보존 그룹을 함께 선언한다.
+0301도 `build_sidecar.method: union_distinct_keys`로 keyspace를 먼저 만들며, task 경계와 최종
+dataset partition은 `build_sidecar`에서만 관리한다. 0301의 `build_sidecar`, `sources`, `keys`,
+`partition_by`, `part_boundary`는 필수이며 일반 left-source 계약은 지원하지 않는다. 두 Asset 모두
+terminal write를 내부에서 자동 생성한다. 0401은 `smoking-data.pipeline.v8` 계약에서 단일
+`define_upstream`과 `build_sidecar`를 선언한다. 0401 sidecar는 `filter`, `type_cast`, `add_calc`만
+선택적으로 적용한 뒤 남은 모든 행의 coordinate를 수집하며 `active_row_selection`은 사용하지 않는다.
+`materialize`는 해당 좌표의 payload만 선택적으로 읽는다.
+`build_sidecar.part_boundary`는 coordinate task 경계일 뿐 출력 partition은 아니다. 공개 YAML에는
+`inputs`, `partition_by`, `save_dataset`, `data_assertion`을 선언하지 않는다. bounded task 산출물은 저장 직전에
+schema-by-name streaming merge된 뒤 `snapshot.sbdf` 하나로 변환되어 atomic commit된다. SBDF key
+sidecar는 `_smoking_data/` 아래의 random-access 메타데이터이며 Parquet 데이터 표현이 아니다.
+0401의 remote publication은 `parquet.enabled: false`, `sbdf.enabled: true`로 SBDF 데이터 표현만
+게시한다. publication의 SBDF key는 `output.artifact.sbdf.row_key_columns`를 자동 상속한다.
+`shard_policy`, `row_key_columns`, `batch_size`, `encoding_rle`, `key_hash`, `hash_buckets`는
+`publication.sbdf`에 반복하지 않으며 로컬 artifact 계약과 내부 고정 기본값으로 결정한다.
+검증 설정을 생략하면 SHA-256, remote HEAD 확인, sidecar reference 확인을 모두 활성화한다.
+게시 경로·쓰기 정책은
+중복하지 않고 루트 `output.artifact`만 진실
+원천으로 사용한다.
 성공 metadata와 definition·plan은 게시된 dataset의 `_smoking_data/` 아래에 함께 저장한다.
-최종 dataset은 기본적으로 Zstd를 사용하고, `.temp` 중간 산출물과 probe·selector·index sidecar는
+0101~0301 최종 Parquet dataset은 기본적으로 Zstd를 사용하고, `.temp` 중간 산출물과 probe·selector·index sidecar는
 쓰기 지연을 줄이기 위해 비압축 Parquet으로 기록한다.
 
-0101·0201·0301 Definition은 작성 초기 검증을 위해 다음 테스트 실행 계약을 사용할 수 있다.
+0101·0201·0301·0401 Definition은 작성 초기 검증을 위해 다음 테스트 실행 계약을 사용할 수 있다.
 
 ```yaml
 execution:
@@ -248,9 +296,16 @@ YAML 옵션으로 노출하지 않는다.
 검증 시 생성되는 캐노니컬 key는 alias 변경과 무관하다.
 
 0201의 `build_sidecar.operations[].group_keys`는 논리적인 active-row 선택 그룹을 선언한다.
-`materialize.part_boundary.preserve_groups`는 물리적인 payload 경계 힌트이므로 두 필드가
-항상 같을 필요가 없으며, 선택 그룹의 일부만 지정할 수 있다. 좌표로 선택된 행은 sidecar
-결과를 기준으로 유지된다.
+`build_sidecar.part_boundary.preserve_groups`는 물리적인 payload 경계 힌트이므로 선택 그룹과
+항상 같을 필요가 없으며 그 일부만 지정할 수 있다. 0401은 대표행 선택 없이 필터를 통과한 모든
+좌표를 유지한다.
+
+0401 `materialize.operations`의 `unnest`는 Arrow LIST/LargeList 칼럼을 행으로 펼친다. `columns`를
+생략하거나 `auto`로 두면 실행 시점의 입력 Arrow 스키마에서 모든 LIST/LargeList 칼럼을 자동 탐색한다.
+모든 대상은 위치 기준으로 zip하며 각 부모 행의 원소 수가 하나라도 다르면 `list.shape_mismatch`로
+실패한다. null/빈 부모 LIST는 모두 0개 원소로 취급한다. 일반 칼럼은 각 원소 행에 반복되며
+`max_elements_per_row`를 생략하면 1024를 사용한다. 특정 LIST만 풀거나 출력 이름을 바꾸려는 경우에만
+`columns: [{source: values, output: value}]`처럼 명시한다.
 
 Pivot의 `value_keys`와 `value_keys_without_column`에서 `output_dtype`는 선택 사항이다.
 생략하면 명시적 cast를 수행하지 않고 집계 결과의 Arrow 타입을 사용하며, `first`, `min`,
@@ -264,8 +319,32 @@ Pivot의 `value_keys`와 `value_keys_without_column`에서 `output_dtype`는 선
 `max_source_files`와 `max_projected_bytes_mb`를 지정한다. 이 물리 설정은 논리 operation
 해시와 후보 결과 fingerprint에는 포함되지 않는다.
 `materialize.operations`는 좌표 단위 자식 프로세스에서 선택 읽기·payload 변환·staging Parquet 쓰기로
-융합되며, `save_dataset`은 부모 프로세스의 assertion과 atomic commit을 담당한다. 0301·0401은
-`smoking-data.pipeline.v6`의 평면 operation DAG를 유지한다.
+융합된다. 저장 전 `data_assertion`은 이 목록의 마지막 operation으로 선언한다. 이 operation은
+`not_null`, `unique`, 값 범위 같은 최종 데이터 조건을 검사하며, 위반 시 오류와 샘플을 기록하고
+atomic commit을 중단한다. 내부 terminal write가 부모 프로세스의 assertion과 atomic commit을 담당한다.
+0301은 입력 `define_asset`/`define_dataset`을
+루트 `define_upstream`에 선언하고, join·후처리는 `materialize.operations`에 선언한다.
+`build_sidecar.sources`의 key projection을 union·distinct한 keyspace Parquet이 materialize의 유일한
+시작점이다. 각 join은 이 keyspace를 보존하는 left join으로 고정되므로 `how`를 선언하지 않는다.
+각 join은 오른쪽 upstream alias만 `input_right`에 선언한다. 왼쪽 입력은
+`materialize.operations`의 직전 operation 결과로 자동 연결되며, 공개 0301 YAML에서는
+`inputs: {left: ..., right: ...}`를 선언하지 않는다. 따라서 0301 join 목록은 분기 없는 순차 chain이다.
+`left_on`과 `right_on`은 이름이 다른 join key를 명시하기 위해 유지한다. 물리 partition을 확인할 수 없는
+right source는 `right_partition_column` 또는 경로명으로 partition을 추론하지 않고 일반 bounded/index
+join으로 읽는다. 원본의 중복 key는 자동 제거하지 않으므로 join multiplicity metadata에서 행 증폭을
+확인한다. `suffix`를 생략하면 이름이 겹치지 않는 오른쪽 칼럼은 원래 이름을 유지하고, 왼쪽 결과와
+이름이 충돌하는 오른쪽 칼럼에만 `_<right alias>`를 붙인다. 충돌 칼럼의 postfix를 직접 정할 때만
+비어 있지 않은 `suffix`를 선언한다. Join의 `include_columns`와 `exclude_columns`는 list이면 정확한
+칼럼명 목록으로 처리하고, 단일 string이면 정규식 필터로 처리한다. include를 먼저 적용한 뒤 exclude를
+적용한다. join key는 include와 무관하게 내부 입력에 유지되고 결과에서는 중복 key를 만들지 않으며,
+exclude가 join key와 일치하면 검증 오류로 처리한다.
+0301 planner는 key-to-file/row-group sidecar의 예상 일치 행 수를 이용해 오른쪽 payload의 선택도를
+판단한다. 정확한 task key 필터를 구성할 수 있고 예상 일치 행이 선택 row-group 행의 절반 이하이며
+입력이 batch 경계를 넘으면, 필요한 행만 task-local Arrow IPC로 compact한 뒤 join state를 만든다.
+그 밖의 경우에는 기존 직접 Arrow read 경로를 사용한다. 이 선택은 내부 물리 정책이므로 YAML 필드를
+추가하지 않으며, 실행 metadata의 `bounded_join_profile.right_arrow_staging`에서 확인한다.
+기존 `columns.include/exclude/regex` 중첩 계약은 0301 공개 YAML에서 허용하지 않는다. 0401의 source는
+루트 `define_upstream`, 변환은 `materialize.operations`에 두며 각 operation 입력은 직전 결과로 자동 연결한다.
 
 ### 예시 template
 
@@ -275,16 +354,23 @@ prefix 끝에 `-full`을 붙이면 모든 선택 필드가 포함된 전체 예�
 
 | Slim prefix | Full prefix | 생성 내용 |
 | --- | --- | --- |
+| `sd-template-0101-gdelt-doc-articles` | `sd-template-0101-gdelt-doc-articles-full` | 0101 GDELT 문서 API |
+| `sd-template-0101-http-ndjson` | `sd-template-0101-http-ndjson-full` | 0101 NDJSON HTTP 입력 |
+| `sd-template-0101-http-xml` | `sd-template-0101-http-xml-full` | 0101 XML HTTP 입력 |
 | `sd-template-0101-source` | `sd-template-0101-source-full` | 0101 Source |
 | `sd-template-0102-calculated-list-facts` | `sd-template-0102-calculated-list-facts-full` | 0102 Calculated Fact |
+| `sd-template-0201-gdelt-event-truth` | `sd-template-0201-gdelt-event-truth-full` | 0201 GDELT truth |
 | `sd-template-0201-pipeline-curated-pivot` | `sd-template-0201-pipeline-curated-pivot-full` | 0201 Curated Pivot |
 | `sd-template-0201-pipeline-pivot-parity` | `sd-template-0201-pipeline-pivot-parity-full` | 0201 Pivot parity |
+| `sd-template-0301-gdelt-event-enriched` | `sd-template-0301-gdelt-event-enriched-full` | 0301 GDELT enrichment |
 | `sd-template-0301-pipeline-basic` | `sd-template-0301-pipeline-basic-full` | 0301 기본 Join |
 | `sd-template-0301-pipeline-multi-right-full-parity` | `sd-template-0301-pipeline-multi-right-full-parity-full` | 0301 Multi-right full parity |
 | `sd-template-0301-pipeline-multi-right-join` | `sd-template-0301-pipeline-multi-right-join-full` | 0301 Multi-right Join |
 | `sd-template-0301-pipeline-multi-right-post-ops` | `sd-template-0301-pipeline-multi-right-post-ops-full` | 0301 Join 후속 operation |
+| `sd-template-0401-gdelt-event-snapshot` | `sd-template-0401-gdelt-event-snapshot-full` | 0401 GDELT snapshot |
 | `sd-template-0401-pipeline-analysis-snapshot` | `sd-template-0401-pipeline-analysis-snapshot-full` | 0401 Snapshot |
 | `sd-template-chain-0101-to-0401-asset-chain` | `sd-template-chain-0101-to-0401-asset-chain-full` | 0101~0401 Chain |
+| `sd-template-chain-gdelt-0103-to-0401` | `sd-template-chain-gdelt-0103-to-0401-full` | GDELT 0103~0401 Chain |
 
 ## 검증과 실행
 

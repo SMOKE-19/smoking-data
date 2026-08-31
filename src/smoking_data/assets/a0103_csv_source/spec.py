@@ -11,7 +11,7 @@ from smoking_data.ops.projection import POLARS_TYPE_MAP, resolve_add_calc_expres
 from smoking_data.runtime.asset_config import deep_merge, load_effective_asset_config
 from smoking_data.runtime.config import load_config
 from smoking_data.runtime.object_store.config import PublicationSpec
-from smoking_data.runtime.paths import file_sha256, resolve_project_path
+from smoking_data.runtime.paths import file_sha256, infer_project_root, resolve_project_path
 from smoking_data.runtime.template_resolution import resolve_contract_templates
 
 CSV_SOURCE_SCHEMA_VERSION = "smoking-data.csv-source.v1"
@@ -56,7 +56,11 @@ def load_csv_source_spec(
     project_root: str | Path | None = None,
 ) -> CsvSourceSpec:
     path = Path(yaml_path).expanduser().resolve()
-    root = Path(project_root or path.parent).expanduser().resolve()
+    root = (
+        Path(project_root).expanduser().resolve()
+        if project_root is not None
+        else infer_project_root(path)
+    )
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, dict):
         _fail("0103 YAML root must be a mapping.", path="$")
@@ -117,9 +121,10 @@ def load_csv_source_spec(
             "root_dir",
             "format",
             "compression",
-            "write_policy",
+            "write_policy",  # hidden compatibility input; omitted from public schema
+            "physical_layout",
             "file_name_rule",
-            "parquet_writer",
+            "parquet_writer",  # hidden compatibility input
             "publication",
         },
         path="output.artifact",
@@ -127,11 +132,15 @@ def load_csv_source_spec(
     required_constants = {
         "type": "source_dataset",
         "format": "parquet",
-        "write_policy": "atomic_replace",
     }
     for key, expected in required_constants.items():
         if artifact.get(key) != expected:
             _fail(f"output.artifact.{key} must be {expected!r}.", path=f"output.artifact.{key}")
+    if artifact.get("write_policy") not in {None, "atomic_replace"}:
+        _fail(
+            "Legacy output.artifact.write_policy only accepts 'atomic_replace'.",
+            path="output.artifact.write_policy",
+        )
     output_root = resolve_project_path(
         _name(artifact.get("root_dir"), path="output.artifact.root_dir"), project_root=root
     )
@@ -164,9 +173,29 @@ def load_csv_source_spec(
     hash_length = int(token.get("collision_hash_length") or 8)
     if not 4 <= hash_length <= 64:
         _fail("collision_hash_length must be between 4 and 64.", path="output.artifact.file_name_rule.relative_path_token.collision_hash_length")
-    writer = _mapping(artifact.get("parquet_writer") or {}, path="output.artifact.parquet_writer")
-    _keys(writer, {"row_group_size"}, path="output.artifact.parquet_writer")
-    row_group_size = writer.get("row_group_size")
+    physical_layout = _mapping(
+        artifact.get("physical_layout") or {}, path="output.artifact.physical_layout"
+    )
+    legacy_writer = _mapping(
+        artifact.get("parquet_writer") or {}, path="output.artifact.parquet_writer"
+    )
+    _keys(legacy_writer, {"row_group_size"}, path="output.artifact.parquet_writer")
+    _keys(
+        physical_layout,
+        {"profile", "adaptation_scope", "row_group_rows"},
+        path="output.artifact.physical_layout",
+    )
+    _name(
+        physical_layout.get("profile"), path="output.artifact.physical_layout.profile"
+    )
+    if physical_layout.get("adaptation_scope") != "generation_fixed":
+        _fail(
+            "output.artifact.physical_layout.adaptation_scope must be 'generation_fixed'.",
+            path="output.artifact.physical_layout.adaptation_scope",
+        )
+    row_group_size = physical_layout.get("row_group_rows")
+    if row_group_size == "auto":
+        row_group_size = None
     if row_group_size is not None and (not isinstance(row_group_size, int) or row_group_size < 1):
         _fail("row_group_size must be a positive integer.", path="output.artifact.parquet_writer.row_group_size")
     publication = PublicationSpec.from_mapping(artifact.get("publication"))

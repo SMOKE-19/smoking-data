@@ -86,6 +86,7 @@ class ParquetPublicationSpec:
     index_level: str = "row_group"
     writer_page_index: bool = False
     key_columns: tuple[str, ...] = ()
+    planning_columns: tuple[str, ...] = ()
     key_null_policy: str = "error"
     key_hash: str = "sha256_trunc128_v1"
     hash_buckets: int = 256
@@ -121,7 +122,12 @@ class PublicationSpec:
     verification: VerificationSpec
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any] | None) -> PublicationSpec | None:
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any] | None,
+        *,
+        sbdf_row_key_columns: tuple[str, ...] = (),
+    ) -> PublicationSpec | None:
         if value is None:
             return None
         raw = _mapping(value, path="output.artifact.publication")
@@ -160,7 +166,10 @@ class PublicationSpec:
             mode=mode,
             failure_policy=failure_policy,
             parquet=_parquet_spec(raw.get("parquet")),
-            sbdf=_sbdf_spec(raw.get("sbdf")),
+            sbdf=_sbdf_spec(
+                raw.get("sbdf"),
+                default_row_key_columns=sbdf_row_key_columns,
+            ),
             verification=_verification_spec(raw.get("verification")),
         )
 
@@ -177,6 +186,7 @@ class PublicationSpec:
                     "level": self.parquet.index_level,
                     "writer_page_index": self.parquet.writer_page_index,
                     "key_columns": list(self.parquet.key_columns),
+                    "planning_columns": list(self.parquet.planning_columns),
                     "key_null_policy": self.parquet.key_null_policy,
                     "key_hash": self.parquet.key_hash,
                     "hash_buckets": self.parquet.hash_buckets,
@@ -306,7 +316,19 @@ def _parquet_spec(value: Any) -> ParquetPublicationSpec:
     raw = _mapping(value or {}, path="publication.parquet")
     _unknown(raw, {"enabled", "random_access_index"}, path="publication.parquet")
     index = _mapping(raw.get("random_access_index") or {}, path="publication.parquet.random_access_index")
-    _unknown(index, {"level", "writer_page_index", "key_columns", "key_null_policy", "key_hash", "hash_buckets"}, path="publication.parquet.random_access_index")
+    _unknown(
+        index,
+        {
+            "level",
+            "writer_page_index",
+            "key_columns",
+            "planning_columns",
+            "key_null_policy",
+            "key_hash",
+            "hash_buckets",
+        },
+        path="publication.parquet.random_access_index",
+    )
     level = str(index.get("level") or "row_group")
     if level not in {"row_group", "page_if_available", "page_required", "key"}:
         raise ConfigError("publication.parquet.random_access_index.level is invalid.")
@@ -314,27 +336,49 @@ def _parquet_spec(value: Any) -> ParquetPublicationSpec:
     if isinstance(writer_page_index, str):
         writer_page_index = writer_page_index == "enabled"
     key_columns = _strings(index.get("key_columns"), path="publication.parquet.random_access_index.key_columns")
+    planning_columns = tuple(
+        column
+        for column in _strings(
+            index.get("planning_columns"),
+            path="publication.parquet.random_access_index.planning_columns",
+        )
+        if column not in key_columns
+    )
     if level == "key" and not key_columns:
         raise ConfigError("key index requires key_columns.")
+    if planning_columns and level != "key":
+        raise ConfigError("planning_columns requires random_access_index.level=key.")
     buckets = _hash_buckets(index.get("hash_buckets", 256), path="publication.parquet.random_access_index.hash_buckets")
     return ParquetPublicationSpec(
         enabled=bool(raw.get("enabled", True)),
         index_level=level,
         writer_page_index=bool(writer_page_index),
         key_columns=key_columns,
+        planning_columns=planning_columns,
         key_null_policy=str(index.get("key_null_policy") or "error"),
         key_hash=str(index.get("key_hash") or "sha256_trunc128_v1"),
         hash_buckets=buckets,
     )
 
 
-def _sbdf_spec(value: Any) -> SbdfPublicationSpec:
+def _sbdf_spec(
+    value: Any,
+    *,
+    default_row_key_columns: tuple[str, ...] = (),
+) -> SbdfPublicationSpec:
     raw = _mapping(value or {}, path="publication.sbdf")
     _unknown(raw, {"enabled", "shard_policy", "row_key_columns", "batch_size", "encoding_rle", "key_hash", "hash_buckets"}, path="publication.sbdf")
     return SbdfPublicationSpec(
         enabled=bool(raw.get("enabled", False)),
         shard_policy=str(raw.get("shard_policy") or "mirror_parquet_parts"),
-        row_key_columns=_strings(raw.get("row_key_columns"), path="publication.sbdf.row_key_columns"),
+        row_key_columns=(
+            _strings(
+                raw.get("row_key_columns"),
+                path="publication.sbdf.row_key_columns",
+            )
+            if "row_key_columns" in raw
+            else default_row_key_columns
+        ),
         batch_size=_positive_int(raw.get("batch_size", 50_000), path="publication.sbdf.batch_size"),
         encoding_rle=bool(raw.get("encoding_rle", True)),
         key_hash=str(raw.get("key_hash") or "sha256_trunc128_v1"),

@@ -11,7 +11,6 @@ output:
     root_dir: f"{data_root}/{asset_code}/{job_name}"
     format: parquet
     compression: zstd
-    write_policy: atomic_replace
     physical_layout:
       profile: joined_reuse_v1
       adaptation_scope: generation_fixed
@@ -19,7 +18,7 @@ output:
   logging:
     root_dir: f"{log_root}/{asset_code}"
 
-operations:
+define_upstream:
 - op: define_asset
   alias: main
   definition: 0201.pipeline_curated_pivot.0201.yaml
@@ -50,45 +49,43 @@ operations:
 #   alias: category
 #   definition: 0201.category.0201.yaml
 
-- op: materialize
-  alias: materialize_left_parts
-  inputs: {source: main}
+build_sidecar:
+  alias: join_keyspace
+  method: union_distinct_keys
+  sources: [main]
+  keys: [partition, join_key]
   partition_by: [partition]
   part_boundary:
     target_rows: 20000
     target_key_groups: 500
     preserve_groups: [partition, join_key]
+
+materialize:
+  alias: materialize_left_parts
   workers: 1
   max_tasks_per_child: 4
+  operations:
 
-- op: join
-  alias: join_profile
-  inputs: {left: materialize_left_parts, right: profile}
-  how: left
-  left_on: [join_key]
-  right_on: [join_key]
-  suffix: _profile
-  columns:
-    include: [partition, join_key, latest_updated_at.max, profile_code, profile_name]
-    exclude: []
-    regex: []
+  - op: join
+    alias: join_main
+    input_right: main
+    left_on: [partition, join_key]
+    right_on: [partition, join_key]
 
-- op: join
-  alias: join_category
-  inputs: {left: join_profile, right: category}
-  how: left
-  left_on: [profile_code]
-  right_on: [category_profile_code]
-  suffix: _category
-  columns:
-    include: []
-    exclude: [debug]
-    regex: ['^category_']
+  - op: join
+    alias: join_profile
+    input_right: profile
+    left_on: [join_key]
+    right_on: [join_key]
+    include_columns: [partition, join_key, latest_updated_at.max, profile_code, profile_name]
 
-- op: save_dataset
-  alias: write_joined
-  inputs: {data: join_category}
-  partition_by: [partition]
+  - op: join
+    alias: join_category
+    input_right: category
+    left_on: [profile_code]
+    right_on: [category_profile_code]
+    include_columns: '^category_'
+    exclude_columns: [debug]
 
 execution:
   memory_budget_mb: 4096

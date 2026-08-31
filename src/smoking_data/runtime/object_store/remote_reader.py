@@ -151,6 +151,7 @@ def lookup_remote_parquet_key_coordinates(
 ) -> list[dict[str, Any]]:
     sidecar = dict((handle.manifest.get("sidecars") or {}).get("parquet") or {})
     key_columns = [str(value) for value in sidecar.get("key_columns") or []]
+    planning_columns = [str(value) for value in sidecar.get("planning_columns") or []]
     resolved_key_types = {
         str(key): str(value)
         for key, value in (key_types or sidecar.get("key_types") or {}).items()
@@ -203,15 +204,18 @@ def lookup_remote_parquet_key_coordinates(
                 code="remote.key_data_reference_invalid",
                 context={"file_id": file_id},
             )
-        result.append(
-            {
-                "file_id": file_id,
-                "relative_path": data["relative_path"],
-                "row_group_id": int(row["row_group_id"]),
-                "row_offset_in_group": int(row["row_offset_in_group"]),
-                "source_row_index": int(row["source_row_index"]),
+        coordinate = {
+            "file_id": file_id,
+            "relative_path": data["relative_path"],
+            "row_group_id": int(row["row_group_id"]),
+            "row_offset_in_group": int(row["row_offset_in_group"]),
+            "source_row_index": int(row["source_row_index"]),
+        }
+        if planning_columns:
+            coordinate["planning_values"] = {
+                column: row.get(column) for column in planning_columns
             }
-        )
+        result.append(coordinate)
     result.sort(
         key=lambda row: (
             row["relative_path"],

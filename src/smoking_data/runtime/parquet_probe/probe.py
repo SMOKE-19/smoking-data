@@ -98,6 +98,14 @@ def ensure_pipeline_probes_profiled(
     handles: dict[str, ProbeHandle] = {}
     source_profiles: dict[str, dict[str, Any]] = {}
     for source_name, source in spec.sources.items():
+        if source.keyspace is not None:
+            source_profiles[source_name] = {
+                "elapsed_sec": 0.0,
+                "reused": False,
+                "synthetic": True,
+                "method": source.keyspace.get("method"),
+            }
+            continue
         source_started = time_module.perf_counter()
         handles[source_name] = ensure_source_probe(
             source_name=source_name,
@@ -413,7 +421,6 @@ def ensure_probe(
             "capabilities": capabilities,
             "artifacts": artifact_paths,
             "layout": "partitioned",
-            "write_policy": "atomic_replace",
             "partitioning": {
                 "anchor_date": partition_grid.anchor_date.isoformat(),
                 "step_days": partition_grid.step_days,
@@ -1720,7 +1727,7 @@ def _parse_probe_output(value: Any, *, project_root: Path) -> dict[str, Path]:
     artifact = _mapping(output.get("artifact"), path="output.artifact")
     _reject_unknown(
         artifact,
-        {"type", "root_dir", "layout", "write_policy"},
+        {"type", "root_dir", "layout"},
         path="output.artifact",
     )
     if artifact.get("type") != "probe_sidecar":
@@ -1733,18 +1740,13 @@ def _parse_probe_output(value: Any, *, project_root: Path) -> dict[str, Path]:
             "Internal parquet probe output.artifact.layout must be partitioned.",
             code="output.invalid_layout",
         )
-    if artifact.get("write_policy") != "atomic_replace":
-        raise ValidationError(
-            "Internal parquet probe output.artifact.write_policy must be atomic_replace.",
-            code="output.unsupported_write_policy",
-        )
     roots: dict[str, Path] = {}
     for name, section_value in (
         ("artifact", artifact),
         ("logging", output.get("logging")),
     ):
         section = _mapping(section_value, path=f"output.{name}")
-        allowed = {"root_dir", "type", "layout", "write_policy"} if name == "artifact" else {"root_dir"}
+        allowed = {"root_dir", "type", "layout"} if name == "artifact" else {"root_dir"}
         _reject_unknown(section, allowed, path=f"output.{name}")
         root_dir = str(section.get("root_dir") or "").strip()
         if not root_dir:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -11,8 +12,11 @@ import yaml
 
 LEGACY_SOURCE_SCHEMA = "smoking-data.source.v4"
 CURRENT_SOURCE_SCHEMA = "smoking-data.source.v5"
+CURRENT_CALCULATED_FACT_SCHEMA = "smoking-data.calculated-fact.v2"
+CURRENT_CSV_SOURCE_SCHEMA = "smoking-data.csv-source.v1"
 CURRENT_PIPELINE_SCHEMA = "smoking-data.pipeline.v6"
 CURRENT_CURATED_SCHEMA = "smoking-data.pipeline.v7"
+CURRENT_SNAPSHOT_SCHEMA = "smoking-data.pipeline.v8"
 CURRENT_CHAIN_SCHEMA = "smoking-data.asset-chain.v2"
 CURRENT_PUBLICATION_SCHEMA = "smoking-data.publication.v1"
 
@@ -53,11 +57,22 @@ def migrate_definition_yaml(
     elif _schema_name(payload) in {
         CURRENT_PIPELINE_SCHEMA,
         CURRENT_CURATED_SCHEMA,
+        CURRENT_SNAPSHOT_SCHEMA,
+        CURRENT_CALCULATED_FACT_SCHEMA,
+        CURRENT_CSV_SOURCE_SCHEMA,
         CURRENT_CHAIN_SCHEMA,
         CURRENT_PUBLICATION_SCHEMA,
     }:
         converted = deepcopy(payload)
-        changes: list[dict[str, str]] = []
+        changes = []
+        _normalize_public_output(
+            converted,
+            asset_code=str((converted.get("yaml") or {}).get("asset_code") or ""),
+            changes=changes,
+        )
+        _normalize_curated_phase_contract(converted, changes=changes)
+        _normalize_join_upstream_contract(converted, changes=changes)
+        _normalize_snapshot_phase_contract(converted, changes=changes)
         warnings = [f"입력 YAML이 이미 {_schema_name(payload)}입니다."]
     elif _legacy_stage_id(payload) in {"etl.01.04", "etl.02.04", "etl.03.01"}:
         converted, changes, warnings = _convert_legacy_pipeline(payload)
@@ -129,7 +144,11 @@ def generate_parquet_migration_yaml(
                 "root_dir": root,
                 "format": "parquet",
                 "compression": "zstd",
-                "write_policy": "atomic_replace",
+                "physical_layout": {
+                    "profile": "curated_reuse_v1",
+                    "adaptation_scope": "generation_fixed",
+                    "row_group_rows": "auto",
+                },
             },
             "logging": {"root_dir": f".temp/logs/0201/{job_name}"},
         },
@@ -147,6 +166,8 @@ def generate_parquet_migration_yaml(
         "build_sidecar": {
             "alias": "select_rows",
             "source": "main",
+            "partition_by": [partition_column],
+            "part_boundary": {"target_rows": 20000, "preserve_groups": fields},
             "columns": "auto",
             "operations": [
                 {
@@ -159,18 +180,8 @@ def generate_parquet_migration_yaml(
         },
         "materialize": {
             "alias": "materialize_rows",
-            "source": "main",
-            "coordinates": "select_rows",
-            "partition_by": [partition_column],
-            "part_boundary": {"target_rows": 20000, "preserve_groups": fields},
             "workers": 1,
             "max_tasks_per_child": 1,
-            "operations": [],
-        },
-        "save_dataset": {
-            "alias": "write_migration",
-            "input": "materialize_rows",
-            "partition_by": [partition_column],
             "operations": [],
         },
         "execution": {"reset_before_run": False},
@@ -222,6 +233,634 @@ def _schema_name(payload: dict[str, Any]) -> str:
     return str(header.get("schema_version") if isinstance(header, dict) else "unknown")
 
 
+def _normalize_curated_phase_contract(
+    payload: dict[str, Any],
+    *,
+    changes: list[dict[str, str]],
+) -> None:
+    """Normalize legacy 0201 phase links into the sidecar-owned partition contract."""
+
+    if _schema_name(payload) != CURRENT_CURATED_SCHEMA:
+        return
+    build_sidecar = payload.get("build_sidecar")
+    materialize = payload.get("materialize")
+    if not isinstance(build_sidecar, dict) or not isinstance(materialize, dict):
+        return
+
+    expected = {
+        "source": str(build_sidecar.get("source") or "").strip(),
+        "coordinates": str(build_sidecar.get("alias") or "").strip(),
+    }
+    for field, target in expected.items():
+        if field not in materialize:
+            continue
+        value = str(materialize.get(field) or "").strip()
+        if not target or value != target:
+            counterpart = "build_sidecar.source" if field == "source" else "build_sidecar.alias"
+            raise ValueError(
+                f"materialize.{field}는 {counterpart}와 일치해야 생략형으로 정규화할 수 있습니다. "
+                f"value={value!r}, expected={target!r}"
+            )
+        materialize.pop(field)
+        changes.append(
+            _change(
+                f"materialize.{field}",
+                "implicit build_sidecar.source"
+                if field == "source"
+                else "implicit build_sidecar.alias",
+            )
+        )
+
+    sidecar_partition = build_sidecar.get("partition_by")
+    materialize_partition = materialize.pop("partition_by", None)
+    if sidecar_partition is None:
+        if not isinstance(materialize_partition, list) or not materialize_partition:
+            raise ValueError(
+                "0201 YAML에는 build_sidecar.partition_by 또는 legacy materialize.partition_by가 필요합니다."
+            )
+        build_sidecar["partition_by"] = deepcopy(materialize_partition)
+        sidecar_partition = build_sidecar["partition_by"]
+        changes.append(
+            _change("materialize.partition_by", "build_sidecar.partition_by")
+        )
+    elif materialize_partition is not None:
+        if materialize_partition != sidecar_partition:
+            raise ValueError(
+                "materialize.partition_by는 build_sidecar.partition_by와 일치해야 정규화할 수 있습니다."
+            )
+        changes.append(
+            _change("materialize.partition_by", "build_sidecar.partition_by")
+        )
+
+    materialize_boundary = materialize.pop("part_boundary", None)
+    sidecar_boundary = build_sidecar.get("part_boundary")
+    if sidecar_boundary is None:
+        if not isinstance(materialize_boundary, dict):
+            raise ValueError(
+                "0201 YAML에는 build_sidecar.part_boundary 또는 legacy materialize.part_boundary가 필요합니다."
+            )
+        build_sidecar["part_boundary"] = deepcopy(materialize_boundary)
+        changes.append(
+            _change("materialize.part_boundary", "build_sidecar.part_boundary")
+        )
+    elif materialize_boundary is not None:
+        if materialize_boundary != sidecar_boundary:
+            raise ValueError(
+                "materialize.part_boundary는 build_sidecar.part_boundary와 일치해야 정규화할 수 있습니다."
+            )
+        changes.append(
+            _change("materialize.part_boundary", "build_sidecar.part_boundary")
+        )
+
+    execution = payload.get("execution")
+    memory = execution.get("memory") if isinstance(execution, dict) else None
+    phases = memory.get("phases") if isinstance(memory, dict) else None
+    if isinstance(phases, dict) and phases.pop("save_dataset", None) is not None:
+        changes.append(
+            _change(
+                "execution.memory.phases.save_dataset",
+                "removed (internal commit phase)",
+            )
+        )
+
+    save = payload.pop("save_dataset", None)
+    if save is None:
+        return
+    if not isinstance(save, dict):
+        raise ValueError("save_dataset은 object여야 합니다.")
+    save_input = str(save.get("input") or "").strip()
+    materialize_alias = str(materialize.get("alias") or "").strip()
+    if save_input != materialize_alias:
+        raise ValueError(
+            "save_dataset.input은 materialize.alias와 일치해야 자동 terminal write로 정규화할 수 있습니다."
+        )
+    save_partition = save.get("partition_by")
+    if save_partition != sidecar_partition:
+        raise ValueError(
+            "save_dataset.partition_by는 build_sidecar.partition_by와 일치해야 정규화할 수 있습니다."
+        )
+    assertions = save.get("operations") or []
+    if not isinstance(assertions, list) or any(
+        not isinstance(item, dict) or item.get("op") != "data_assertion"
+        for item in assertions
+    ):
+        raise ValueError(
+            "save_dataset.operations는 data_assertion 목록이어야 materialize.operations로 이동할 수 있습니다."
+        )
+    materialize_operations = materialize.setdefault("operations", [])
+    if not isinstance(materialize_operations, list):
+        raise ValueError("materialize.operations는 list여야 합니다.")
+    materialize_operations.extend(deepcopy(assertions))
+    changes.append(
+        _change(
+            "save_dataset",
+            "implicit terminal write; data_assertion moved to materialize.operations",
+        )
+    )
+
+
+def _normalize_join_upstream_contract(
+    payload: dict[str, Any],
+    *,
+    changes: list[dict[str, str]],
+) -> None:
+    """Normalize 0301 into the mandatory keyspace-first public contract."""
+
+    header = payload.get("yaml")
+    if (
+        _schema_name(payload) != CURRENT_PIPELINE_SCHEMA
+        or not isinstance(header, dict)
+        or str(header.get("asset_code") or "") != "0301"
+    ):
+        return
+    public_materialize = payload.get("materialize")
+    operations = payload.get("operations")
+    if public_materialize is not None and operations is not None:
+        raise ValueError("0301은 루트 materialize와 operations를 동시에 선언할 수 없습니다.")
+    if public_materialize is None and not isinstance(operations, list):
+        return
+    if public_materialize is not None and not isinstance(public_materialize, dict):
+        raise ValueError("0301 materialize는 object여야 합니다.")
+
+    flat_operations = operations if isinstance(operations, list) else []
+    source_ops = [
+        deepcopy(item)
+        for item in flat_operations
+        if isinstance(item, dict)
+        and item.get("op") in {"define_asset", "define_dataset"}
+    ]
+    existing = payload.get("define_upstream")
+    if existing is not None:
+        if not isinstance(existing, list) or not existing:
+            raise ValueError("0301 define_upstream은 비어 있지 않은 list여야 합니다.")
+        if source_ops:
+            raise ValueError(
+                "0301 source operation은 define_upstream과 operations에 중복 선언할 수 없습니다."
+            )
+    else:
+        if not source_ops:
+            raise ValueError(
+                "0301 YAML에는 define_asset 또는 define_dataset source가 필요합니다."
+            )
+        payload["define_upstream"] = source_ops
+        changes.append(
+            _change(
+                "operations define_asset/define_dataset",
+                "define_upstream",
+            )
+        )
+
+    downstream = [
+        deepcopy(item)
+        for item in flat_operations
+        if not (
+            isinstance(item, dict)
+            and item.get("op") in {"define_asset", "define_dataset"}
+        )
+    ]
+    upstream = payload.get("define_upstream")
+    first_alias = (
+        str(upstream[0].get("alias") or "")
+        if isinstance(upstream, list) and upstream and isinstance(upstream[0], dict)
+        else ""
+    )
+    existing_keyspace = payload.get("build_sidecar")
+    has_keyspace = isinstance(existing_keyspace, dict)
+
+    if public_materialize is not None:
+        materialize = deepcopy(public_materialize)
+        nested = deepcopy(materialize.get("operations") or [])
+        if not isinstance(nested, list):
+            raise ValueError("0301 materialize.operations는 list여야 합니다.")
+        source_alias = str(materialize.pop("source", None) or first_alias)
+        legacy_boundary = materialize.pop("part_boundary", None)
+        legacy_partition = materialize.pop("partition_by", None)
+    else:
+        materialize_ops = [
+            item
+            for item in downstream
+            if isinstance(item, dict) and item.get("op") == "materialize"
+        ]
+        save_ops = [
+            item
+            for item in downstream
+            if isinstance(item, dict) and item.get("op") == "save_dataset"
+        ]
+        if len(materialize_ops) > 1 or len(save_ops) != 1:
+            raise ValueError(
+                "0301 정규화에는 최대 하나의 materialize와 정확히 하나의 save_dataset이 필요합니다."
+            )
+        save = save_ops[0]
+        legacy_partition = save.get("partition_by")
+        if not isinstance(legacy_partition, list) or not legacy_partition:
+            raise ValueError("0301 save_dataset.partition_by가 필요합니다.")
+        if materialize_ops:
+            operation = materialize_ops[0]
+            inputs = operation.get("inputs")
+            source_alias = str(
+                (inputs.get("source") if isinstance(inputs, dict) else None) or first_alias
+            )
+            legacy_boundary = operation.get("part_boundary")
+            if operation.get("partition_by") != legacy_partition:
+                raise ValueError(
+                    "0301 materialize.partition_by와 save_dataset.partition_by가 일치해야 합니다."
+                )
+            materialize = {
+                key: deepcopy(value)
+                for key, value in operation.items()
+                if key not in {"op", "inputs", "partition_by", "part_boundary"}
+            }
+        else:
+            source_alias = first_alias
+            legacy_boundary = None
+            materialize = {
+                "alias": "materialize_selected_payload",
+                "workers": 1,
+                "max_tasks_per_child": 1,
+            }
+        nested = [
+            item
+            for item in downstream
+            if not isinstance(item, dict)
+            or item.get("op") not in {"materialize", "save_dataset"}
+        ]
+        terminal_alias = (
+            str(nested[-1].get("alias") or "")
+            if nested and isinstance(nested[-1], dict)
+            else source_alias
+        )
+        save_inputs = save.get("inputs")
+        if not isinstance(save_inputs, dict) or save_inputs.get("data") != terminal_alias:
+            raise ValueError(
+                "0301 save_dataset 입력은 materialize.operations의 마지막 alias와 일치해야 합니다."
+            )
+
+    for operation in nested:
+        if not isinstance(operation, dict) or operation.get("op") != "join":
+            continue
+        how = str(operation.pop("how", "left") or "left").strip().lower()
+        operation.pop("right_partition_column", None)
+        if how not in {"left", "left_outer"}:
+            raise ValueError(
+                "0301 migrate는 keyspace 기반 left join으로 보존 가능한 기존 how만 지원합니다."
+            )
+        columns = operation.pop("columns", None)
+        if columns is not None:
+            if not isinstance(columns, dict):
+                raise ValueError("0301 join.columns는 object여야 합니다.")
+            if "include_columns" in operation or "exclude_columns" in operation:
+                raise ValueError(
+                    "0301 join은 columns와 include_columns/exclude_columns를 함께 사용할 수 없습니다."
+                )
+            include = [str(item) for item in columns.get("include") or []]
+            include_regex = [str(item) for item in columns.get("regex") or []]
+            exclude = [str(item) for item in columns.get("exclude") or []]
+            exclude_regex = [str(item) for item in columns.get("exclude_regex") or []]
+            if include_regex:
+                exact_patterns = [f"^(?:{re.escape(name)})$" for name in include]
+                operation["include_columns"] = "|".join(
+                    [*exact_patterns, *(f"(?:{pattern})" for pattern in include_regex)]
+                )
+            elif include:
+                operation["include_columns"] = include
+            if exclude_regex:
+                exact_patterns = [f"^(?:{re.escape(name)})$" for name in exclude]
+                operation["exclude_columns"] = "|".join(
+                    [*exact_patterns, *(f"(?:{pattern})" for pattern in exclude_regex)]
+                )
+            elif exclude:
+                operation["exclude_columns"] = exclude
+
+    if has_keyspace:
+        keyspace = deepcopy(existing_keyspace)
+        if str(keyspace.get("method") or "").strip().lower() != "union_distinct_keys":
+            raise ValueError("0301 build_sidecar.method는 union_distinct_keys여야 합니다.")
+    else:
+        first_join = next(
+            (
+                item
+                for item in nested
+                if isinstance(item, dict) and item.get("op") == "join"
+            ),
+            None,
+        )
+        left_keys = first_join.get("left_on") if isinstance(first_join, dict) else []
+        boundary_groups = (
+            legacy_boundary.get("preserve_groups")
+            if isinstance(legacy_boundary, dict)
+            else None
+        )
+        keys: list[str] = []
+        for value in [*(legacy_partition or []), *(boundary_groups or []), *(left_keys or [])]:
+            text = str(value).strip()
+            if text and text not in keys:
+                keys.append(text)
+        if not keys:
+            raise ValueError("0301 keyspace keys를 기존 join/materialize 계약에서 추론할 수 없습니다.")
+        partition_by = [str((legacy_partition or keys)[0])]
+        boundary = deepcopy(legacy_boundary) if isinstance(legacy_boundary, dict) else {}
+        boundary.setdefault("target_rows", 20000)
+        boundary["preserve_groups"] = deepcopy(keys)
+        keyspace = {
+            "alias": "join_keyspace",
+            "method": "union_distinct_keys",
+            "sources": [source_alias],
+            "keys": deepcopy(keys),
+            "partition_by": partition_by,
+            "part_boundary": boundary,
+            "null_key_policy": "error",
+        }
+        materialize_alias = str(materialize.get("alias") or "materialize_selected_payload")
+        used_aliases = {
+            str(item.get("alias") or "") for item in nested if isinstance(item, dict)
+        }
+        payload_alias = f"join_{source_alias}"
+        suffix = 2
+        while payload_alias in used_aliases:
+            payload_alias = f"join_{source_alias}_{suffix}"
+            suffix += 1
+        for item in nested:
+            inputs = item.get("inputs") if isinstance(item, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            for port in ("left", "data", "source"):
+                value = inputs.get(port)
+                if value in {source_alias, materialize_alias}:
+                    inputs[port] = payload_alias
+        nested.insert(
+            0,
+            {
+                "op": "join",
+                "alias": payload_alias,
+                "input_right": source_alias,
+                "left_on": deepcopy(keys),
+                "right_on": deepcopy(keys),
+            },
+        )
+        changes.append(
+            _change(
+                "0301 materialize boundary",
+                "build_sidecar union_distinct_keys with payload restoration join",
+            )
+        )
+
+    current_alias = str(materialize.get("alias") or "materialize_selected_payload")
+    for operation in nested:
+        if not isinstance(operation, dict):
+            continue
+        if operation.get("op") == "join":
+            inputs = operation.pop("inputs", None)
+            input_right = operation.get("input_right")
+            if input_right is not None and inputs is not None:
+                raise ValueError("0301 join은 input_right와 inputs를 동시에 선언할 수 없습니다.")
+            if input_right is None:
+                if not isinstance(inputs, dict):
+                    raise ValueError("0301 join에는 inputs 또는 input_right가 필요합니다.")
+                if inputs.get("left") != current_alias:
+                    raise ValueError(
+                        "0301 순차 join migration에서 inputs.left는 직전 operation alias여야 합니다."
+                    )
+                input_right = inputs.get("right")
+                if not str(input_right or "").strip():
+                    raise ValueError("0301 join inputs.right 값이 필요합니다.")
+                operation["input_right"] = str(input_right)
+            _reorder_mapping(
+                operation,
+                (
+                    "op",
+                    "alias",
+                    "input_right",
+                    "left_on",
+                    "right_on",
+                    "suffix",
+                    "include_columns",
+                    "exclude_columns",
+                ),
+            )
+        current_alias = str(operation.get("alias") or current_alias)
+
+    materialize.pop("source", None)
+    materialize.pop("partition_by", None)
+    materialize.pop("part_boundary", None)
+    materialize["operations"] = nested
+    _reorder_mapping(
+        materialize,
+        (
+            "alias",
+            "workers",
+            "max_tasks_per_child",
+            "operations",
+        ),
+    )
+    payload["build_sidecar"] = keyspace
+    payload["materialize"] = materialize
+    payload.pop("operations", None)
+    changes.append(
+        _change(
+            "operations materialize/join/save_dataset",
+            "materialize phase with implicit terminal save",
+        )
+    )
+    _reorder_mapping(
+        payload,
+        (
+            "yaml",
+            "job",
+            "output",
+            "define_upstream",
+            "build_sidecar",
+            "materialize",
+            "execution",
+        ),
+    )
+
+
+def _normalize_snapshot_phase_contract(
+    payload: dict[str, Any], *, changes: list[dict[str, str]]
+) -> None:
+    """Normalize flat 0401 DAG YAML into the public single-snapshot phase contract."""
+
+    header = payload.get("yaml")
+    if not isinstance(header, dict) or str(header.get("asset_code") or "") != "0401":
+        return
+    if header.get("schema_version") == CURRENT_SNAPSHOT_SCHEMA:
+        materialize = payload.get("materialize")
+        if isinstance(materialize, dict) and isinstance(
+            materialize.get("operations"), list
+        ):
+            operations = materialize["operations"]
+            retained = [
+                item
+                for item in operations
+                if not isinstance(item, dict) or item.get("op") != "data_assertion"
+            ]
+            if len(retained) != len(operations):
+                materialize["operations"] = retained
+                changes.append(
+                    _change(
+                        "0401 materialize.operations[].data_assertion",
+                        "removed (0401 snapshot assertion contract removed)",
+                    )
+                )
+        if isinstance(payload.get("build_sidecar"), dict):
+            sidecar = payload["build_sidecar"]
+            sidecar_operations = sidecar.get("operations")
+            if isinstance(sidecar_operations, list):
+                retained = [
+                    item
+                    for item in sidecar_operations
+                    if not isinstance(item, dict)
+                    or item.get("op") != "active_row_selection"
+                ]
+                if len(retained) != len(sidecar_operations):
+                    if retained:
+                        sidecar["operations"] = retained
+                    else:
+                        sidecar.pop("operations", None)
+                    changes.append(
+                        _change(
+                            "0401 build_sidecar.operations[].active_row_selection",
+                            "removed (all filtered rows become coordinates)",
+                        )
+                    )
+            return
+        upstreams = payload.get("define_upstream")
+        materialize = payload.get("materialize")
+        if (
+            not isinstance(upstreams, list)
+            or len(upstreams) != 1
+            or not isinstance(upstreams[0], dict)
+            or not isinstance(materialize, dict)
+        ):
+            raise ValueError(
+                "0401 v8 coordinate 정규화에는 단일 define_upstream과 materialize가 필요합니다."
+            )
+        boundary = materialize.pop("part_boundary", None)
+        if not isinstance(boundary, dict):
+            boundary = {"target_rows": 20000}
+        source_alias = str(upstreams[0].get("alias") or "").strip()
+        if not source_alias:
+            raise ValueError("0401 define_upstream.alias가 필요합니다.")
+        payload["build_sidecar"] = {
+            "alias": "select_snapshot_rows",
+            "source": source_alias,
+            "columns": "auto",
+            "part_boundary": boundary,
+        }
+        _reorder_mapping(
+            materialize,
+            ("alias", "workers", "max_tasks_per_child", "operations"),
+        )
+        _reorder_mapping(
+            payload,
+            (
+                "yaml",
+                "job",
+                "output",
+                "define_upstream",
+                "build_sidecar",
+                "materialize",
+                "execution",
+            ),
+        )
+        changes.append(
+            _change(
+                "0401 materialize.part_boundary",
+                "build_sidecar.part_boundary + direct coordinate collection",
+            )
+        )
+        return
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        raise ValueError("0401 v6 YAML에는 operations 목록이 필요합니다.")
+    upstreams = [
+        deepcopy(item)
+        for item in operations
+        if isinstance(item, dict) and item.get("op") in {"define_asset", "define_dataset"}
+    ]
+    materializations = [
+        deepcopy(item)
+        for item in operations
+        if isinstance(item, dict) and item.get("op") == "materialize"
+    ]
+    saves = [
+        deepcopy(item)
+        for item in operations
+        if isinstance(item, dict) and item.get("op") == "save_dataset"
+    ]
+    if len(upstreams) != 1 or len(materializations) != 1 or len(saves) != 1:
+        raise ValueError(
+            "0401 정규화에는 source, materialize, save_dataset이 각각 정확히 하나 필요합니다."
+        )
+    upstream = upstreams[0]
+    materialize = materializations[0]
+    source_alias = str(upstream.get("alias") or "").strip()
+    materialize_inputs = materialize.get("inputs")
+    if not isinstance(materialize_inputs, dict) or str(
+        materialize_inputs.get("source") or ""
+    ) != source_alias:
+        raise ValueError("0401 materialize.inputs.source가 단일 upstream alias와 일치해야 합니다.")
+    save = saves[0]
+    save_inputs = save.get("inputs")
+    if not isinstance(save_inputs, dict) or not str(save_inputs.get("data") or "").strip():
+        raise ValueError("0401 save_dataset.inputs.data가 필요합니다.")
+
+    nested: list[dict[str, Any]] = []
+    for item in operations:
+        if not isinstance(item, dict) or item.get("op") in {
+            "define_asset",
+            "define_dataset",
+            "materialize",
+            "save_dataset",
+            "data_assertion",
+        }:
+            continue
+        normalized = deepcopy(item)
+        normalized.pop("inputs", None)
+        normalized.pop("partition_by", None)
+        nested.append(normalized)
+    boundary = deepcopy(materialize.get("part_boundary") or {"target_rows": 20000})
+    materialize = {
+        key: deepcopy(value)
+        for key, value in materialize.items()
+        if key not in {"op", "inputs", "partition_by", "part_boundary"}
+    }
+    materialize["operations"] = nested
+    _reorder_mapping(
+        materialize,
+        ("alias", "workers", "max_tasks_per_child", "operations"),
+    )
+    header["schema_version"] = CURRENT_SNAPSHOT_SCHEMA
+    payload["define_upstream"] = [upstream]
+    payload["build_sidecar"] = {
+        "alias": "select_snapshot_rows",
+        "source": source_alias,
+        "columns": "auto",
+        "part_boundary": boundary,
+    }
+    payload["materialize"] = materialize
+    payload.pop("operations", None)
+    changes.append(_change(CURRENT_PIPELINE_SCHEMA, CURRENT_SNAPSHOT_SCHEMA))
+    changes.append(
+        _change(
+            "0401 operations source/materialize/save_dataset",
+            "define_upstream + materialize.operations + implicit single-file write",
+        )
+    )
+    _reorder_mapping(
+        payload,
+        (
+            "yaml",
+            "job",
+            "output",
+            "define_upstream",
+            "build_sidecar",
+            "materialize",
+            "execution",
+        ),
+    )
+
+
 def _legacy_stage_id(payload: dict[str, Any]) -> str:
     stage = payload.get("stage")
     if not isinstance(stage, dict):
@@ -249,16 +888,139 @@ def _pipeline_output(payload: dict[str, Any], *, artifact_type: str, asset_code:
     logging_root = _current_template(
         str(logging.get("path") or ""), fallback=f".temp/logs/{asset_code}"
     )
+    artifact = {
+        "type": artifact_type,
+        "root_dir": root,
+        "format": "sbdf" if asset_code == "0401" else "parquet",
+        **({} if asset_code == "0401" else {"compression": "zstd"}),
+        **(
+            {
+                "sbdf": {
+                    "row_key_columns": ["partition"],
+                    "batch_size": 50_000,
+                    "encoding_rle": True,
+                }
+            }
+            if asset_code == "0401"
+            else {}
+        ),
+        "physical_layout": {
+            "profile": {
+                "0201": "curated_reuse_v1",
+                "0301": "joined_reuse_v1",
+                "0401": "analysis_snapshot_adaptive_v1",
+            }[asset_code],
+            "adaptation_scope": (
+                "task_adaptive" if asset_code == "0401" else "generation_fixed"
+            ),
+            "row_group_rows": "auto",
+        },
+    }
     return {
         "artifact": {
-            "type": artifact_type,
-            "root_dir": root,
-            "format": "parquet",
-            "compression": "zstd",
-            "write_policy": "atomic_replace",
+            **artifact,
         },
         "logging": {"root_dir": logging_root},
     }
+
+
+def _normalize_public_output(
+    payload: dict[str, Any],
+    *,
+    asset_code: str,
+    changes: list[dict[str, str]],
+) -> None:
+    """Normalize the user-facing dataset output envelope without policy fields."""
+
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return
+    artifact = output.get("artifact")
+    if not isinstance(artifact, dict):
+        return
+    if asset_code == "0401":
+        if artifact.get("format") != "sbdf":
+            artifact["format"] = "sbdf"
+            changes.append(_change("output.artifact.format", "sbdf (0401 default)"))
+        artifact.pop("compression", None)
+        if not isinstance(artifact.get("sbdf"), dict):
+            artifact["sbdf"] = {
+                "row_key_columns": _infer_0401_sbdf_keys(payload),
+                "batch_size": 50_000,
+                "encoding_rle": True,
+            }
+            changes.append(_change("0401 output keys", "output.artifact.sbdf"))
+    if artifact.pop("write_policy", None) is not None:
+        changes.append(
+            _change("output.artifact.write_policy", "removed (atomic publication invariant)")
+        )
+    writer = artifact.get("parquet_writer")
+    writer = writer if isinstance(writer, dict) else {}
+    legacy_compression = writer.pop("compression", None)
+    legacy_row_group_rows = writer.pop("row_group_size", None)
+    if asset_code != "0401" and "compression" not in artifact:
+        artifact["compression"] = str(legacy_compression or "zstd")
+        changes.append(
+            _change("output.artifact.parquet_writer.compression", "output.artifact.compression")
+        )
+    profiles = {
+        "0101": "source_ingest_v1",
+        "0102": "fact_append_v1",
+        "0103": "source_ingest_v1",
+        "0201": "curated_reuse_v1",
+        "0301": "joined_reuse_v1",
+        "0401": "analysis_snapshot_adaptive_v1",
+    }
+    layout = artifact.get("physical_layout")
+    if not isinstance(layout, dict):
+        layout = {}
+        artifact["physical_layout"] = layout
+    layout_changed = False
+    for key, value in {
+        "profile": profiles.get(asset_code, "reusable_dataset_v1"),
+        "adaptation_scope": (
+            "task_adaptive" if asset_code == "0401" else "generation_fixed"
+        ),
+        "row_group_rows": legacy_row_group_rows or "auto",
+    }.items():
+        if key not in layout:
+            layout[key] = value
+            layout_changed = True
+    if layout_changed:
+        changes.append(
+            _change("output writer layout", "output.artifact.physical_layout")
+        )
+    if isinstance(artifact.get("parquet_writer"), dict) and not artifact["parquet_writer"]:
+        artifact.pop("parquet_writer")
+    if asset_code == "0101":
+        _order_legacy_source_output(output)
+    else:
+        _reorder_mapping(output, ("artifact", "logging"))
+        _reorder_mapping(
+            artifact,
+            (
+                "type",
+                "root_dir",
+                "format",
+                "compression",
+                "physical_layout",
+                "sbdf",
+                "file_name_rule",
+                "parquet_writer",
+                "publication",
+            ),
+        )
+
+
+def _infer_0401_sbdf_keys(payload: dict[str, Any]) -> list[str]:
+    sidecar = payload.get("build_sidecar")
+    if isinstance(sidecar, dict):
+        boundary = sidecar.get("part_boundary")
+        if isinstance(boundary, dict):
+            values = boundary.get("preserve_groups")
+            if isinstance(values, list) and values and all(str(value).strip() for value in values):
+                return [str(value) for value in values]
+    return ["partition"]
 
 
 def _current_template(value: str, *, fallback: str) -> str:
@@ -367,7 +1129,7 @@ def _convert_legacy_pipeline(
     paths = _legacy_source_paths(upstream.get("source_paths"), path="upstream.source_paths")
     date_window = payload.get("date_window") if isinstance(payload.get("date_window"), dict) else {}
     operations: list[dict[str, Any]] = [_define_dataset("source", paths), {"op": "materialize", "alias": "materialize_snapshot", "inputs": {"source": "source"}, "partition_by": [str(date_window.get("column") or "partition")], "part_boundary": {"target_rows": 20000, "preserve_groups": [str(date_window.get("column") or "partition")]}, "workers": 1, "max_tasks_per_child": 1}, {"op": "save_dataset", "alias": "write_snapshot", "inputs": {"data": "materialize_snapshot"}, "partition_by": [str(date_window.get("column") or "partition")] }]
-    converted = _current_pipeline(name, "0401", CURRENT_PIPELINE_SCHEMA, _pipeline_output(payload, artifact_type="analysis_snapshot", asset_code="0401"), operations)
+    converted = _current_pipeline(name, "0401", CURRENT_SNAPSHOT_SCHEMA, _pipeline_output(payload, artifact_type="analysis_snapshot", asset_code="0401"), operations)
     warnings.append("legacy filters, joins, column_rename and indexed_snapshot options require manual operation mapping.")
     changes.append(_change(f"stage.id {stage_id}", "yaml.asset_code 0401"))
     return converted, changes, warnings
@@ -376,7 +1138,15 @@ def _convert_legacy_pipeline(
 def _current_pipeline(job_name: str, asset_code: str, schema: str, output: dict[str, Any], operations: list[dict[str, Any]], keys: list[str] | None = None) -> dict[str, Any]:
     if keys is not None:
         partition = keys[0]
-        return {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "define_upstream": [{**operations[0]}], "build_sidecar": {"alias": "select_rows", "source": operations[0]["alias"], "columns": "auto", "operations": [{"op": "active_row_selection", "method": "sort_first", "group_keys": [{"name": key, "column": key} for key in keys], "sort": [{"column": partition, "direction": "asc", "nulls": "last"}]}]}, "materialize": {"alias": "materialize_rows", "source": operations[0]["alias"], "coordinates": "select_rows", "partition_by": [partition], "part_boundary": {"target_rows": 20000, "preserve_groups": keys}, "workers": 1, "max_tasks_per_child": 1, "operations": []}, "save_dataset": {"alias": "write_output", "input": "materialize_rows", "partition_by": [partition], "operations": []}, "execution": {"reset_before_run": False}}
+        return {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "define_upstream": [{**operations[0]}], "build_sidecar": {"alias": "select_rows", "source": operations[0]["alias"], "partition_by": [partition], "part_boundary": {"target_rows": 20000, "preserve_groups": keys}, "columns": "auto", "operations": [{"op": "active_row_selection", "method": "sort_first", "group_keys": [{"name": key, "column": key} for key in keys], "sort": [{"column": partition, "direction": "asc", "nulls": "last"}]}]}, "materialize": {"alias": "materialize_rows", "workers": 1, "max_tasks_per_child": 1, "operations": []}, "execution": {"reset_before_run": False}}
+    if asset_code == "0301":
+        result = {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "operations": operations, "execution": {"reset_before_run": False}}
+        _normalize_join_upstream_contract(result, changes=[])
+        return result
+    if asset_code == "0401":
+        result = {"yaml": {"schema_version": CURRENT_PIPELINE_SCHEMA, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "operations": operations, "execution": {"reset_before_run": False}}
+        _normalize_snapshot_phase_contract(result, changes=[])
+        return result
     return {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "operations": operations, "execution": {"reset_before_run": False}}
 
 
@@ -415,6 +1185,14 @@ def _is_current_source(payload: dict[str, Any]) -> bool:
 
 
 def _needs_source_normalization(payload: dict[str, Any]) -> bool:
+    output = payload.get("output")
+    artifact = output.get("artifact") if isinstance(output, dict) else None
+    if isinstance(artifact, dict) and (
+        "write_policy" in artifact
+        or "compression" not in artifact
+        or "physical_layout" not in artifact
+    ):
+        return True
     source = payload.get("source")
     if not isinstance(source, dict):
         return False
@@ -480,6 +1258,7 @@ def _normalize_current_source(
 
     _normalize_legacy_source_filters(request, changes=changes, warnings=warnings)
     _order_legacy_source_fields(source, request)
+    _normalize_public_output(converted, asset_code="0101", changes=changes)
     return converted, changes, warnings
 
 
@@ -657,7 +1436,16 @@ def _order_legacy_source_output(output: dict[str, Any]) -> None:
     if isinstance(artifact, dict):
         _reorder_mapping(
             artifact,
-            ("type", "root_dir", "format", "write_policy", "file_name_rule", "parquet_writer", "publication"),
+            (
+                "type",
+                "root_dir",
+                "format",
+                "compression",
+                "physical_layout",
+                "file_name_rule",
+                "parquet_writer",
+                "publication",
+            ),
         )
         file_name_rule = artifact.get("file_name_rule")
         if isinstance(file_name_rule, dict):
@@ -870,7 +1658,7 @@ def _convert_output(
     if not root_dir:
         raise ValueError("legacy output.output_dir가 필요합니다.")
     file_rule = _required_mapping(legacy, "file_name_rule")
-    writer = legacy.get("parquet_writer", {})
+    writer = deepcopy(legacy.get("parquet_writer", {}))
     if not isinstance(writer, dict):
         raise ValueError("legacy output.parquet_writer는 object여야 합니다.")
     logging_root = legacy.get("logging_dir")
@@ -892,7 +1680,12 @@ def _convert_output(
             "type": "source_dataset",
             "root_dir": root_dir,
             "format": "parquet",
-            "write_policy": "atomic_replace",
+            "compression": str(writer.pop("compression", "zstd")),
+            "physical_layout": {
+                "profile": "source_ingest_v1",
+                "adaptation_scope": "generation_fixed",
+                "row_group_rows": writer.pop("row_group_size", 1000),
+            },
             "file_name_rule": {"raw_dataset": file_rule["raw_dataset"]},
             "parquet_writer": deepcopy(writer),
         },

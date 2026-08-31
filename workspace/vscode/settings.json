@@ -6,13 +6,15 @@
     ],
     "./.vscode/schemas/pipeline-v6.schema.json": [
       "**/*.0301.yaml",
-      "**/*.0301.yml",
-      "**/*.0401.yaml",
-      "**/*.0401.yml"
+      "**/*.0301.yml"
     ],
     "./.vscode/schemas/pipeline-v7.schema.json": [
       "**/*.0201.yaml",
       "**/*.0201.yml"
+    ],
+    "./.vscode/schemas/pipeline-v8.schema.json": [
+      "**/*.0401.yaml",
+      "**/*.0401.yml"
     ],
     "./.vscode/schemas/calculated-fact-v2.schema.json": [
       "**/*.0102.yaml",
@@ -20,7 +22,9 @@
     ],
     "./.vscode/schemas/asset-chain-v2.schema.json": [
       "**/*.chain.yaml",
-      "**/*.chain.yml"
+      "**/*.chain.yml",
+      "**/chain.*.yaml",
+      "**/chain.*.yml"
     ],
     "./.vscode/schemas/schedule-v1.schema.json": [
       "**/*.schedule.yaml",

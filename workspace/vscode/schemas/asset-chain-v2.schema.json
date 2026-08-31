@@ -30,7 +30,7 @@
         "required": ["id", "asset_code", "definition"],
         "properties": {
           "id": {"type": "string", "minLength": 1, "description": "Chain 안에서 유일한 Asset ID"},
-          "asset_code": {"type": "string", "pattern": "^(01|03|04|05)[0-9]{2}$", "description": "산출물 계열과 variant를 나타내는 네 자리 코드"},
+          "asset_code": {"type": "string", "pattern": "^(01|02|03|04|05)[0-9]{2}$", "description": "산출물 계열과 variant를 나타내는 네 자리 코드"},
           "definition": {"type": "string", "minLength": 1, "description": "Chain YAML 기준 상대 Asset Definition 경로"},
           "inputs": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}, "description": "port 이름에서 upstream Asset ID로의 실행 의존관계"}
         }

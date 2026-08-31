@@ -206,7 +206,8 @@
             "type": {"const": "source_dataset"},
             "root_dir": {"type": "string", "minLength": 1},
             "format": {"const": "parquet"},
-            "write_policy": {"const": "atomic_replace"},
+            "compression": {"type": "string", "enum": ["snappy", "zstd", "uncompressed"], "default": "zstd"},
+            "physical_layout": {"$ref": "#/$defs/physicalLayout"},
             "file_name_rule": {
               "type": "object",
               "additionalProperties": false,
@@ -287,13 +288,22 @@
       "properties": {
         "index": {"type": "boolean"},
         "engine": {"type": "string", "enum": ["pyarrow", "fastparquet"]},
-        "compression": {"type": "string", "enum": ["snappy", "zstd", "uncompressed"], "default": "zstd"},
-        "row_group_size": {"type": "integer", "minimum": 1},
         "write_page_index": {"type": "boolean"},
         "write_statistics": {"type": "boolean"},
         "data_page_size": {"type": "integer", "minimum": 1},
         "max_rows_per_page": {"type": "integer", "minimum": 1},
         "use_dictionary": {"oneOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}]}
+      }
+    },
+    "physicalLayout": {
+      "type": "object",
+      "description": "게시 Parquet의 재사용 프로필과 row-group 결정 범위",
+      "additionalProperties": false,
+      "required": ["profile", "adaptation_scope", "row_group_rows"],
+      "properties": {
+        "profile": {"type": "string", "minLength": 1},
+        "adaptation_scope": {"const": "generation_fixed"},
+        "row_group_rows": {"oneOf": [{"const": "auto"}, {"type": "integer", "minimum": 1}]}
       }
     }
   }

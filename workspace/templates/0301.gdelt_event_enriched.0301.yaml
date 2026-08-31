@@ -9,28 +9,33 @@ output:
     root_dir: f"{data_root}/{asset_code}/{job_name}"
     format: parquet
     compression: zstd
-    write_policy: atomic_replace
     physical_layout: {profile: joined_reuse_v1, adaptation_scope: generation_fixed, row_group_rows: auto}
   logging:
     root_dir: f"{log_root}/{asset_code}"
-operations:
+define_upstream:
 - op: define_asset
   alias: main
   definition: 0201.gdelt_event_truth.0201.yaml
-- op: materialize
-  alias: materialize_events
-  inputs: {source: main}
+build_sidecar:
+  alias: join_keyspace
+  method: union_distinct_keys
+  sources: [main]
+  keys: [partition, row_key]
   partition_by: [partition]
   part_boundary:
     target_rows: 20000
     target_key_groups: 5000
     preserve_groups: [partition, row_key]
+materialize:
+  alias: materialize_events
   workers: 1
   max_tasks_per_child: 1
-- op: save_dataset
-  alias: save_enriched
-  inputs: {data: materialize_events}
-  partition_by: [partition]
+  operations:
+  - op: join
+    alias: join_main
+    input_right: main
+    left_on: [partition, row_key]
+    right_on: [partition, row_key]
 execution:
   memory_budget_mb: 2048
   max_source_files_per_task: 40

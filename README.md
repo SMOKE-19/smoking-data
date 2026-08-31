@@ -21,7 +21,7 @@ CLI와 엔진은 하나의 `smoking-data` wheel에서 제공한다. SPI 환경 �
 - 각 계층에 붙였다 뗄 수 있는 범용 operation
 - Engine이 Asset Chain 검증·실행과 dataset-local provenance 계약 소유
 - 설치 후 `init`으로 YAML 편집 환경, LLM 진단 지침·sandbox, 0101 adapter와 Asset별 기본 config 생성
-- 로컬 atomic commit 뒤 선택적으로 S3 immutable Parquet·SBDF generation bundle과 random-access sidecar 게시
+- 0101~0301 Parquet 및 0401 단일 SBDF atomic artifact; 선택적으로 S3 immutable generation과 random-access sidecar 게시
 
 0103 출력 행에는 `file_name`(상대경로)과 함께 소스 파일의 UTC
 `source_modified_at`이 기록된다. 파일시스템이 생성 시각을 제공하는 환경에서는

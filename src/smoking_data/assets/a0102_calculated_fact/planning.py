@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 from smoking_data.core.exceptions import ValidationError
 from smoking_data.ops.upstream import discover_parquet_files
 from smoking_data.runtime.config import load_config
-from smoking_data.runtime.paths import resolve_project_path
+from smoking_data.runtime.paths import infer_project_root, resolve_project_path
 from smoking_data.runtime.template_resolution import resolve_contract_templates
 from smoking_data.runtime.yaml_loader import load_pipeline_spec
 
@@ -54,9 +54,10 @@ def preflight_calculated_fact_yaml(
 ) -> CalculatedFactRunPlan:
     from .spec import load_calculated_fact_spec
 
+    effective_project_root = project_root or infer_project_root(definition_path)
     config = load_config(
         config_path=config_path,
-        project_root=project_root,
+        project_root=effective_project_root,
         asset_code="0102",
     )
     definition = resolve_project_path(definition_path, project_root=config.project_root)
@@ -183,10 +184,10 @@ def build_calculated_fact_plan(
             "asset.invalid_output_contract",
             "0102 output must be a calculated_fact_dataset in Parquet format.",
         )
-    if artifact.get("write_policy") != "append_generation":
+    if artifact.get("write_policy") not in {None, "append_generation"}:
         _fail(
             "asset.invalid_output_contract",
-            "0102 output.write_policy must be append_generation.",
+            "Legacy 0102 output.write_policy only accepts append_generation.",
         )
     compression = str(artifact.get("compression") or "zstd").lower()
     if compression != "zstd":
@@ -199,6 +200,16 @@ def build_calculated_fact_plan(
         _fail(
             "asset.invalid_output_contract",
             "0102 output.artifact.physical_layout must be a mapping.",
+        )
+    if not str(physical_layout.get("profile") or "").strip():
+        _fail(
+            "asset.invalid_output_contract",
+            "0102 output.artifact.physical_layout.profile must be non-empty.",
+        )
+    if physical_layout.get("adaptation_scope") != "generation_fixed":
+        _fail(
+            "asset.invalid_output_contract",
+            "0102 output.artifact.physical_layout.adaptation_scope must be generation_fixed.",
         )
     row_group_value = physical_layout.get("row_group_rows", "auto")
     output_row_group_rows = None if row_group_value == "auto" else int(row_group_value)

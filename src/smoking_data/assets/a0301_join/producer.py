@@ -45,6 +45,7 @@ from smoking_data.runtime.naming import (
     task_id,
 )
 from smoking_data.runtime.object_store.remote_upstream import materialize_remote_parquet_files
+from smoking_data.runtime.output_contract import resolve_physical_writer_output
 from smoking_data.runtime.output_physical_layout import (
     previous_output_physical_layout_matches,
     resolve_configured_row_group_rows,
@@ -64,7 +65,8 @@ PRESET_NAME = "0301"
 RIGHT_INDEX_MANIFEST_VERSION = "smoking-data.0301-right-index.v2"
 INTERNAL_JOIN_BACKEND_ENV = "SMOKING_DATA_0301_JOIN_BACKEND"
 INTERNAL_DISABLE_BOUNDED_JOIN_ENV = "SMOKING_DATA_DISABLE_0301_BOUNDED_JOIN"
-BOUNDED_JOIN_STRATEGY_VERSION = "smoking-data.0301-adaptive-parallel-join.v5"
+INTERNAL_RIGHT_STAGING_ENV = "SMOKING_DATA_0301_RIGHT_STAGING"
+BOUNDED_JOIN_STRATEGY_VERSION = "smoking-data.0301-adaptive-parallel-join.v6"
 
 
 def can_run(preset: str) -> bool:
@@ -78,6 +80,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     execution = _mapping(raw.get("execution"), section="execution", allow_missing=True)
     join_backend = os.getenv(INTERNAL_JOIN_BACKEND_ENV, "arrow_native").strip().lower()
     bounded_join = os.getenv(INTERNAL_DISABLE_BOUNDED_JOIN_ENV) != "1"
+    right_staging_mode = os.getenv(INTERNAL_RIGHT_STAGING_ENV, "auto").strip().lower()
     if join_backend not in {"arrow_native", "polars"}:
         raise ValidationError(
             f"Unsupported internal 0301 join backend: {join_backend!r}.",
@@ -97,22 +100,32 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                     "required_feature": "polars-join-experiment",
                 },
             )
+    if right_staging_mode not in {"off", "auto", "force"}:
+        raise ValidationError(
+            f"Unsupported internal 0301 right staging mode: {right_staging_mode!r}.",
+            code="join.unsupported_right_staging_mode",
+            context={
+                "environment": INTERNAL_RIGHT_STAGING_ENV,
+                "value": right_staging_mode,
+            },
+        )
     test_run_limit = final_task_limit(execution)
-    logical_plan = compile_0301_logical_plan(raw)
+    output = resolve_physical_writer_output(raw, asset_code="0301")
+    physical_raw = {**raw, "output": output}
+    logical_plan = compile_0301_logical_plan(physical_raw)
     logical_plan_hash = str(
         (raw.get("__pipeline") or {}).get("execution_plan_hash") or logical_plan.plan_hash
     )
     optimization = optimize_logical_plan(logical_plan, enabled=config.optimizer_enabled)
     left_cfg = _mapping(raw.get("left"), section="left")
     join_cfg = _mapping(raw.get("join"), section="join")
-    output = _mapping(raw.get("output"), section="output")
     right_cfgs = _right_source_configs(raw)
     join_operations = [
         operation for operation in logical_plan.operations if operation.kind.value == "join"
     ]
 
     source_scan_started = time.perf_counter()
-    left_files = _discover_from_cfg(left_cfg, config=config)
+    left_input_files = _discover_from_cfg(left_cfg, config=config)
     right_sources: list[dict[str, Any]] = []
     all_right_files = []
     for source_cfg, operation in zip(right_cfgs, join_operations, strict=True):
@@ -129,7 +142,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 "suffix": operation.config["suffix"],
             }
         )
-    left_fingerprint = combined_fingerprint(left_files)
+    left_fingerprint = combined_fingerprint(left_input_files)
     right_fingerprint = combined_fingerprint(all_right_files)
     skipped_result = (
         None
@@ -141,6 +154,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             right_fingerprint=right_fingerprint,
             logical_plan_hash=logical_plan_hash,
             join_backend=join_backend,
+            right_staging_mode=right_staging_mode,
             asset_code=str((raw.get("__pipeline") or {}).get("asset_code") or "0301"),
             physical_layout_policy=output.get("physical_layout"),
             compression=str(output.get("compression") or "zstd"),
@@ -148,6 +162,17 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     )
     if skipped_result is not None:
         return skipped_result
+    keyspace_profile: dict[str, Any] | None = None
+    if isinstance(left_cfg.get("keyspace"), dict):
+        keyspace_started = time.perf_counter()
+        left_files, keyspace_profile = _materialize_join_keyspace(
+            left_cfg,
+            config=config,
+            artifact_root=artifact_root_for(spec, config=config),
+        )
+        phase_elapsed_sec["keyspace_build_sec"] = time.perf_counter() - keyspace_started
+    else:
+        left_files = left_input_files
     left = _apply_column_policy(scan_parquet_files_union_by_name(left_files), left_cfg)
     first_left_on = list(join_operations[0].config["left_on"])
     join_key_groups = left.select(first_left_on).unique().collect().height if first_left_on else 1
@@ -228,6 +253,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         max_source_files_per_task=config.max_source_files_per_task,
         artifact_root=artifact_root_for(spec, config=config),
         join_multiplicity_profile=join_multiplicity_profile,
+        partition_pruning_enabled=bool(right_partition_key),
     )
     source_selection_strategy = str(source_selection["selected"])
     phase_elapsed_sec["source_scan_sec"] = time.perf_counter() - source_scan_started
@@ -236,18 +262,29 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     if source_selection_strategy == "partition_local":
         right_key_file_index = {}
         left_key_file_index = {}
+        right_key_match_counts = {}
         right_index_rows = 0
         left_index_rows = 0
         right_index_profile = _unused_index_profile("partition_local")
         left_index_profile = _unused_index_profile("partition_local")
     else:
-        right_key_file_index, right_index_rows, right_index_profile = _build_right_key_file_index(
+        (
+            right_key_file_index,
+            right_index_rows,
+            right_index_profile,
+            right_key_match_counts,
+        ) = _build_right_key_file_index(
             right_sources,
             right_partition_key=right_partition_key,
             candidate_root=artifact_root_for(spec, config=config) / "right_key_index",
             logical_plan_hash=logical_plan_hash,
         )
-        left_key_file_index, left_index_rows, left_index_profile = _build_right_key_file_index(
+        (
+            left_key_file_index,
+            left_index_rows,
+            left_index_profile,
+            _,
+        ) = _build_right_key_file_index(
             [
                 {
                     "name": "__left",
@@ -323,6 +360,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                     partition_value=partition_value,
                     right_partition_key=right_partition_key,
                     key_file_index=right_key_file_index,
+                    key_match_counts=right_key_match_counts,
                 )
             task = TaskSpec(
                 task_id=task_id(partition_value, part_index),
@@ -401,6 +439,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 ),
                 "bounded_join": bounded_join,
                 "bounded_join_strategy_version": BOUNDED_JOIN_STRATEGY_VERSION,
+                "right_staging_mode": right_staging_mode,
             },
         )
         for task in tasks
@@ -601,10 +640,25 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             "source_selection": source_selection,
             "source_selection_strategy": source_selection_strategy,
             "join_backend": join_backend,
+            "right_staging_mode": right_staging_mode,
             "candidate_costs": source_selection["candidate_costs"],
             "candidate_rejections": source_selection["candidate_rejections"],
             "partition_locality": source_selection["partition_locality"],
             "join_multiplicity_profile": join_multiplicity_profile,
+            "join_keyspace": keyspace_profile,
+            "right_partition_strategy": (
+                {
+                    "mode": "verified_partition",
+                    "partition_pruning": True,
+                    "column": right_partition_key,
+                }
+                if right_partition_key
+                else {
+                    "mode": "general_join",
+                    "partition_pruning": False,
+                    "reason": "0301_keyspace_contract_has_no_verified_right_partition",
+                }
+            ),
             "index_cache_state": _index_cache_state(
                 source_selection_strategy,
                 left_index_profile=left_index_profile,
@@ -657,6 +711,7 @@ def _maybe_skip_unchanged(
     right_fingerprint: str,
     logical_plan_hash: str,
     join_backend: str,
+    right_staging_mode: str,
     asset_code: str,
     physical_layout_policy: dict[str, Any] | None,
     compression: str,
@@ -677,6 +732,8 @@ def _maybe_skip_unchanged(
     if details.get("logical_plan_hash") != logical_plan_hash:
         return None
     if details.get("join_backend", "arrow_native") != join_backend:
+        return None
+    if details.get("right_staging_mode", "auto") != right_staging_mode:
         return None
     if not previous_output_physical_layout_matches(
         previous,
@@ -750,6 +807,7 @@ def join_partition_task_worker(task: TaskSpec) -> TaskResult:
             "post_operations": payload.get("post_operations") or [],
             "compression": payload.get("compression") or "zstd",
             "join_backend": payload.get("join_backend", "arrow_native"),
+            "right_staging_mode": payload.get("right_staging_mode", "auto"),
         }
     )
     stats["rust_join_elapsed_sec"] = time.perf_counter() - rust_join_started
@@ -798,6 +856,7 @@ def _join_task_fingerprint(task: TaskSpec, *, logical_plan_hash: str) -> str:
         "logical_plan_hash": logical_plan_hash,
         "source_selection_strategy": payload.get("source_selection_strategy"),
         "join_backend": payload.get("join_backend", "arrow_native"),
+        "right_staging_mode": payload.get("right_staging_mode", "auto"),
         "partition_value": task.partition_value,
         "part_index": task.part_index,
         "output_row_group_rows": payload.get("output_row_group_rows"),
@@ -823,6 +882,9 @@ def _join_task_fingerprint(task: TaskSpec, *, logical_plan_hash: str) -> str:
                 "columns": source.get("columns") or {},
                 "keep_right_partition_column": bool(
                     source.get("keep_right_partition_column", False)
+                ),
+                "staging_estimated_match_rows": source.get(
+                    "staging_estimated_match_rows"
                 ),
                 "files": [file_signature(path) for path in source["files"]],
                 "row_groups": source.get("row_groups") or {},
@@ -1115,6 +1177,111 @@ def _discover_from_cfg(source_cfg: dict[str, Any], *, config: RuntimeConfig):
     )
 
 
+def _materialize_join_keyspace(
+    source_cfg: dict[str, Any],
+    *,
+    config: RuntimeConfig,
+    artifact_root: Path,
+) -> tuple[list[DatasetFileShim], dict[str, Any]]:
+    keyspace = _mapping(source_cfg.get("keyspace"), section="left.keyspace")
+    keys = _string_list(keyspace.get("keys"), section="left.keyspace.keys")
+    members = keyspace.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValidationError(
+            "0301 keyspace requires at least one source member.",
+            code="join_keyspace.invalid_sources",
+        )
+    scans: list[pl.LazyFrame] = []
+    source_profiles: list[dict[str, Any]] = []
+    expected_dtypes: dict[str, Any] | None = None
+    for index, value in enumerate(members):
+        member = _mapping(value, section=f"left.keyspace.members[{index}]")
+        name = str(member.get("name") or f"member_{index}")
+        paths = _string_list(member.get("paths"), section=f"left.keyspace.members[{index}].paths")
+        files = discover_parquet_files(
+            [resolve_project_path(path, project_root=config.project_root) for path in paths],
+            recursive=True,
+        )
+        scan = scan_parquet_files_union_by_name(files)
+        schema = dict(scan.collect_schema())
+        missing = [key for key in keys if key not in schema]
+        if missing:
+            raise ValidationError(
+                "Join keyspace source is missing required key columns.",
+                code="join_keyspace.missing_key",
+                context={"source": name, "columns": missing},
+            )
+        key_dtypes = {key: schema[key] for key in keys}
+        if expected_dtypes is None:
+            expected_dtypes = key_dtypes
+        else:
+            mismatches = [
+                {
+                    "column": key,
+                    "expected": str(expected_dtypes[key]),
+                    "actual": str(key_dtypes[key]),
+                }
+                for key in keys
+                if key_dtypes[key] != expected_dtypes[key]
+            ]
+            if mismatches:
+                raise ValidationError(
+                    "Join keyspace source key dtypes differ.",
+                    code="join_keyspace.key_dtype_mismatch",
+                    context={"source": name, "mismatches": mismatches},
+                )
+        scans.append(scan.select(keys))
+        source_profiles.append(
+            {"name": name, "files": len(files), "paths": [str(item.path) for item in files]}
+        )
+
+    combined = pl.concat(scans, how="vertical").unique(subset=keys, maintain_order=False)
+    null_policy = str(keyspace.get("null_key_policy") or "error")
+    null_predicate = pl.any_horizontal([pl.col(key).is_null() for key in keys])
+    if null_policy == "drop":
+        combined = combined.filter(~null_predicate)
+    else:
+        null_rows = int(combined.select(null_predicate.sum()).collect().item())
+        if null_rows:
+            raise ValidationError(
+                "Join keyspace contains null key values.",
+                code="join_keyspace.null_key",
+                context={"keys": keys, "rows": null_rows},
+            )
+
+    keyspace_root = artifact_root / "join_keyspace"
+    staging_root = artifact_root / f".join_keyspace.{os.getpid()}.tmp"
+    reset_path(staging_root)
+    ensure_dir(staging_root)
+    output_path = staging_root / "keyspace.parquet"
+    boundary = dict(keyspace.get("part_boundary") or {})
+    target_rows = max(1, int(boundary.get("target_rows") or config.target_rows_per_part))
+    try:
+        combined.sink_parquet(
+            output_path,
+            compression="zstd",
+            row_group_size=target_rows,
+            maintain_order=False,
+        )
+        reset_path(keyspace_root)
+        os.replace(staging_root, keyspace_root)
+    finally:
+        reset_path(staging_root)
+    committed = keyspace_root / output_path.name
+    rows = int(pq.ParquetFile(committed).metadata.num_rows)
+    return [DatasetFileShim(committed)], {
+        "schema_version": "smoking-data.0301-join-keyspace.v1",
+        "method": "union_distinct_keys",
+        "keys": keys,
+        "partition_by": list(keyspace.get("partition_by") or []),
+        "null_key_policy": null_policy,
+        "rows": rows,
+        "files": 1,
+        "bytes": committed.stat().st_size,
+        "sources": source_profiles,
+    }
+
+
 def _apply_column_policy(lf, source_cfg: dict[str, Any]):
     columns = _mapping(source_cfg.get("columns"), section="source.columns", allow_missing=True)
     lf = apply_exclude_columns(lf, columns.get("exclude"))
@@ -1140,8 +1307,13 @@ def _apply_join_column_policy(
         )
     include = [str(item) for item in columns.get("include") or []]
     patterns = [str(item) for item in columns.get("regex") or []]
+    exclude_patterns = [str(item) for item in columns.get("exclude_regex") or []]
     exclude = {str(item) for item in columns.get("exclude") or []}
-    excluded_required = sorted(exclude.intersection(required))
+    excluded_required = sorted(
+        name
+        for name in required
+        if name in exclude or any(re.search(pattern, name) for pattern in exclude_patterns)
+    )
     if excluded_required:
         raise ValidationError(
             f"Right source {source_name!r} cannot exclude required columns: {excluded_required}",
@@ -1162,7 +1334,12 @@ def _apply_join_column_policy(
                 selected.append(name)
     else:
         selected = list(schema_names)
-    selected = [name for name in selected if name not in exclude]
+    selected = [
+        name
+        for name in selected
+        if name not in exclude
+        and not any(re.search(pattern, name) for pattern in exclude_patterns)
+    ]
     for name in required:
         if name not in selected:
             selected.append(name)
@@ -1216,6 +1393,7 @@ def _build_right_key_file_index(
     ],
     int,
     dict[str, Any],
+    dict[str, dict[tuple[str | None, tuple[str, ...]], int]],
 ]:
     manifest_path = candidate_root.parent / f"{candidate_root.name}.manifest.json"
     previous = _read_json_mapping(manifest_path)
@@ -1235,6 +1413,7 @@ def _build_right_key_file_index(
         str,
         dict[tuple[str | None, tuple[str, ...]], dict[str, set[int]]],
     ] = {}
+    match_counts: dict[str, dict[tuple[str | None, tuple[str, ...]], int]] = {}
     indexed_rows = 0
     source_entries: dict[str, Any] = {}
     rebuilt_files = 0
@@ -1243,9 +1422,11 @@ def _build_right_key_file_index(
     max_key_rows = 0
     for source in right_sources:
         source_index: dict[tuple[str | None, tuple[str, ...]], dict[str, set[int]]] = {}
+        source_match_counts: dict[tuple[str | None, tuple[str, ...]], int] = {}
         right_on = list(source["right_on"])
         if not right_on:
             index[str(source["name"])] = source_index
+            match_counts[str(source["name"])] = source_match_counts
             continue
         columns = list(
             dict.fromkeys([*right_on, *([right_partition_key] if right_partition_key else [])])
@@ -1293,6 +1474,9 @@ def _build_right_key_file_index(
                 source_index.setdefault((partition, key), {}).setdefault(str(path), set()).add(
                     int(row["__row_group"])
                 )
+                source_match_counts[(partition, key)] = source_match_counts.get(
+                    (partition, key), 0
+                ) + int(row.get("__match_rows") or 0)
             source_entries[source_id] = {
                 "source_name": str(source["name"]),
                 "source_path": resolved_path,
@@ -1302,6 +1486,7 @@ def _build_right_key_file_index(
                 "size_bytes": candidate_path.stat().st_size,
             }
         index[str(source["name"])] = source_index
+        match_counts[str(source["name"])] = source_match_counts
     deleted_ids = sorted(set(previous_sources) - set(source_entries))
     for source_id in deleted_ids:
         stale_path = Path(str((previous_sources.get(source_id) or {}).get("candidate_path") or ""))
@@ -1323,7 +1508,7 @@ def _build_right_key_file_index(
         "max_rows_per_key_row_group": max_key_rows,
         "candidate_bytes": sum(int(item["size_bytes"]) for item in source_entries.values()),
     }
-    return index, indexed_rows, profile
+    return index, indexed_rows, profile, match_counts
 
 
 def _build_right_key_candidate(
@@ -1416,6 +1601,7 @@ def _choose_source_selection(
     max_source_files_per_task: int,
     artifact_root: Path,
     join_multiplicity_profile: dict[str, Any],
+    partition_pruning_enabled: bool,
 ) -> dict[str, Any]:
     source_files = {
         "left": [str(item.path) for item in left_files],
@@ -1428,7 +1614,7 @@ def _choose_source_selection(
         profile.estimated_compressed_bytes() for profile in parquet_profiles.values()
     )
     locality_sources: dict[str, Any] = {}
-    complete_locality = bool(partition_values)
+    complete_locality = bool(partition_values) and partition_pruning_enabled
     for source_name, paths in source_files.items():
         assignments: dict[str, str] = {}
         unassigned: list[str] = []
@@ -1693,16 +1879,15 @@ def _select_right_sources_for_task(
         str,
         dict[tuple[str | None, tuple[str, ...]], dict[str, set[int]]],
     ],
+    key_match_counts: dict[
+        str,
+        dict[tuple[str | None, tuple[str, ...]], int],
+    ],
 ) -> list[dict[str, Any]]:
     selected_sources: list[dict[str, Any]] = []
     for source in right_sources:
         source_payload = dict(source)
         candidate_files = [DatasetFileShim(path) for path in source["files"]]
-        if not right_partition_key:
-            candidate_files = _select_partition_named_files(
-                candidate_files,
-                partition_value=partition_value,
-            )
         candidate_paths = {str(item.path) for item in candidate_files}
         left_on = list(source["left_on"])
         if (
@@ -1716,6 +1901,12 @@ def _select_right_sources_for_task(
                 if all(row[column] is not None for column in left_on)
             }
             partition_key = partition_value if right_partition_key else None
+            source_payload["staging_estimated_match_rows"] = sum(
+                key_match_counts.get(str(source["name"]), {}).get(
+                    (partition_key, key), 0
+                )
+                for key in wanted
+            )
             matching_spans: dict[str, set[int]] = {}
             for key in wanted:
                 for path, row_groups in (
@@ -1823,11 +2014,6 @@ def _build_0301_physical_plan(
         ]
         for source in task.payload["right_sources"]:
             files = [DatasetFileShim(path) for path in source["files"]]
-            if not right_partition_key:
-                files = _select_partition_named_files(
-                    files,
-                    partition_value=str(task.partition_value),
-                )
             spans.extend(
                 SourceSpan(
                     source_name=str(source["name"]),
@@ -2259,6 +2445,23 @@ def _summarize_bounded_join(task_results: list[TaskResult]) -> dict[str, Any]:
         ),
         "right_key_index_rows": _summarize_task_metric(enabled, "right_key_index_rows"),
         "right_key_index_reuses": _summarize_task_metric(enabled, "right_key_index_reuses"),
+        "right_arrow_staging": {
+            "staged_sources": _summarize_task_metric(enabled, "right_staging_sources"),
+            "skipped_sources": _summarize_task_metric(
+                enabled, "right_staging_skipped_sources"
+            ),
+            "input_rows": _summarize_task_metric(enabled, "right_staging_input_rows"),
+            "output_rows": _summarize_task_metric(enabled, "right_staging_output_rows"),
+            "peak_input_batch_rows": _summarize_task_metric(
+                enabled, "right_staging_peak_input_batch_rows"
+            ),
+            "peak_temporary_bytes": _summarize_task_metric(
+                enabled, "right_staging_peak_bytes"
+            ),
+            "write_sec": _summarize_task_counter(enabled, "right_staging_write_sec"),
+            "read_sec": _summarize_task_counter(enabled, "right_staging_read_sec"),
+            "filter_sec": _summarize_task_counter(enabled, "right_staging_filter_sec"),
+        },
         "join_key_representation": {
             "binary_row_sources": _summarize_task_metric(
                 enabled, "binary_row_key_sources"

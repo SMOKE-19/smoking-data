@@ -28,7 +28,11 @@ from .remote_manifest import (
     payload_sha256,
     utc_now,
 )
-from .sbdf_representation import BuiltSbdfRepresentation, build_sbdf_representation
+from .sbdf_representation import (
+    BuiltSbdfRepresentation,
+    build_existing_sbdf_representation,
+    build_sbdf_representation,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +55,6 @@ def publish_committed_dataset(
     asset_code: str,
     job_name: str,
     definition_sha256: str = "",
-    commit_kind: str = "snapshot_replace",
     target: ObjectStoreTarget | None = None,
     store_factory: Callable[[ObjectStoreTarget], ObjectStore] = S3ObjectStore,
 ) -> PublicationResult | None:
@@ -76,7 +79,6 @@ def publish_committed_dataset(
             asset_code=asset_code,
             job_name=job_name,
             definition_sha256=definition_sha256,
-            commit_kind=commit_kind,
             target=resolved_target,
             store=store,
             dataset_id=dataset_id,
@@ -94,7 +96,6 @@ def publish_committed_dataset(
                 "job_name": job_name,
                 "local_dataset_root": str(root),
                 "publication": publication.to_mapping(),
-                "commit_kind": commit_kind,
                 "definition_sha256": definition_sha256,
                 "error": {
                     "code": getattr(exc, "code", "remote.publication_failed"),
@@ -126,7 +127,6 @@ def _publish(
     asset_code: str,
     job_name: str,
     definition_sha256: str,
-    commit_kind: str,
     target: ObjectStoreTarget,
     store: ObjectStore,
     dataset_id: str,
@@ -143,8 +143,17 @@ def _publish(
     local_manifest, detected_commit_kind = _normalize_local_manifest(
         root, raw_local_manifest, manifest_path=manifest_path
     )
-    if detected_commit_kind is not None:
-        commit_kind = detected_commit_kind
+    local_artifact_format = str(
+        (local_manifest.get("context") or {}).get("artifact_format") or "parquet"
+    )
+    if local_artifact_format == "sbdf" and (
+        publication.parquet.enabled or not publication.sbdf.enabled
+    ):
+        raise SmokingDataError(
+            "An SBDF artifact can only publish the SBDF representation.",
+            code="remote.sbdf_only_publication_required",
+        )
+    commit_kind = detected_commit_kind or "snapshot_replace"
     generation_id = str(local_manifest.get("generation_id") or local_manifest.get("transaction_id") or "")
     if not generation_id:
         raise SmokingDataError(
@@ -185,6 +194,11 @@ def _publish(
         parquet_rows = 0
         parquet_files = 0
         for relative, local_path, role in snapshot_files:
+            if role in {"parquet_data", "sbdf_data"} and (
+                (role == "parquet_data" and not publication.parquet.enabled)
+                or role == "sbdf_data"
+            ):
+                continue
             remote_relative = (
                 f"data/{relative}" if role == "parquet_data" else f"provenance/{relative}"
             )
@@ -214,7 +228,7 @@ def _publish(
                 parquet_rows += int(part.get("rows") or 0)
 
         built_index: BuiltIndex | None = None
-        if publication.parquet.enabled:
+        if publication.parquet.enabled and local_artifact_format == "parquet":
             built_index = build_parquet_indexes(
                 snapshot,
                 Path(temporary) / "indexes" / "parquet",
@@ -246,15 +260,28 @@ def _publish(
 
         built_sbdf: BuiltSbdfRepresentation | None = None
         if publication.sbdf.enabled:
-            built_sbdf = build_sbdf_representation(
-                snapshot,
-                Path(temporary),
-                receipt_path.parent.parent / "publication-cache" / "sbdf",
-                generation_id=generation_id,
-                generation_prefix=generation_prefix,
-                parts=[item for item in local_manifest.get("parts", []) if isinstance(item, dict)],
-                spec=publication.sbdf,
-            )
+            sbdf_parts = [
+                item for item in local_manifest.get("parts", []) if isinstance(item, dict)
+            ]
+            if local_artifact_format == "sbdf":
+                built_sbdf = build_existing_sbdf_representation(
+                    snapshot,
+                    Path(temporary),
+                    generation_id=generation_id,
+                    generation_prefix=generation_prefix,
+                    parts=sbdf_parts,
+                    spec=publication.sbdf,
+                )
+            else:
+                built_sbdf = build_sbdf_representation(
+                    snapshot,
+                    Path(temporary),
+                    receipt_path.parent.parent / "publication-cache" / "sbdf",
+                    generation_id=generation_id,
+                    generation_prefix=generation_prefix,
+                    parts=sbdf_parts,
+                    spec=publication.sbdf,
+                )
             for item in built_sbdf.objects:
                 existed = store.head(item.object_key) is not None
                 metadata = store.put_immutable(
@@ -314,11 +341,14 @@ def _publish(
             local_manifest_sha256=local_manifest_sha256,
             definition_sha256=definition_sha256,
             schema_fingerprint=schema_fingerprint,
-            commit_kind=commit_kind,
             objects=objects,
             target_identity=target.safe_identity(),
             representations={
-                "parquet": {"enabled": True, "files": parquet_files, "rows": parquet_rows},
+                "parquet": {
+                    "enabled": publication.parquet.enabled and local_artifact_format == "parquet",
+                    "files": parquet_files,
+                    "rows": parquet_rows,
+                },
                 "sbdf": {
                     "enabled": built_sbdf is not None,
                     "files": len(built_sbdf.objects) if built_sbdf else 0,
@@ -344,7 +374,7 @@ def _publish(
                         "files": "smoking-data.remote-parquet-files.v1",
                         "row_groups": "smoking-data.remote-parquet-row-groups.v1",
                         "pages": "smoking-data.remote-parquet-pages.v1",
-                        "keys": "smoking-data.remote-parquet-keys.v1",
+                        "keys": "smoking-data.remote-parquet-keys.v2",
                     },
                     "counts": {
                         "files": built_index.files if built_index else 0,
@@ -355,6 +385,8 @@ def _publish(
                     "key_hash": publication.parquet.key_hash,
                     "key_columns": list(publication.parquet.key_columns),
                     "key_types": built_index.key_types if built_index else {},
+                    "planning_columns": list(publication.parquet.planning_columns),
+                    "planning_types": built_index.planning_types if built_index else {},
                     "hash_buckets": publication.parquet.hash_buckets,
                     "capabilities": {
                         "row_group": built_index is not None,
@@ -445,7 +477,6 @@ def _publish(
         "job_name": job_name,
         "local_dataset_root": str(root),
         "publication": publication.to_mapping(),
-        "commit_kind": commit_kind,
         "definition_sha256": definition_sha256,
         "generation_id": generation_id,
         "manifest_key": manifest_key,
@@ -475,7 +506,10 @@ def _snapshot_committed_dataset(
 ) -> list[tuple[str, Path, str]]:
     selected: list[tuple[str, Path, str]] = []
     entries: list[tuple[str, str]] = [
-        (str(item["relative_path"]), "parquet_data")
+        (
+            str(item["relative_path"]),
+            "sbdf_data" if str(item.get("format") or "") == "sbdf" else "parquet_data",
+        )
         for item in manifest.get("parts", [])
         if isinstance(item, dict) and item.get("relative_path")
     ]
@@ -544,7 +578,7 @@ def _stable_generation_created_at(
     data_mtimes = [
         path.stat().st_mtime
         for _, path, role in snapshot_files
-        if role == "parquet_data"
+        if role in {"parquet_data", "sbdf_data"}
     ]
     if not data_mtimes:
         return generation_id

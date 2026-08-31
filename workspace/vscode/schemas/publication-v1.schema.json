@@ -25,6 +25,7 @@
                 "level": {"enum": ["row_group", "page_if_available", "page_required", "key"]},
                 "writer_page_index": {"oneOf": [{"type": "boolean"}, {"enum": ["enabled", "disabled"]}]},
                 "key_columns": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+                "planning_columns": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
                 "key_null_policy": {"enum": ["error", "skip"]},
                 "key_hash": {"const": "sha256_trunc128_v1"},
                 "hash_buckets": {"enum": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]}

@@ -10,9 +10,7 @@ output:
   artifact:
     type: analysis_snapshot
     root_dir: f"{asset_data_root}/{job_name}"
-    format: parquet
-    compression: zstd
-    write_policy: atomic_replace
+    format: sbdf
     physical_layout:
       profile: analysis_snapshot_adaptive_v1
       adaptation_scope: task_adaptive

@@ -9,10 +9,15 @@ import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
 import smoking_data_engine_rs as engine
+from smoking_data import __version__ as package_version
 
 
-def test_python_package_version_matches_distribution_metadata() -> None:
-    assert engine.__version__ == version("smoking_data_engine_rs")
+def test_public_package_version_matches_distribution_metadata() -> None:
+    assert package_version == version("smoking-data")
+
+
+def test_native_engine_exposes_its_component_version() -> None:
+    assert engine.__version__ == "2.1.0"
 
 
 def test_validate_expression_ir_accepts_compiler_v1_contract() -> None:

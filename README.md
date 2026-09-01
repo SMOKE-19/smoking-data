@@ -1,6 +1,6 @@
 # smoking-data
 
-현재 엔진/API 릴리즈: `0.1.15` (Python 3.10–3.13, Linux/Windows wheel 제공)
+현재 엔진/API 릴리즈: `0.1.16` (Python 3.10–3.13 지원; 릴리스 자산은 로컬에서 빌드해 수동 첨부)
 
 Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 엔진/API 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
 Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서 관리한다. 작업공간 생성 원본과
@@ -8,8 +8,9 @@ Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서 관리한다
 `smoking-data-testkit`에 둔다. SBDF 변환은 중복 native 코드를 포함하지 않고 외부
 `smoking-sbdf` 패키지에 위임한다.
 
-CLI와 엔진은 하나의 `smoking-data` wheel에서 제공한다. SPI 환경 전용 작업공간 초기화는
-상위 작업 디렉터리의 독립 `smoking_data_cli_spi` 패키지에서 제공한다.
+일반 CLI와 엔진은 하나의 `smoking-data` wheel에서 제공한다. SPI 환경 전용 작업공간 초기화는
+상위 작업 디렉터리의 독립 `smoking_data_cli_spi` 패키지에서 제공하며, 엔진 저장소와 GitHub
+Release에는 포함하지 않는다.
 
 ## 목표 구조
 

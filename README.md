@@ -1,11 +1,11 @@
 # smoking-data
 
-현재 엔진/API 릴리즈: `0.1.14` (Python 3.10–3.13, Linux/Windows wheel 제공)
+현재 엔진/API 릴리즈: `0.1.15` (Python 3.10–3.13, Linux/Windows wheel 제공)
 
 Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 엔진/API 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
-Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서, 작업공간 원본은 저장소 루트
-`workspace/`에서 관리한다. `workspace/templates/`는 사용자용 Definition template 원본이며,
-운영 설정이나 회귀 테스트 fixture를 담지 않는다. SBDF 변환은 중복 native 코드를 포함하지 않고 외부
+Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서 관리한다. 작업공간 생성 원본과
+`init` 명령은 독립 `smoking_data_cli_spi` 패키지가 소유하고, 사람이 검토하는 완성 workspace는
+`smoking-data-testkit`에 둔다. SBDF 변환은 중복 native 코드를 포함하지 않고 외부
 `smoking-sbdf` 패키지에 위임한다.
 
 CLI와 엔진은 하나의 `smoking-data` wheel에서 제공한다. SPI 환경 전용 작업공간 초기화는
@@ -20,7 +20,7 @@ CLI와 엔진은 하나의 `smoking-data` wheel에서 제공한다. SPI 환경 �
   `0301` Join, `0401` Snapshot Asset 계층
 - 각 계층에 붙였다 뗄 수 있는 범용 operation
 - Engine이 Asset Chain 검증·실행과 dataset-local provenance 계약 소유
-- 설치 후 `init`으로 YAML 편집 환경, LLM 진단 지침·sandbox, 0101 adapter와 Asset별 기본 config 생성
+- 별도 workspace CLI의 `init`으로 YAML 편집 환경, LLM 진단 지침·sandbox와 Asset별 config 생성
 - 0101~0301 Parquet 및 0401 단일 SBDF atomic artifact; 선택적으로 S3 immutable generation과 random-access sidecar 게시
 
 0103 출력 행에는 `file_name`(상대경로)과 함께 소스 파일의 UTC
@@ -41,9 +41,9 @@ uv run smoking-data --help
 주요 명령은 다음과 같다.
 
 ```bash
-# YAML schema·snippet, schedules, Source adapter와 Asset별 config 생성
-uv run smoking-data init .
-uv run smoking-data update templates .
+# 별도 CLI에서 YAML schema·snippet, schedules와 Asset별 config 생성
+uv run --project ../smoking_data_cli_spi smoking-data-cli-spi init .
+uv run --project ../smoking_data_cli_spi smoking-data-cli-spi update templates .
 
 # 공통 Asset/Chain 실행·검증 (YAML 종류 자동 판별)
 uv run smoking-data validate templates/0201.pipeline_curated_pivot.0201.yaml --json
@@ -80,7 +80,7 @@ uv run smoking-data layout migrate \
   templates/migrations/0101.physical_layout.layout-migration.yaml --json
 ```
 
-`init .`은 `templates/`와 `schedules/`를 생성한다. `templates/`는 Asset·Chain 계약을 설명하는
+workspace CLI의 `init .`은 `templates/`와 `schedules/`를 생성한다. `templates/`는 Asset·Chain 계약을 설명하는
 Definition template이며, 실제 회귀 테스트 fixture는 별도 testkit에서 관리한다. `--force`로
 갱신할 때 기존 init 관리 생성물은 압축하지 않고 `.history/YYMMDD_HHMMSS/` 아래에 함께
 백업한다. `DATA`와 `.temp` 운영 데이터는 백업하지 않는다.
@@ -89,8 +89,7 @@ GDELT bulk 예제는 작은 `lastupdate.txt`를 우선 조회하고 실제로 �
 전체 masterfile을 스트리밍 스캔한다. 선택 파일의 byte 크기와 MD5를 검증한 뒤 헤더 없는 TSV에
 61개 컬럼명을 부여하고 0103→0201→0301→0401 체인으로 게시한다. 현재 예제의 범위는 최신 파일 한 개다.
 
-wheel은 다음 명령으로 빌드한다. 저장소 루트 `workspace/`의 원본 리소스는 빌드 과정에서 wheel 내부
-`smoking_data/_workspace/`로 함께 복사된다.
+엔진 wheel은 작업공간 원본을 포함하지 않고 실행에 필요한 최소 기본 config만 포함한다.
 
 ```bash
 uv build --wheel
@@ -102,7 +101,7 @@ Asset Definition 파일은 `정렬키.설명.계약종류.yaml` 형식을 사용
 모든 Asset Definition은 최상위 `yaml` 헤더에 `schema_version`과 `asset_code`를 함께 선언한다. Chain은
 같은 헤더에 `schema_version`만 선언한다.
 
-`init`은 공통 `.smoking-data/config.yaml`과 지원 Asset별 `config.yaml`을 생성하고,
+`smoking-data-cli-spi init`은 공통 `.smoking-data/config.yaml`과 지원 Asset별 `config.yaml`을 생성하고,
 작업공간 안의 기본 실행 디렉터리인 `DATA`, `.temp`, `.temp/metadata`, `.temp/logs`도 준비한다.
 또한 사용자용 `templates/`와 비활성 상태의 `schedules/` 예약 실행 템플릿을 생성한다.
 `--force`는 기본값이 아니며, 지정한 경우에만 기존 `.vscode`, `.smoking-data`, `.agent`,
@@ -117,7 +116,7 @@ LLM 진단을 위해 루트 `AGENTS.md`, 패키지 관리 `.agent/smoking-data/`
 Asset별 생성물 기본값인 `output`은 불필요한 래퍼 없이 config 최상위에 둔다.
 설정은 `번들 공통 < 번들 Asset < 작업공간 공통 < 작업공간 Asset < 개별 Definition`
 순서로 재귀 병합한다. 저장소에서 init 리소스를 수정할 때는
-저장소 루트의 [`workspace`](workspace/README.md)를 단일 원본으로 사용한다. `vscode`,
+`smoking_data_cli_spi/src/smoking_data_cli_spi/_workspace`를 단일 원본으로 사용한다. `vscode`,
 `smoking_data`, `templates`, `schedules`가 각각 `.smoking-data`, `templates`,
 `schedules`로 대응한다.
 자동완성 prefix, 파일명 규칙과 검증·실행 명령은 init이 생성하는 `.smoking-data/HELP.md`에서 바로
@@ -148,8 +147,8 @@ dataset의 `_smoking_data/`에 저장된다. `_dataset.manifest.json`은 이 파
 ## 디렉터리
 
 ```text
-workspace/            init 원본 리소스와 예시
 src/smoking_data/
+  _config/           엔진 실행에 필요한 최소 기본 config
   assets/
     a0101_source/    Source Dataset 생산
     a0102_calculated_fact/
@@ -163,8 +162,6 @@ src/smoking_data/
   migrations/        기존 dataset의 bounded-memory 물리 레이아웃 재작성
   runtime/           실행·transaction·metadata·chain·내부 Parquet probe
                      읽기 전용 dataset/failure/missing/profile inspector
-  workspace_init/    init CLI 내부 Python 구현
-  workspace_resources.py  개발 원본과 wheel 리소스 탐색
 native/              Rust/PyO3 실행 kernel
 schemas/             공개 YAML JSON Schema 원본
 docs/               공개 저장소에는 포함하지 않는 프로젝트 문서 영역
@@ -173,8 +170,8 @@ docs/               공개 저장소에는 포함하지 않는 프로젝트 문�
 Python 모듈은 숫자로 시작할 수 없으므로 Asset code 앞에 공통 접두사 `a`를 붙인다. 그 뒤에는
 `code_description` 순서를 사용한다.
 
-문서와 testkit은 제품 소스 저장소와 분리 관리한다. 공개 소스 배포본에는 실행에 필요한
-코드·schema·workspace resource만 포함한다.
+문서, workspace fixture와 testkit은 제품 소스 저장소와 분리 관리한다. 공개 엔진 배포본에는
+실행 코드·schema·최소 기본 config만 포함한다.
 
 ## SBDF 백엔드
 

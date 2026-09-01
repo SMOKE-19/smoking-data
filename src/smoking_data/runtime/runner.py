@@ -641,13 +641,10 @@ def main(argv: list[str] | None = None) -> int:
         ["publication"],
         ["pwq"],
         ["inspect"],
-        ["update"],
     ]:
         if len(argv) == 1 or argv[1:2] in [["-h"], ["--help"]]:
             _print_cli_help(argv[0])
             return 0
-    if argv and argv[0] == "init":
-        return _main_init(argv[1:])
     if argv and argv[0] == "source":
         return _main_source(argv[1:])
     if argv and argv[0] == "run":
@@ -660,8 +657,6 @@ def main(argv: list[str] | None = None) -> int:
         return _main_compare(argv[1:])
     if argv and argv[0] == "fixture":
         return _main_fixture(argv[1:])
-    if argv[:2] == ["update", "templates"]:
-        return _main_update_templates(argv[2:])
     if argv and argv[0] == "parquet-schema":
         return _main_parquet_schema(argv[1:])
     if argv[:2] == ["pwq", "advise"]:
@@ -871,7 +866,6 @@ def _main_run(argv: list[str]) -> int:
 
 
 _CLI_COMMANDS: dict[str, tuple[str, ...]] = {
-    "init": ("Initialize a workspace",),
     "source": ("Run a 0101 Source Definition",),
     "run": ("Run an Asset Definition or Chain",),
     "validate": ("Validate an Asset Definition or Chain",),
@@ -888,7 +882,6 @@ _CLI_COMMANDS: dict[str, tuple[str, ...]] = {
     "schedule": ("Validate or tick schedules",),
     "inspect": ("Inspect datasets and metadata",),
     "pwq": ("Advise or benchmark pipeline write quality",),
-    "update": ("Update initialized workspace resources",),
 }
 
 _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
@@ -916,7 +909,6 @@ _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
         "pwq advise PIPELINE.yaml",
         "pwq benchmark-dummy --root ROOT",
     ),
-    "update": ("update templates [TARGET] [--json]",),
     "inspect": (
         "inspect dataset PATH",
         "inspect failure PATH",
@@ -946,160 +938,6 @@ def _looks_like_definition_path(value: str) -> bool:
     path = Path(value).expanduser()
     return path.exists() or path.suffix.casefold() in {".yaml", ".yml"}
 
-
-def _main_update_templates(argv: list[str]) -> int:
-    from smoking_data.workspace_init import backup_paths, initialize_workspace_templates
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Update workspace templates from the installed smoking-data package. "
-            "Existing templates are backed up before replacement."
-        )
-    )
-    parser.add_argument("target", nargs="?", default=".", help="Workspace root.")
-    parser.add_argument("--json", action="store_true", help="Print a JSON result.")
-    args = parser.parse_args(argv)
-    try:
-        history = backup_paths(args.target, names=("templates",))
-        templates = initialize_workspace_templates(args.target, force=True)
-        payload = {
-            "ok": True,
-            "command": "update templates",
-            "workspace_root": str(Path(args.target).expanduser().resolve()),
-            "templates": templates,
-            "history": history,
-        }
-    except (OSError, TypeError, ValueError) as exc:
-        payload = {
-            "ok": False,
-            "command": "update templates",
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-        }
-    if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    elif payload["ok"]:
-        print(
-            "[smoking-data] templates updated: "
-            f"created={len(payload['templates']['created'])} "
-            f"replaced={len(payload['templates']['preserved'])} "
-            f"history={payload['history']['history_root']}"
-        )
-    else:
-        print(f"[smoking-data] template update failed: {payload['error']}")
-    return 0 if payload["ok"] else 1
-
-
-def _main_init(argv: list[str]) -> int:
-    from smoking_data.workspace_init import (
-        backup_init_outputs,
-        initialize_agent_workspace,
-        initialize_asset_configs,
-        initialize_cast_types,
-        initialize_help,
-        initialize_runtime_directories,
-        initialize_schedule_templates,
-        initialize_workspace,
-        initialize_workspace_templates,
-    )
-    from smoking_data.workspace_init.config_initializer import initialize_runtime_config
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Initialize YAML authoring, per-Asset configs, "
-            "and workspace runtime directories."
-        )
-    )
-    parser.add_argument("target", nargs="?", default=".")
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help=(
-            "Replace files managed by init, including templates, schedules, Asset configs, "
-            "HELP.md, and agent guidance. User runtime data, object-store settings, "
-            "AGENTS.md, and .agent/local are preserved."
-        ),
-    )
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
-    try:
-        history = (
-            backup_init_outputs(args.target)
-            if args.force
-            else {"history_root": None, "backed_up": []}
-        )
-        workspace = initialize_workspace(args.target)
-        adapter = initialize_runtime_config(args.target)
-        asset_configs = initialize_asset_configs(args.target, force=args.force)
-        runtime_directories = initialize_runtime_directories(args.target)
-        templates = initialize_workspace_templates(args.target, force=args.force)
-        schedule_templates = initialize_schedule_templates(args.target, force=args.force)
-        help_document = initialize_help(args.target, force=args.force)
-        cast_types_document = initialize_cast_types(args.target, force=args.force)
-        agent_workspace = initialize_agent_workspace(args.target)
-        payload = {
-            "ok": True,
-            "workspace": workspace,
-            "adapter": adapter,
-            "asset_configs": asset_configs,
-            "runtime_directories": runtime_directories,
-            "templates": templates,
-            "schedule_templates": schedule_templates,
-            "help": help_document,
-            "cast_types": cast_types_document,
-            "agent_workspace": agent_workspace,
-            "force": args.force,
-            "history": history,
-        }
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
-    if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    elif payload["ok"]:
-        print(f"[smoking-data] workspace initialized: {payload['workspace']['vscode_dir']}")
-        print(
-            "[smoking-data] source adapter: "
-            f"{payload['adapter'].get('managed_by', 'installed adapter package')}"
-        )
-        print(
-            "[smoking-data] Asset configs: "
-            f"created={len(payload['asset_configs']['created'])} "
-            f"preserved={len(payload['asset_configs']['preserved'])}"
-        )
-        print(
-            "[smoking-data] runtime directories: "
-            f"created={len(payload['runtime_directories']['created'])} "
-            f"preserved={len(payload['runtime_directories']['preserved'])} "
-            "skipped_outside_workspace="
-            f"{len(payload['runtime_directories']['skipped_outside_workspace'])}"
-        )
-        print(
-            "[smoking-data] templates: "
-            f"created={len(payload['templates']['created'])} "
-            f"preserved={len(payload['templates']['preserved'])}"
-        )
-        print(
-            "[smoking-data] schedule templates: "
-            f"created={len(payload['schedule_templates']['created'])} "
-            f"preserved={len(payload['schedule_templates']['preserved'])}"
-        )
-        print(f"[smoking-data] help: {payload['help']['help_path']}")
-        print(
-            "[smoking-data] Agent workspace: "
-            f"root={payload['agent_workspace']['agent_root']} "
-            f"sandbox={payload['agent_workspace']['sandbox_root']} "
-            "entrypoint_action="
-            f"{payload['agent_workspace']['agents_entrypoint_action']}"
-        )
-        if payload["agent_workspace"]["manual_link_required"]:
-            print(
-                "[smoking-data] AGENTS.md에 Agent 지침을 연결하지 못했습니다. "
-                f"reason={payload['agent_workspace']['agents_entrypoint_reason']}; "
-                ".agent/README.md 링크를 수동으로 추가하세요."
-            )
-    else:
-        print(f"[smoking-data] init failed: {payload['error']}")
-    return 0 if payload["ok"] else 1
 
 
 def _main_publication_inspect(argv: list[str]) -> int:

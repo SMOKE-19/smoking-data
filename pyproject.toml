@@ -51,11 +51,7 @@ include = [
 
 [tool.setuptools.package-data]
 smoking_data = [
-    "assets/contract.yaml",
-    "assets/a0101_source/contract.yaml",
-    "assets/a0201_curated/contract.yaml",
-    "assets/a0301_join/contract.yaml",
-    "assets/a0401_snapshot/contract.yaml",
+    "_config/**/*.yaml",
 ]
 smoking_data_engine_rs = ["*.pyi", "py.typed"]
 spotfire_expr_normalizer = ["data/*.sqlite", "data/*.md"]

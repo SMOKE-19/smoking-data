@@ -3,22 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from smoking_data.workspace_resources import workspace_text
-
 ASSET_CONFIG_SCHEMA_VERSION = "smoking-data.asset-config.v3"
-COMMON_CONFIG_RESOURCE = "smoking_data/config.yaml"
+COMMON_CONFIG_RESOURCE = "_config/config.yaml"
 ASSET_CONFIG_RESOURCES = {
-    "0101": "smoking_data/assets/0101/config.yaml",
-    "0102": "smoking_data/assets/0102/config.yaml",
-    "0103": "smoking_data/assets/0103/config.yaml",
-    "0201": "smoking_data/assets/0201/config.yaml",
-    "0301": "smoking_data/assets/0301/config.yaml",
-    "0401": "smoking_data/assets/0401/config.yaml",
+    "0101": "_config/assets/0101/config.yaml",
+    "0102": "_config/assets/0102/config.yaml",
+    "0103": "_config/assets/0103/config.yaml",
+    "0201": "_config/assets/0201/config.yaml",
+    "0301": "_config/assets/0301/config.yaml",
+    "0401": "_config/assets/0401/config.yaml",
 }
 
 
@@ -231,7 +230,10 @@ def _read_config_text(
 
 
 def _resource_text(relative: str) -> str:
-    return workspace_text(*relative.split("/"))
+    node = resources.files("smoking_data")
+    for part in relative.split("/"):
+        node = node.joinpath(part)
+    return node.read_text(encoding="utf-8")
 
 
 def _require_asset_code(asset_code: str) -> str:

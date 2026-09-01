@@ -1,186 +1,173 @@
 # smoking-data
 
-현재 엔진/API 릴리즈: `0.1.16` (Python 3.10–3.13 지원; 릴리스 자산은 로컬에서 빌드해 수동 첨부)
+`smoking-data`는 고카디널리티 데이터셋을 제한된 메모리에서 수집·변환·선별·조인·게시하는
+Asset 지향 데이터 처리 엔진이다. Python 실행 계층과 Rust/PyO3 커널을 하나의 패키지로 제공하며,
+YAML Definition을 검증하고 실행 계획과 재현 가능한 데이터셋 산출물을 생성한다.
 
-Source 0101·CSV Source 0103과 Engine을 하나의 `smoking-data` 엔진/API 배포 패키지로 통합한 Asset 생산 엔진이다. Python 실행기,
-Rust/PyO3 Engine kernel, YAML 계약과 Asset Chain은 `src/`에서 관리한다. 작업공간 생성 원본과
-`init` 명령은 독립 `smoking_data_cli_spi` 패키지가 소유하고, 사람이 검토하는 완성 workspace는
-`smoking-data-testkit`에 둔다. SBDF 변환은 중복 native 코드를 포함하지 않고 외부
-`smoking-sbdf` 패키지에 위임한다.
+현재 엔진/API 버전은 `0.1.16`이며 Python 3.10 이상 3.14 미만을 지원한다.
 
-일반 CLI와 엔진은 하나의 `smoking-data` wheel에서 제공한다. SPI 환경 전용 작업공간 초기화는
-상위 작업 디렉터리의 독립 `smoking_data_cli_spi` 패키지에서 제공하며, 엔진 저장소와 GitHub
-Release에는 포함하지 않는다.
+## 주요 기능
 
-## 목표 구조
+- Parquet footer와 sidecar를 이용한 파일·row group·row coordinate 선택 읽기
+- 제한된 메모리 예산을 반영하는 task 분할과 bounded execution
+- Parquet 및 SBDF 데이터셋 생성과 atomic commit
+- 로컬 파일시스템과 S3 호환 object storage의 선택적 동기화·게시
+- 실행 Definition, manifest, checksum, 실패 원인과 profile metadata 기록
+- Asset Chain의 의존성 검증, 위상 정렬과 순차 실행
+- YAML 마이그레이션, 제한 task smoke run, 데이터셋 읽기 전용 진단
+- 설치된 엔진의 Asset·operation·expression capability를 반환하는 API와 CLI
 
-- `smoking-data` 엔진/API/CLI 통합 WHL과 선택적인 독립 SPI 초기화 WHL
-- `0101` SQL SPI·HTTP JSON/NDJSON/XML Source Dataset과 자동 Physical Probe, `0102` Calculated Fact,
-  `0103` 로컬·HTTP CSV/TSV/ZIP Source,
-  `0201` Curated,
-  `0301` Join, `0401` Snapshot Asset 계층
-- 각 계층에 붙였다 뗄 수 있는 범용 operation
-- Engine이 Asset Chain 검증·실행과 dataset-local provenance 계약 소유
-- 별도 workspace CLI의 `init`으로 YAML 편집 환경, LLM 진단 지침·sandbox와 Asset별 config 생성
-- 0101~0301 Parquet 및 0401 단일 SBDF atomic artifact; 선택적으로 S3 immutable generation과 random-access sidecar 게시
+## Asset 계층
 
-0103 출력 행에는 `file_name`(상대경로)과 함께 소스 파일의 UTC
-`source_modified_at`이 기록된다. 파일시스템이 생성 시각을 제공하는 환경에서는
-`source_created_at`도 기록하며, Linux/POSIX처럼 생성 시각을 안정적으로 조회할 수
-없는 환경에서는 해당 값이 null이다.
+| Asset | 역할 | 기본 산출물 |
+| --- | --- | --- |
+| `0101` | HTTP JSON·NDJSON·XML 및 등록된 Source adapter를 통한 원천 데이터 수집 | Parquet Source Dataset |
+| `0102` | upstream 칼럼을 이용한 schema-aware 계산 칼럼 생성 | Parquet Calculated Fact |
+| `0103` | 로컬·HTTP CSV/TSV/ZIP cast, unpivot, route 처리 | Parquet Source Dataset |
+| `0201` | row selection, cast, list restore, pivot 등 정제 pipeline | Parquet Curated Dataset |
+| `0301` | 여러 upstream의 keyspace 구성과 coordinate 기반 join | Parquet Join Dataset |
+| `0401` | filter, unnest/explode와 단일 분석 snapshot 생성 | SBDF Snapshot |
 
-## 개발 환경
+0103은 각 출력 행에 원본 상대경로인 `file_name`과 UTC `source_modified_at`을 기록한다.
+파일시스템이 생성 시각을 제공하면 `source_created_at`도 기록하며, 안정적으로 조회할 수 없는
+환경에서는 null을 사용한다.
+
+## 실행 모델
+
+Definition은 최상위 `yaml.schema_version`과 Asset의 `yaml.asset_code`를 선언한다. 엔진은 실행 전에
+계약을 검증하고 논리 graph를 구성한 뒤 physical task로 낮춘다. `build_sidecar` 단계는 Parquet
+metadata와 필요한 coordinate를 수집하고, 후속 materialize 단계는 계획에 포함된 파일과 행만 읽는다.
+
+실행 성공 시 데이터셋에는 다음 추적 정보를 함께 기록한다.
+
+- 실행 Definition 원본과 SHA-256
+- dataset manifest와 artifact descriptor
+- 입력·출력 파일 및 sidecar 관계
+- 실행 계획, row count와 schema 정보
+- 실패·skip·missing dependency를 포함한 구조화 metadata
+
+0101부터 0301까지는 Parquet를 기본 산출물로 사용하고, 0401은 SBDF snapshot을 기본으로 사용한다.
+출력은 임시 경로에 완성한 뒤 최종 경로로 교체하여 불완전한 dataset 노출을 방지한다.
+
+## 설치
+
+릴리스 wheel을 받은 경우 해당 파일을 직접 설치한다.
+
+```bash
+python -m pip install ./smoking_data-0.1.16-cp313-cp313-linux_x86_64.whl \
+  --find-links https://github.com/SMOKE-19/smoking-sbdf/releases/expanded_assets/v0.1.6
+```
+
+소스에서 개발 환경을 구성하려면 Rust toolchain과 `uv`가 필요하다.
 
 ```bash
 uv sync
-uv run ruff check .
 uv run smoking-data --help
 ```
 
-제품의 통합·회귀 테스트는 제품 코드와 분리된 `smoking-data-testkit` 저장소에서 실행한다.
+## CLI
 
-주요 명령은 다음과 같다.
-
-```bash
-# 별도 CLI에서 YAML schema·snippet, schedules와 Asset별 config 생성
-uv run --project ../smoking_data_cli_spi smoking-data-cli-spi init .
-uv run --project ../smoking_data_cli_spi smoking-data-cli-spi update templates .
-
-# 공통 Asset/Chain 실행·검증 (YAML 종류 자동 판별)
-uv run smoking-data validate templates/0201.pipeline_curated_pivot.0201.yaml --json
-uv run smoking-data validate templates/chain.0101_to_0401_asset_chain.chain.yaml --json
-uv run smoking-data run templates/0101.source.0101.yaml --json
-uv run smoking-data run templates/0101.gdelt_doc_articles.0101.yaml --json
-uv run smoking-data run templates/0102.calculated_list_facts.0102.yaml --json
-uv run smoking-data run templates/0103.csv_unpivot_source.0103.yaml --json
-uv run smoking-data validate templates/0101.http_ndjson.0101.yaml --json
-uv run smoking-data validate templates/0101.http_xml.0101.yaml --json
-uv run smoking-data validate templates/0103.http_zip_unpivot_source.0103.yaml --json
-uv run smoking-data validate templates/chain.gdelt_0103_to_0401.chain.yaml --json
-uv run smoking-data run templates/0201.pipeline_curated_pivot.0201.yaml --json
-uv run smoking-data run templates/chain.0101_to_0401_asset_chain.chain.yaml --json
-uv run smoking-data run templates/chain.gdelt_0103_to_0401.chain.yaml --trigger-type chain --json
-
-# dataset·실패·missing dependency·profile 읽기 전용 진단
-uv run smoking-data inspect dataset DATA/0103/csv_unpivot_source --project-root . --json
-uv run smoking-data inspect failure DATA/0201/curated/_smoking_data/metadata.json --project-root . --json
-uv run smoking-data inspect missing DATA/0102/calculated_fact --project-root . --json
-uv run smoking-data inspect profile DATA/0201/curated/_smoking_data/metadata.json --project-root . --json
-
-# 기존 명령 호환
-uv run smoking-data source templates/0101.source.0101.yaml --json
-uv run smoking-data templates/0201.pipeline_curated_pivot.0201.yaml --json
-uv run smoking-data chain validate templates/chain.0101_to_0401_asset_chain.chain.yaml --json
-uv run smoking-data chain run templates/chain.0101_to_0401_asset_chain.chain.yaml --json
-
-# 후행 실행 이력으로 실행 가능한 물리 레이아웃 권고 YAML 생성
-uv run smoking-data layout report 0101.yaml 0201.yaml --json
-
-# migration YAML의 execution.mode는 최초 dry_run으로 검토한다.
-uv run smoking-data layout migrate \
-  templates/migrations/0101.physical_layout.layout-migration.yaml --json
-```
-
-workspace CLI의 `init .`은 `templates/`와 `schedules/`를 생성한다. `templates/`는 Asset·Chain 계약을 설명하는
-Definition template이며, 실제 회귀 테스트 fixture는 별도 testkit에서 관리한다. `--force`로
-갱신할 때 기존 init 관리 생성물은 압축하지 않고 `.history/YYMMDD_HHMMSS/` 아래에 함께
-백업한다. `DATA`와 `.temp` 운영 데이터는 백업하지 않는다.
-GDELT bulk 예제는 작은 `lastupdate.txt`를 우선 조회하고 실제로 게시된 최신 Events ZIP을 선택한다.
-최신 슬롯이 아직 미게시 상태면 이전 성공 파일을 재사용하고, 이력이 없는 최초 실행·복구 상황에서만
-전체 masterfile을 스트리밍 스캔한다. 선택 파일의 byte 크기와 MD5를 검증한 뒤 헤더 없는 TSV에
-61개 컬럼명을 부여하고 0103→0201→0301→0401 체인으로 게시한다. 현재 예제의 범위는 최신 파일 한 개다.
-
-엔진 wheel은 작업공간 원본을 포함하지 않고 실행에 필요한 최소 기본 config만 포함한다.
+가장 일반적인 진입점은 `validate`, `run`, `capabilities`다.
 
 ```bash
-uv build --wheel
+# 실행 없이 Definition 계약 검증
+smoking-data validate definitions/job.0201.yaml --json
+
+# Asset 또는 Chain 실행
+smoking-data run definitions/job.0201.yaml --project-root . --json
+
+# 설치된 엔진 capability 확인
+smoking-data capabilities --json
 ```
 
-Asset Definition 파일은 `정렬키.설명.계약종류.yaml` 형식을 사용한다. 예를 들어
-`0201.pipeline_curated_pivot.0201.yaml`은 앞의 `0201`로 정렬하고 마지막 `.0201.yaml`로
-편집기 스키마를 선택한다. Chain은 `chain.설명.chain.yaml` 형식을 사용한다.
-모든 Asset Definition은 최상위 `yaml` 헤더에 `schema_version`과 `asset_code`를 함께 선언한다. Chain은
-같은 헤더에 `schema_version`만 선언한다.
+주요 보조 명령은 다음과 같다.
 
-`smoking-data-cli-spi init`은 공통 `.smoking-data/config.yaml`과 지원 Asset별 `config.yaml`을 생성하고,
-작업공간 안의 기본 실행 디렉터리인 `DATA`, `.temp`, `.temp/metadata`, `.temp/logs`도 준비한다.
-또한 사용자용 `templates/`와 비활성 상태의 `schedules/` 예약 실행 템플릿을 생성한다.
-`--force`는 기본값이 아니며, 지정한 경우에만 기존 `.vscode`, `.smoking-data`, `.agent`,
-`for_agents`, `schedules`, `AGENTS.md`, `templates/`를 동일한 history snapshot에 보관한다.
-LLM 진단을 위해 루트 `AGENTS.md`, 패키지 관리 `.agent/smoking-data/`, 사용자 관리
-`.agent/local/CONTEXT.md`도 생성한다. 임시 Python 탐색 코드는 `for_agents/scripts/`, JSON·CSV·보고서는
-`for_agents/output/`에만 저장하며 `for_agents/.gitignore`가 sandbox 전체를 Git에서 제외한다.
-기존 루트 `AGENTS.md`가 있으면 본문을 보존하고 Smoking Data 관리 블록만 자동 추가·갱신한다.
-`.agent` 링크가 이미 있는 문서는 변경하지 않는다. local context는 보존하고 패키지 관리 지침은 init
-재실행 시 최신화한다.
-각 config는 재귀 경로 `paths`, 런타임 `execution`, 공통 불변 조건을 담는 `contract`를 함께 소유한다.
-Asset별 생성물 기본값인 `output`은 불필요한 래퍼 없이 config 최상위에 둔다.
-설정은 `번들 공통 < 번들 Asset < 작업공간 공통 < 작업공간 Asset < 개별 Definition`
-순서로 재귀 병합한다. 저장소에서 init 리소스를 수정할 때는
-`smoking_data_cli_spi/src/smoking_data_cli_spi/_workspace`를 단일 원본으로 사용한다. `vscode`,
-`smoking_data`, `templates`, `schedules`가 각각 `.smoking-data`, `templates`,
-`schedules`로 대응한다.
-자동완성 prefix, 파일명 규칙과 검증·실행 명령은 init이 생성하는 `.smoking-data/HELP.md`에서 바로
-확인할 수 있으며, 이미 존재하는 도움말은 덮어쓰지 않는다.
+```text
+inspect       dataset, failure, missing dependency, profile 조회
+migrate       기존 Definition·Parquet 입력·Chain 마이그레이션
+smoke         일부 task만 실행하는 bounded smoke test
+layout        물리 레이아웃 분석과 마이그레이션
+publication   object storage 게시 상태 조회·재시도·정리
+chain         Asset Chain 검증과 실행
+parquet-schema
+              Parquet footer schema 조회
+pwq           pipeline write quality 권고
+```
 
-init은 `.smoking-data/object-stores.yaml` 예시도 생성한다. AWS credential은 이 파일에 기록하지
-않고 Linux `~/.aws` 또는 Windows `%USERPROFILE%\.aws`의 target별 shared profile을 사용한다. S3
-게시 계약과 `publication inspect`·`publication retry`·dry-run 기본 `publication gc` 명령은
-`.smoking-data/HELP.md`를 참고한다.
+각 명령의 세부 계약은 CLI help에서 확인한다.
 
-설치된 adapter가 홈 경로의 토큰 파일을 직접 확인하는 API라면 0101 Definition의
-`source.api_request.adapter_options.pre_query_script`에 프로젝트 루트 기준 `.py` 경로를 지정할
-수 있다. 스크립트는 실행당 한 번, adapter query 전에 별도 Python 프로세스로 실행된다.
-Smoking Data 코어는 스크립트의 토큰 값과 출력 스트림을 읽거나 metadata에 기록하지 않으며,
-스크립트가 실패하면 데이터 query를 시작하지 않는다.
+```bash
+smoking-data migrate --help
+smoking-data publication --help
+smoking-data inspect --help
+```
 
-0101의 SQL 기반 Source adapter 구현과 기본 query 옵션은 별도 설치 패키지인
-`smoking-data-spi`가 소유한다. 해당 adapter의 기본 Parquet writer 옵션은 adapter 패키지에서
-제공하고, Definition의 `output.artifact.parquet_writer`가 같은 키를 지정하면 Asset 값이
-최종 override한다. adapter별 실행 옵션은 Definition의 `source.api_request.adapter_options`에서
-관리한다. HTTP 기반 Source는 코어 런타임이 직접 처리한다.
+## Python API
 
-Asset 성공 결과의 `metadata.json`, 원본 `definition.yaml`, 실제 0101 `query.sql`과 실행 계획은 게시된
-dataset의 `_smoking_data/`에 저장된다. `_dataset.manifest.json`은 이 파일들의 checksum도 검증한다.
-실행 log와 Chain orchestration receipt만 공통 임시 경로에 분리한다. 이 구조는 브레이킹 컷오버이며
-구형 외부 metadata 및 SQL template 출력 계약을 읽지 않는다.
+검증 API는 pipeline을 실행하거나 registry 상태를 변경하지 않고 구조화된 결과를 반환한다.
 
-## 디렉터리
+```python
+from smoking_data import get_capabilities, validate_definition
+
+result = validate_definition(
+    "definitions/job.0201.yaml",
+    project_root=".",
+)
+
+if not result.ok:
+    print(result.error_code, result.error_message)
+
+capabilities = get_capabilities()
+print(capabilities["asset_schemas"])
+```
+
+`ValidationResult`에는 Definition 종류, schema version, Asset code, job name, YAML·graph SHA-256과
+구조화된 오류 정보가 포함된다. `get_capabilities()`는 파일을 읽거나 pipeline을 실행하지 않는
+독립 introspection API다.
+
+## Object storage와 random access
+
+publication 계약을 설정하면 dataset artifact와 sidecar, manifest를 S3 호환 저장소에 immutable
+generation으로 게시할 수 있다. 후속 실행은 remote manifest와 sidecar를 먼저 읽어 필요한 object
+range만 내려받으며, 전체 Parquet 동기화를 기본 전제로 삼지 않는다.
+
+AWS credential은 Definition에 저장하지 않는다. 런타임은 운영체제의 AWS shared credentials와
+명시된 profile을 사용한다. 게시 상태는 다음 명령으로 확인한다.
+
+```bash
+smoking-data publication inspect --help
+smoking-data publication retry --help
+smoking-data publication gc --help
+```
+
+## 코드 구조
 
 ```text
 src/smoking_data/
-  _config/           엔진 실행에 필요한 최소 기본 config
-  assets/
-    a0101_source/    Source Dataset 생산
-    a0102_calculated_fact/
-                       schema-aware Calculated Fact 생산
-    a0103_csv_source/  CSV cast·unpivot·route Source Dataset 생산
-    a0201_curated/   정리된 partition dataset 생산
-    a0301_join/      join dataset 생산
-    a0401_snapshot/  분석 snapshot 생산
-  ops/               범용 operation
-  core/              논리·물리 계약
-  migrations/        기존 dataset의 bounded-memory 물리 레이아웃 재작성
-  runtime/           실행·transaction·metadata·chain·내부 Parquet probe
-                     읽기 전용 dataset/failure/missing/profile inspector
-native/              Rust/PyO3 실행 kernel
-schemas/             공개 YAML JSON Schema 원본
-docs/               공개 저장소에는 포함하지 않는 프로젝트 문서 영역
+  _config/             엔진 기본 설정
+  assets/              0101~0401 Asset 실행 계층
+  ops/                 재사용 가능한 데이터 operation
+  planners/            sidecar·task·memory 계획
+  core/                pipeline, graph, result와 engine 계약
+  runtime/             실행, metadata, transaction, publication
+  migrations/          Definition·물리 레이아웃 마이그레이션
+src/smoking_data_engine_rs/
+                       Rust/PyO3 커널 Python binding
+native/engine/         Arrow·Parquet 기반 native 실행 커널
+schemas/               공개 YAML JSON Schema
 ```
 
-Python 모듈은 숫자로 시작할 수 없으므로 Asset code 앞에 공통 접두사 `a`를 붙인다. 그 뒤에는
-`code_description` 순서를 사용한다.
+Python 모듈명은 숫자로 시작할 수 없으므로 Asset 구현 패키지는 `a0101_source`처럼 `a` 접두사를
+사용한다.
 
-문서, workspace fixture와 testkit은 제품 소스 저장소와 분리 관리한다. 공개 엔진 배포본에는
-실행 코드·schema·최소 기본 config만 포함한다.
+## 개발 및 빌드
 
-## SBDF 백엔드
+```bash
+uv run ruff check .
+uv run pytest -q
+uv build --wheel
+```
 
-`smoking_data.backends.streaming_sbdf`는 `smoking-sbdf>=0.1.6,<0.2.0`의 공개
-`convert_with_result()` API를 사용한다. 기존 `export_sbdf()`는 출력 `Path`를 그대로 반환하고,
-실제 worker·파일별 batch 크기·row/slice 수가 필요하면 `export_sbdf_with_result()`를 사용한다.
-외부 패키지를 import하는 것만으로 pandas나 Polars DataFrame이 monkey patch되지 않는다. uv는
-`v0.1.6` GitHub Release의 플랫폼별 wheel 목록을 flat source로 사용하며 lockfile에 버전을 고정한다.
-소스 checkout이 아닌 `smoking-data` wheel만 직접 설치할 때는 의존성 탐색을 위해 같은 Release
-자산 URL을 installer의 `--find-links`로 전달해야 한다. 향후 `smoking-sbdf`가 사용하는 Python
-package index에 함께 게시되면 이 추가 옵션은 제거할 수 있다.
+wheel에는 엔진 실행 코드, native extension과 최소 기본 config만 포함한다. 빌드 후에는
+wheel metadata의 버전, `smoking-data` entry point, native module import와 금지된 개발 산출물의
+미포함 여부를 확인한다.

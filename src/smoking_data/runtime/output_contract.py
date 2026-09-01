@@ -16,8 +16,8 @@ def resolve_physical_writer_output(raw: dict[str, Any], *, asset_code: str) -> d
         )
     artifact = output.get("artifact")
     if not isinstance(artifact, dict):
-        # Keep direct preset callers and old test fixtures working while public
-        # pipeline YAMLs use the canonical envelope.
+        # Direct preset callers still use the private flat writer contract.
+        # Public pipeline YAMLs use the canonical output.artifact envelope.
         return dict(output)
     root_dir = str(artifact.get("root_dir") or "").strip()
     if not root_dir:

@@ -753,6 +753,24 @@ def _extract_run_id(payload: dict[str, Any]) -> str | None:
 
 
 def _target_asset_code(path: Path) -> str:
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        payload = None
+    if isinstance(payload, dict):
+        yaml_section = payload.get("yaml")
+        if isinstance(yaml_section, dict):
+            asset_code = str(yaml_section.get("asset_code") or "").strip()
+            if asset_code:
+                return asset_code
+            schema_version = str(yaml_section.get("schema_version") or "").strip()
+            if schema_version == "smoking-data.asset-chain.v2":
+                return "chain"
+        if isinstance(payload.get("chain"), dict):
+            return "chain"
+        legacy_asset_code = str(payload.get("asset_code") or "").strip()
+        if legacy_asset_code:
+            return legacy_asset_code
     parts = path.name.split(".")
     return parts[-2] if len(parts) >= 3 else ""
 
@@ -767,7 +785,7 @@ def _validate_target_definition(path: Path, *, target_kind: str) -> None:
     asset_code = _target_asset_code(path)
     if target_kind == "chain" and asset_code != "chain":
         raise ValidationError(
-            "Scheduled chain target filename must end with .chain.yaml.",
+            "Scheduled chain target must declare the Asset Chain contract.",
             code="schedule.target_kind_mismatch",
             context={"definition": str(path), "target_kind": target_kind},
         )
@@ -780,7 +798,7 @@ def _validate_target_definition(path: Path, *, target_kind: str) -> None:
         "0401",
     }:
         raise ValidationError(
-            "Scheduled asset target filename must end with a supported Asset code.",
+            "Scheduled asset target must declare a supported Asset code.",
             code="schedule.target_kind_mismatch",
             context={"definition": str(path), "target_kind": target_kind},
         )

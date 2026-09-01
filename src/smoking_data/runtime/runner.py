@@ -655,14 +655,10 @@ def main(argv: list[str] | None = None) -> int:
         return _main_capabilities(argv[1:])
     if argv and argv[0] == "compare":
         return _main_compare(argv[1:])
-    if argv and argv[0] == "fixture":
-        return _main_fixture(argv[1:])
     if argv and argv[0] == "parquet-schema":
         return _main_parquet_schema(argv[1:])
     if argv[:2] == ["pwq", "advise"]:
         return _main_pwq_advise(argv[2:])
-    if argv[:2] == ["pwq", "benchmark-dummy"]:
-        return _main_pwq_benchmark_dummy(argv[2:])
     if argv[:2] == ["migrate", "yaml"]:
         return _main_migrate_yaml(argv[2:])
     if argv[:2] == ["migrate", "parquet"]:
@@ -871,7 +867,6 @@ _CLI_COMMANDS: dict[str, tuple[str, ...]] = {
     "validate": ("Validate an Asset Definition or Chain",),
     "capabilities": ("Show engine capabilities",),
     "compare": ("Compare execution results",),
-    "fixture": ("Run fixture utilities",),
     "parquet-schema": ("Read Parquet footer schema",),
     "migrate": ("Migrate Definitions, Parquet inputs, or Chains",),
     "smoke": ("Run bounded smoke tasks",),
@@ -881,7 +876,7 @@ _CLI_COMMANDS: dict[str, tuple[str, ...]] = {
     "registry": ("Inspect authoring registry",),
     "schedule": ("Validate or tick schedules",),
     "inspect": ("Inspect datasets and metadata",),
-    "pwq": ("Advise or benchmark pipeline write quality",),
+    "pwq": ("Advise pipeline write quality",),
 }
 
 _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
@@ -905,10 +900,7 @@ _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
         "publication gc",
         "publication read-key KEY",
     ),
-    "pwq": (
-        "pwq advise PIPELINE.yaml",
-        "pwq benchmark-dummy --root ROOT",
-    ),
+    "pwq": ("pwq advise PIPELINE.yaml",),
     "inspect": (
         "inspect dataset PATH",
         "inspect failure PATH",
@@ -2057,60 +2049,6 @@ def _main_layout_migrate(argv: list[str]) -> int:
     return exit_code
 
 
-def _main_pwq_benchmark_dummy(argv: list[str]) -> int:
-    from smoking_data.advisors.pwq import benchmark_dummy_0201
-
-    parser = argparse.ArgumentParser(description="Benchmark PWQ candidates on dummy 0201 data.")
-    parser.add_argument("--root", required=True)
-    parser.add_argument("--repetitions", type=int, default=2)
-    parser.add_argument("--max-elapsed-sec", type=float, default=120.0)
-    parser.add_argument("--max-input-bytes", type=int, default=256 * 1024 * 1024)
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
-    try:
-        if args.json:
-            with contextlib.redirect_stdout(io.StringIO()):
-                handle = benchmark_dummy_0201(
-                    args.root,
-                    repetitions=args.repetitions,
-                    max_elapsed_sec=args.max_elapsed_sec,
-                    max_input_bytes=args.max_input_bytes,
-                )
-        else:
-            handle = benchmark_dummy_0201(
-                args.root,
-                repetitions=args.repetitions,
-                max_elapsed_sec=args.max_elapsed_sec,
-                max_input_bytes=args.max_input_bytes,
-            )
-    except SmokingDataError as exc:
-        payload = {"ok": False, **exc.to_dict()}
-        if args.json:
-            print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
-        else:
-            print(f"[smoking-data] pwq benchmark failed: {payload['error_message']}")
-        return 1
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
-        payload = {
-            "ok": False,
-            "error_type": type(exc).__name__,
-            "error_code": "pwq.benchmark_failed",
-            "error_message": str(exc),
-            "error_context": {"root": str(args.root)},
-        }
-        if args.json:
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
-        else:
-            print(f"[smoking-data] pwq benchmark failed: {payload['error_message']}")
-        return 1
-    payload = {"ok": True, "benchmark": handle.to_dict()}
-    if args.json:
-        print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
-    else:
-        print(f"[smoking-data] pwq benchmark={handle.summary_path}")
-    return 0
-
-
 def _main_validate(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Validate an Asset Definition or Asset Chain YAML without running it."
@@ -2286,33 +2224,3 @@ def _main_compare(argv: list[str]) -> int:
     status = "ok" if ok else "diff"
     print(f"[smoking-data] parity_report={report_path} status={status}")
     return 1 if args.fail_on_diff and not ok else 0
-
-
-def _main_fixture(argv: list[str]) -> int:
-    from smoking_data.core.parity_fixtures import (
-        write_0201_curated_parity_fixture,
-        write_0201_pivot_parity_fixture,
-        write_0301_join_parity_fixture,
-        write_0301_multi_right_full_parity_fixture,
-    )
-    parser = argparse.ArgumentParser(description="Create reusable parity smoke fixture inputs.")
-    parser.add_argument(
-        "preset",
-        choices=["0201", "0201-pivot", "0301", "0301-multi-right-full"],
-        help="Fixture preset to create.",
-    )
-    parser.add_argument("--root", required=True, help="Fixture root directory.")
-    args = parser.parse_args(argv)
-    if args.preset == "0201":
-        fixture = write_0201_curated_parity_fixture(args.root)
-    elif args.preset == "0201-pivot":
-        fixture = write_0201_pivot_parity_fixture(args.root)
-    elif args.preset == "0301":
-        fixture = write_0301_join_parity_fixture(args.root)
-    else:
-        fixture = write_0301_multi_right_full_parity_fixture(args.root)
-    print(
-        "[smoking-data] "
-        f"fixture={fixture.preset} yaml={fixture.yaml_path} expected_rows={fixture.expected_rows}"
-    )
-    return 0

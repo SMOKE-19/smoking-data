@@ -150,35 +150,11 @@
     },
     "snapshotPublication": {
       "type": "object",
+      "description": "0401 Definition은 게시 target만 선언하며 SBDF 표현과 공통 정책은 config에서 상속한다.",
       "additionalProperties": false,
-      "required": ["enabled", "target", "dataset_prefix", "parquet", "sbdf"],
+      "required": ["target"],
       "properties": {
-        "enabled": {"type": "boolean"},
-        "target": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"},
-        "dataset_prefix": {"type": "string", "minLength": 1, "not": {"pattern": "(^|/)(\\.\\.?)(/|$)|^[\\\\/]|://"}},
-        "mode": {"const": "mirror_after_local_commit"},
-        "failure_policy": {"enum": ["required", "warn_and_retry"]},
-        "parquet": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["enabled"],
-          "properties": {"enabled": {"const": false}}
-        },
-        "sbdf": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["enabled"],
-          "properties": {"enabled": {"const": true}}
-        },
-        "verification": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "checksum": {"const": "sha256"},
-            "verify_remote_head": {"type": "boolean"},
-            "verify_sidecar_references": {"type": "boolean"}
-          }
-        }
+        "target": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"}
       }
     },
     "output": {

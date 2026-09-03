@@ -19,6 +19,13 @@ PIPELINE_SCHEMA_VERSION_BY_ASSET = {
     "0301": PIPELINE_SCHEMA_VERSION,
     "0401": SNAPSHOT_PIPELINE_SCHEMA_VERSION,
 }
+CURATED_EXECUTION_PHASES = (
+    "build_sidecar.01_candidate",
+    "build_sidecar.02_ipc_writer",
+    "build_sidecar.03_active_selection",
+    "materialize.01_payload",
+    "save_dataset.01_commit",
+)
 PUBLIC_EXECUTION_KEYS = frozenset(
     {
         "workers",
@@ -34,6 +41,9 @@ PUBLIC_EXECUTION_KEYS = frozenset(
         "sidecar_worker_recycle_mode",
         "sidecar_max_source_files",
         "sidecar_max_projected_bytes_mb",
+        "candidate_workers",
+        "bucketize_workers",
+        "active_selection_workers",
     }
 )
 ROOT_KEYS = frozenset({"yaml", "job", "operations", "output", "execution"})
@@ -368,11 +378,7 @@ def normalize_pipeline_document(
     normalized = {
         "schema_version": version,
         "job": dict(job),
-        **(
-            {"migration": dict(raw["migration"])}
-            if isinstance(raw.get("migration"), dict)
-            else {}
-        ),
+        **({"migration": dict(raw["migration"])} if isinstance(raw.get("migration"), dict) else {}),
         "sources": sources,
         "operations": lowered_operations,
         "sinks": sinks,
@@ -550,9 +556,7 @@ def _expand_join_materialize_document(
         )
     preserve_groups = _string_list(
         boundary.get("preserve_groups"),
-        path=(
-            "build_sidecar.part_boundary.preserve_groups"
-        ),
+        path=("build_sidecar.part_boundary.preserve_groups"),
     )
     partition_by = keyspace_partition_by
     operations.append(
@@ -733,9 +737,7 @@ def _expand_snapshot_materialize_document(
             code="operation.unsupported",
             context={"path": "define_upstream[0].op", "operation": kind},
         )
-    source_alias = _required_string(
-        upstream.get("alias"), path="define_upstream[0].alias"
-    )
+    source_alias = _required_string(upstream.get("alias"), path="define_upstream[0].alias")
 
     operations: list[dict[str, Any]] = [upstream]
     phases: dict[str, str] = {source_alias: "define_upstream"}
@@ -754,9 +756,7 @@ def _expand_snapshot_materialize_document(
             code="build_sidecar.invalid_source",
             context={"source": sidecar_source, "expected": source_alias},
         )
-    boundary = _mapping(
-        sidecar.get("part_boundary"), path="build_sidecar.part_boundary"
-    )
+    boundary = _mapping(sidecar.get("part_boundary"), path="build_sidecar.part_boundary")
     _reject_unknown(
         boundary,
         {"target_rows", "target_key_groups", "preserve_groups"},
@@ -812,9 +812,7 @@ def _expand_snapshot_materialize_document(
                 code="operation.unsupported",
                 context={"path": f"{path}.op", "operation": kind},
             )
-        alias = str(
-            operation.pop("alias", "") or f"{sidecar_alias}__{index + 1:02d}_{kind}"
-        )
+        alias = str(operation.pop("alias", "") or f"{sidecar_alias}__{index + 1:02d}_{kind}")
         operation["alias"] = alias
         operation["inputs"] = {"data": current}
         operations.append(operation)
@@ -830,9 +828,7 @@ def _expand_snapshot_materialize_document(
     )
     phases[sidecar_alias] = "build_sidecar"
 
-    sidecar_execution = _mapping(
-        sidecar.get("execution") or {}, path="build_sidecar.execution"
-    )
+    sidecar_execution = _mapping(sidecar.get("execution") or {}, path="build_sidecar.execution")
     _reject_unknown(
         sidecar_execution,
         {"workers", "worker_recycle"},
@@ -886,9 +882,7 @@ def _expand_snapshot_materialize_document(
         {"alias", "workers", "max_tasks_per_child", "operations"},
         path="materialize",
     )
-    materialize_alias = _required_string(
-        materialize.get("alias"), path="materialize.alias"
-    )
+    materialize_alias = _required_string(materialize.get("alias"), path="materialize.alias")
     nested = materialize.get("operations") or []
     if not isinstance(nested, list):
         raise ValidationError(
@@ -921,11 +915,7 @@ def _expand_snapshot_materialize_document(
                 "target_key_groups": target_key_groups,
                 "preserve_groups": [
                     _SNAPSHOT_PARTITION_COLUMN,
-                    *(
-                        group
-                        for group in preserve_groups
-                        if group != _SNAPSHOT_PARTITION_COLUMN
-                    ),
+                    *(group for group in preserve_groups if group != _SNAPSHOT_PARTITION_COLUMN),
                 ],
             },
             "workers": materialize.get("workers", 1),
@@ -939,9 +929,7 @@ def _expand_snapshot_materialize_document(
     for index, value in enumerate(nested):
         path = f"materialize.operations[{index}]"
         operation = dict(_mapping(value, path=path))
-        forbidden = sorted(
-            key for key in ("inputs", "partition_by") if key in operation
-        )
+        forbidden = sorted(key for key in ("inputs", "partition_by") if key in operation)
         if forbidden:
             raise ValidationError(
                 "0401 materialize operations infer their input and do not accept inputs or partition_by.",
@@ -997,6 +985,172 @@ def _expand_snapshot_materialize_document(
         },
         phases,
     )
+
+
+def _normalize_curated_execution(value: Any) -> dict[str, Any]:
+    execution = _mapping(value, path="execution")
+    public_keys = {
+        "memory",
+        "target_rows_per_part",
+        "target_key_groups_per_part",
+        "max_source_files_per_task",
+        "max_source_row_groups_per_task",
+        "reset_before_run",
+        "test_run",
+    }
+    _reject_unknown(execution, public_keys, path="execution")
+    memory = _mapping(execution.get("memory"), path="execution.memory")
+    _reject_unknown(memory, {"phases"}, path="execution.memory")
+    phase_values = dict(_mapping(memory.get("phases"), path="execution.memory.phases"))
+    legacy_bucketize = phase_values.pop("build_sidecar.02_bucketize", None)
+    if legacy_bucketize is not None and "build_sidecar.02_ipc_writer" in phase_values:
+        raise ValidationError(
+            "Use only build_sidecar.02_ipc_writer; legacy bucketize cannot be combined with it.",
+            code="yaml.conflicting_keys",
+            context={"path": "execution.memory.phases"},
+        )
+    if legacy_bucketize is not None:
+        phase_values["build_sidecar.02_ipc_writer"] = {"mode": "coordinator_only"}
+    _reject_unknown(phase_values, set(CURATED_EXECUTION_PHASES), path="execution.memory.phases")
+    missing = [name for name in CURATED_EXECUTION_PHASES if name not in phase_values]
+    if missing:
+        raise ValidationError(
+            "Asset 0201 requires every ordered execution phase.",
+            code="yaml.required_key",
+            context={"path": "execution.memory.phases", "missing": missing},
+        )
+
+    normalized_ranges: dict[str, Any] = {}
+    requested: dict[str, int] = {}
+    candidate_recycle: dict[str, Any] = {}
+    materialize_max_tasks = 1
+    for phase_name in CURATED_EXECUTION_PHASES:
+        phase_path = f"execution.memory.phases.{phase_name}"
+        phase = _mapping(phase_values[phase_name], path=phase_path)
+        if phase_name in {"build_sidecar.02_ipc_writer", "save_dataset.01_commit"}:
+            _reject_unknown(phase, {"mode"}, path=phase_path)
+            if phase.get("mode") != "coordinator_only":
+                raise ValidationError(
+                    f"0201 {phase_name} requires mode=coordinator_only.",
+                    code="yaml.invalid_value",
+                    context={"path": f"{phase_path}.mode", "value": phase.get("mode")},
+                )
+            continue
+
+        allowed = {"workers"}
+        if phase_name == "build_sidecar.01_candidate":
+            allowed.add("recycle")
+        if phase_name == "materialize.01_payload":
+            allowed.add("max_tasks_per_child")
+        _reject_unknown(phase, allowed, path=phase_path)
+        workers_path = f"{phase_path}.workers"
+        workers = _mapping(phase.get("workers"), path=workers_path)
+        _reject_unknown(workers, {"requested", "min", "max"}, path=workers_path)
+        if set(workers) != {"requested", "min", "max"}:
+            raise ValidationError(
+                "0201 phase workers require requested, min, and max.",
+                code="yaml.required_key",
+                context={
+                    "path": workers_path,
+                    "missing": sorted({"requested", "min", "max"} - set(workers)),
+                },
+            )
+        parsed = {key: workers[key] for key in ("requested", "min", "max")}
+        if any(
+            not isinstance(item, int) or isinstance(item, bool) or item < 1
+            for item in parsed.values()
+        ) or not (parsed["min"] <= parsed["requested"] <= parsed["max"]):
+            raise ValidationError(
+                "Phase workers must be positive integers with min <= requested <= max.",
+                code="yaml.invalid_type",
+                context={"path": workers_path, "value": parsed},
+            )
+        requested[phase_name] = int(parsed["requested"])
+        normalized_ranges[phase_name] = {
+            "workers": {"min": int(parsed["min"]), "max": int(parsed["max"])}
+        }
+
+        if phase_name == "build_sidecar.01_candidate":
+            if "recycle" not in phase:
+                raise ValidationError(
+                    "Candidate phase requires recycle settings.",
+                    code="yaml.required_key",
+                    context={"path": f"{phase_path}.recycle"},
+                )
+            recycle = _mapping(phase.get("recycle"), path=f"{phase_path}.recycle")
+            _reject_unknown(
+                recycle,
+                {"mode", "max_source_files", "max_projected_bytes_mb"},
+                path=f"{phase_path}.recycle",
+            )
+            missing_recycle = {
+                "mode",
+                "max_source_files",
+                "max_projected_bytes_mb",
+            } - set(recycle)
+            if missing_recycle:
+                raise ValidationError(
+                    "Candidate recycle requires mode and both limits.",
+                    code="yaml.required_key",
+                    context={
+                        "path": f"{phase_path}.recycle",
+                        "missing": sorted(missing_recycle),
+                    },
+                )
+            mode = str(recycle.get("mode") or "").strip().lower()
+            if mode != "adaptive":
+                raise ValidationError(
+                    "Candidate worker recycle mode must be adaptive.",
+                    code="build_sidecar.unsupported_worker_recycle_mode",
+                    context={"path": f"{phase_path}.recycle.mode", "value": mode},
+                )
+            candidate_recycle = {
+                "sidecar_worker_recycle_mode": mode,
+                "sidecar_max_source_files": recycle.get("max_source_files", 16),
+                "sidecar_max_projected_bytes_mb": recycle.get("max_projected_bytes_mb", 512),
+            }
+            for key, item in candidate_recycle.items():
+                if key == "sidecar_worker_recycle_mode":
+                    continue
+                if not isinstance(item, int) or isinstance(item, bool) or item < 1:
+                    raise ValidationError(
+                        "Candidate recycle limits must be positive integers.",
+                        code="yaml.invalid_type",
+                        context={"path": f"{phase_path}.recycle", "value": recycle},
+                    )
+        elif phase_name == "materialize.01_payload":
+            if "max_tasks_per_child" not in phase:
+                raise ValidationError(
+                    "Materialize phase requires max_tasks_per_child.",
+                    code="yaml.required_key",
+                    context={"path": f"{phase_path}.max_tasks_per_child"},
+                )
+            materialize_max_tasks = phase["max_tasks_per_child"]
+            if (
+                not isinstance(materialize_max_tasks, int)
+                or isinstance(materialize_max_tasks, bool)
+                or materialize_max_tasks < 1
+            ):
+                raise ValidationError(
+                    "materialize max_tasks_per_child must be an integer >= 1.",
+                    code="yaml.invalid_type",
+                    context={
+                        "path": f"{phase_path}.max_tasks_per_child",
+                        "value": materialize_max_tasks,
+                    },
+                )
+
+    return {
+        **{key: item for key, item in execution.items() if key != "memory"},
+        "workers": requested["materialize.01_payload"],
+        "max_tasks_per_child": int(materialize_max_tasks),
+        "sidecar_workers": requested["build_sidecar.01_candidate"],
+        "candidate_workers": requested["build_sidecar.01_candidate"],
+        "bucketize_workers": 1,
+        "active_selection_workers": requested["build_sidecar.03_active_selection"],
+        **candidate_recycle,
+        "memory": {"phases": normalized_ranges},
+    }
 
 
 def _expand_curated_phase_document(
@@ -1071,12 +1225,8 @@ def _expand_curated_phase_document(
                 "combine_upstream.op must be union_rows.",
                 code="combine_upstream.unsupported_operation",
             )
-        combined_alias = _required_string(
-            combined.get("alias"), path="combine_upstream.alias"
-        )
-        source_aliases = _string_list(
-            combined.get("sources"), path="combine_upstream.sources"
-        )
+        combined_alias = _required_string(combined.get("alias"), path="combine_upstream.alias")
+        source_aliases = _string_list(combined.get("sources"), path="combine_upstream.sources")
         upstream_by_alias = {str(item["alias"]): item for item in upstream_operations}
         if len(set(source_aliases)) != len(source_aliases) or set(source_aliases) != set(
             upstream_by_alias
@@ -1097,9 +1247,10 @@ def _expand_curated_phase_document(
         source_column_name = _required_string(
             source_column.get("name"), path="combine_upstream.source_column.name"
         )
-        if source_column.get("dtype") != "STRING" or source_column.get(
-            "existing_column_policy"
-        ) != "error":
+        if (
+            source_column.get("dtype") != "STRING"
+            or source_column.get("existing_column_policy") != "error"
+        ):
             raise ValidationError(
                 "source_column requires dtype=STRING and existing_column_policy=error.",
                 code="combine_upstream.invalid_source_column",
@@ -1168,10 +1319,13 @@ def _expand_curated_phase_document(
             "part_boundary",
             "columns",
             "operations",
-            "execution",
         },
         path="build_sidecar",
     )
+    execution = _normalize_curated_execution(raw.get("execution"))
+    sidecar_workers = int(execution["sidecar_workers"])
+    materialize_workers = int(execution["workers"])
+    materialize_max_tasks_per_child = int(execution["max_tasks_per_child"])
     sidecar_alias = _required_string(sidecar.get("alias"), path="build_sidecar.alias")
     sidecar_source = _required_string(sidecar.get("source"), path="build_sidecar.source")
     legacy_materialize_value = raw.get("materialize")
@@ -1189,63 +1343,17 @@ def _expand_curated_phase_document(
             else "materialize.partition_by"
         ),
     )
-    sidecar_boundary = _mapping(
-        sidecar.get("part_boundary"), path="build_sidecar.part_boundary"
-    )
+    sidecar_boundary = _mapping(sidecar.get("part_boundary"), path="build_sidecar.part_boundary")
     _reject_unknown(
         sidecar_boundary,
         {"target_rows", "target_key_groups", "preserve_groups"},
         path="build_sidecar.part_boundary",
     )
-    sidecar_execution = _mapping(
-        sidecar.get("execution") or {}, path="build_sidecar.execution"
-    )
-    _reject_unknown(
-        sidecar_execution,
-        {"workers", "worker_recycle"},
-        path="build_sidecar.execution",
-    )
-    sidecar_workers = sidecar_execution.get("workers", 1)
-    if (
-        not isinstance(sidecar_workers, int)
-        or isinstance(sidecar_workers, bool)
-        or sidecar_workers < 1
-    ):
-        raise ValidationError(
-            "build_sidecar.execution.workers must be an integer >= 1.",
-            code="yaml.invalid_type",
-            context={"path": "build_sidecar.execution.workers", "value": sidecar_workers},
-        )
-    worker_recycle = _mapping(
-        sidecar_execution.get("worker_recycle") or {},
-        path="build_sidecar.execution.worker_recycle",
-    )
-    _reject_unknown(
-        worker_recycle,
-        {"mode", "max_source_files", "max_projected_bytes_mb"},
-        path="build_sidecar.execution.worker_recycle",
-    )
-    recycle_mode = str(worker_recycle.get("mode") or "adaptive").strip().lower()
-    if recycle_mode != "adaptive":
-        raise ValidationError(
-            "build_sidecar worker recycle mode must be adaptive.",
-            code="build_sidecar.unsupported_worker_recycle_mode",
-            context={
-                "path": "build_sidecar.execution.worker_recycle.mode",
-                "value": recycle_mode,
-            },
-        )
-    for key, default in (("max_source_files", 16), ("max_projected_bytes_mb", 512)):
-        value = worker_recycle.get(key, default)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValidationError(
-                f"build_sidecar.execution.worker_recycle.{key} must be an integer >= 1.",
-                code="yaml.invalid_type",
-                context={
-                    "path": f"build_sidecar.execution.worker_recycle.{key}",
-                    "value": value,
-                },
-            )
+    recycle_mode = str(execution["sidecar_worker_recycle_mode"])
+    recycle_limits = {
+        "sidecar_max_source_files": execution["sidecar_max_source_files"],
+        "sidecar_max_projected_bytes_mb": execution["sidecar_max_projected_bytes_mb"],
+    }
     sidecar_operations = sidecar.get("operations")
     if not isinstance(sidecar_operations, list) or not sidecar_operations:
         raise ValidationError(
@@ -1306,8 +1414,6 @@ def _expand_curated_phase_document(
             "source",
             "coordinates",
             "partition_by",
-            "workers",
-            "max_tasks_per_child",
             "operations",
         },
         path="materialize",
@@ -1354,7 +1460,9 @@ def _expand_curated_phase_document(
             code="yaml.invalid_type",
             context={"path": "materialize.operations"},
         )
-    boundary_alias = materialize_alias if not payload_operations else f"{materialize_alias}__boundary"
+    boundary_alias = (
+        materialize_alias if not payload_operations else f"{materialize_alias}__boundary"
+    )
     operations.append(
         {
             "op": "materialize",
@@ -1362,8 +1470,8 @@ def _expand_curated_phase_document(
             "inputs": {"source": materialize_source, "coordinates": coordinates},
             "partition_by": sidecar_partition_by,
             "part_boundary": sidecar_boundary,
-            "workers": materialize.get("workers", 1),
-            "max_tasks_per_child": materialize.get("max_tasks_per_child", 1),
+            "workers": materialize_workers,
+            "max_tasks_per_child": materialize_max_tasks_per_child,
         }
     )
     phases[boundary_alias] = "materialize"
@@ -1400,7 +1508,11 @@ def _expand_curated_phase_document(
         assertion_started = assertion_started or kind == "data_assertion"
         alias = str(
             operation.pop("alias", "")
-            or (materialize_alias if index == len(payload_operations) - 1 else f"{materialize_alias}__{index + 1:02d}_{kind}")
+            or (
+                materialize_alias
+                if index == len(payload_operations) - 1
+                else f"{materialize_alias}__{index + 1:02d}_{kind}"
+            )
         )
         operation["alias"] = alias
         operation["inputs"] = {"data": current}
@@ -1409,11 +1521,7 @@ def _expand_curated_phase_document(
         current = alias
 
     legacy_save_value = raw.get("save_dataset")
-    save = (
-        _mapping(legacy_save_value, path="save_dataset")
-        if legacy_save_value is not None
-        else {}
-    )
+    save = _mapping(legacy_save_value, path="save_dataset") if legacy_save_value is not None else {}
     _reject_unknown(save, {"alias", "input", "partition_by", "operations"}, path="save_dataset")
     if save:
         save_input = _required_string(save.get("input"), path="save_dataset.input")
@@ -1468,15 +1576,12 @@ def _expand_curated_phase_document(
     )
     phases[save_alias] = "save_dataset"
 
-    execution = dict(raw.get("execution") or {})
+    execution = dict(execution)
     execution.update(
         {
             "sidecar_workers": sidecar_workers,
             "sidecar_worker_recycle_mode": recycle_mode,
-            "sidecar_max_source_files": int(worker_recycle.get("max_source_files", 16)),
-            "sidecar_max_projected_bytes_mb": int(
-                worker_recycle.get("max_projected_bytes_mb", 512)
-            ),
+            **recycle_limits,
         }
     )
     return (
@@ -1546,9 +1651,7 @@ def _canonical_nodes(
         operation = indexed[alias]
         kind = str(operation["op"])
         config = {
-            key: value
-            for key, value in operation.items()
-            if key not in {"alias", "inputs", "op"}
+            key: value for key, value in operation.items() if key not in {"alias", "inputs", "op"}
         }
         if kind == "define_asset":
             source = sources[alias]
@@ -1699,9 +1802,7 @@ def _compile_sources(
             result[operation_id] = {
                 "kind": "parquet_dataset",
                 "paths": [
-                    member_path
-                    for member in compiled_members
-                    for member_path in member["paths"]
+                    member_path for member in compiled_members for member_path in member["paths"]
                 ],
                 "union_by_name": True,
                 "missing_columns": "insert_null",
@@ -1732,8 +1833,10 @@ def _compile_sources(
                 }
             )
             paths = resolved.get("paths")
-            if not isinstance(paths, list) or not paths or not all(
-                str(item).strip() for item in paths
+            if (
+                not isinstance(paths, list)
+                or not paths
+                or not all(str(item).strip() for item in paths)
             ):
                 raise ValidationError(
                     "define_asset resolver must return non-empty dataset paths.",
@@ -1747,9 +1850,7 @@ def _compile_sources(
                 "missing_columns": "insert_null",
                 "incompatible_dtypes": "error",
                 "asset_definition": str(resolved.get("asset_definition") or definition),
-                "asset_definition_hash": str(
-                    resolved.get("asset_definition_hash") or ""
-                ),
+                "asset_definition_hash": str(resolved.get("asset_definition_hash") or ""),
                 "asset_code": str(resolved.get("asset_code") or ""),
             }
             continue
@@ -2067,11 +2168,7 @@ def _validate_output(value: Any, *, asset_code: str) -> dict[str, Any]:
                 "adaptation_scope": adaptation_scope,
                 "row_group_rows": row_group_rows,
             },
-            **(
-                {"publication": dict(artifact["publication"])}
-                if publication is not None
-                else {}
-            ),
+            **({"publication": dict(artifact["publication"])} if publication is not None else {}),
             **({"sbdf": sbdf} if sbdf is not None else {}),
         },
         "logging": logging,
@@ -2088,9 +2185,7 @@ def _apply_0401_sbdf_output_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if artifact_format == "sbdf" and not isinstance(artifact.get("sbdf"), dict):
         sidecar = raw.get("build_sidecar")
         boundary = sidecar.get("part_boundary") if isinstance(sidecar, dict) else None
-        preserve_groups = (
-            boundary.get("preserve_groups") if isinstance(boundary, dict) else None
-        )
+        preserve_groups = boundary.get("preserve_groups") if isinstance(boundary, dict) else None
         row_key_columns = (
             [str(value) for value in preserve_groups]
             if isinstance(preserve_groups, list) and preserve_groups

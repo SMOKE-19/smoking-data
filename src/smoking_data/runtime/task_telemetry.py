@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -20,7 +21,7 @@ from smoking_data.runtime.process_metrics import read_process_metrics
 
 TASK_TELEMETRY_SCHEMA_VERSION = "smoking-data.task-telemetry.v1"
 TASK_TELEMETRY_EVENT_VERSION = "smoking-data.task-telemetry-event.v1"
-DEFAULT_SAMPLE_INTERVAL_SEC = 0.5
+DEFAULT_SAMPLE_INTERVAL_SEC = 1.0
 
 
 @dataclass(slots=True)
@@ -252,7 +253,7 @@ def _supervisor_loop(
                 )
                 max_concurrent_tasks = max(max_concurrent_tasks, active_count)
         if time.monotonic() >= next_sample_at:
-            sample_count, sample_available, exited_count = _sample_workers(
+            sample_count, sample_available, exited_count, sampled_metrics = _sample_workers(
                 workers,
                 pid_identities,
                 tasks,
@@ -263,10 +264,17 @@ def _supervisor_loop(
             samples_written += sample_count
             event_counts["worker_exited"] += exited_count
             metrics_available = metrics_available or sample_available
+            _emit_resource_sample(
+                sampled_metrics,
+                log_path=log_path,
+                log_stream=log_stream,
+                progress=progress,
+            )
+            event_counts["resource_sample"] += 1
             next_sample_at = time.monotonic() + sample_interval_sec
             progress.render()
 
-    sample_count, sample_available, exited_count = _sample_workers(
+    sample_count, sample_available, exited_count, sampled_metrics = _sample_workers(
         workers,
         pid_identities,
         tasks,
@@ -277,6 +285,13 @@ def _supervisor_loop(
     samples_written += sample_count
     event_counts["worker_exited"] += exited_count
     metrics_available = metrics_available or sample_available
+    _emit_resource_sample(
+        sampled_metrics,
+        log_path=log_path,
+        log_stream=log_stream,
+        progress=progress,
+    )
+    event_counts["resource_sample"] += 1
 
     for identity, worker in list(workers.items()):
         if worker.get("exited"):
@@ -423,10 +438,11 @@ def _sample_workers(
     log_stream: TextIO | None,
     *,
     progress: ConsoleProgressRenderer | None = None,
-) -> tuple[int, bool, int]:
+) -> tuple[int, bool, int, list[dict[str, Any]]]:
     count = 0
     available = False
     exited = 0
+    sampled_metrics: list[dict[str, Any]] = []
     for identity, worker in list(workers.items()):
         if worker.get("exited"):
             continue
@@ -449,6 +465,7 @@ def _sample_workers(
                 pid_identities.pop(identity[0], None)
             continue
         available = True
+        sampled_metrics.append(metrics)
         worker["last"] = metrics
         _update_worker_peaks(worker, metrics)
         worker["samples"] = int(worker.get("samples") or 0) + 1
@@ -482,7 +499,49 @@ def _sample_workers(
         if progress is not None:
             progress.handle(sample_event)
         count += 1
-    return count, available, exited
+    return count, available, exited, sampled_metrics
+
+
+def _emit_resource_sample(
+    sampled_metrics: list[dict[str, Any]],
+    *,
+    log_path: Path,
+    log_stream: TextIO | None,
+    progress: ConsoleProgressRenderer,
+) -> None:
+    """Persist and render the same one-second aggregate sample."""
+    filesystem: dict[str, int | str] = {"path": str(log_path.parent)}
+    try:
+        usage = shutil.disk_usage(log_path.parent)
+        filesystem.update(
+            {
+                "total_bytes": int(usage.total),
+                "used_bytes": int(usage.used),
+                "free_bytes": int(usage.free),
+            }
+        )
+    except OSError:
+        pass
+
+    metrics = {
+        "process_count": len(sampled_metrics),
+        "cpu_sec": sum(float(item.get("cpu_sec") or 0.0) for item in sampled_metrics),
+        "rss_mb": sum(float(item.get("rss_mb") or 0.0) for item in sampled_metrics),
+        "peak_rss_mb": sum(
+            float(item.get("peak_rss_mb") or 0.0) for item in sampled_metrics
+        ),
+        "read_bytes": sum(int(item.get("read_bytes") or 0) for item in sampled_metrics),
+        "write_bytes": sum(int(item.get("write_bytes") or 0) for item in sampled_metrics),
+        "filesystem": filesystem,
+    }
+    event = {
+        "schema_version": TASK_TELEMETRY_EVENT_VERSION,
+        "event": "resource_sample",
+        "timestamp_ns": time.time_ns(),
+        "metrics": metrics,
+    }
+    _write_jsonl(log_stream, event)
+    progress.handle(event)
 
 
 def _resolve_identity(

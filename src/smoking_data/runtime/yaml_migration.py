@@ -237,11 +237,9 @@ def generate_parquet_migration_yaml(
         },
         "materialize": {
             "alias": "materialize_rows",
-            "workers": 1,
-            "max_tasks_per_child": 1,
             "operations": [],
         },
-        "execution": {"reset_before_run": False},
+        "execution": _default_curated_execution(),
     }
     _write_yaml_atomic(payload, target)
     return {
@@ -261,10 +259,34 @@ def generate_parquet_migration_yaml(
 def _write_yaml_atomic(payload: dict[str, Any], target_path: Path) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = target_path.with_suffix(target_path.suffix + ".tmp")
-    temporary.write_text(
-        _dump_migration_yaml(payload), encoding="utf-8"
-    )
+    temporary.write_text(_dump_migration_yaml(payload), encoding="utf-8")
     temporary.replace(target_path)
+
+
+def _default_curated_execution() -> dict[str, Any]:
+    workers = {"requested": 1, "min": 1, "max": 1}
+    return {
+        "memory": {
+            "phases": {
+                "build_sidecar.01_candidate": {
+                    "workers": dict(workers),
+                    "recycle": {
+                        "mode": "adaptive",
+                        "max_source_files": 16,
+                        "max_projected_bytes_mb": 512,
+                    },
+                },
+                "build_sidecar.02_ipc_writer": {"mode": "coordinator_only"},
+                "build_sidecar.03_active_selection": {"workers": dict(workers)},
+                "materialize.01_payload": {
+                    "workers": dict(workers),
+                    "max_tasks_per_child": 1,
+                },
+                "save_dataset.01_commit": {"mode": "coordinator_only"},
+            }
+        },
+        "reset_before_run": False,
+    }
 
 
 def _dump_migration_yaml(payload: dict[str, Any]) -> str:
@@ -356,9 +378,7 @@ def _normalize_calculated_fact_phase_contract(
         if not isinstance(build_execution, dict):
             raise ValueError("0102 v2 build_sidecar.execution은 object여야 합니다.")
         recycle = build_execution.get("worker_recycle")
-        build_max_files = (
-            recycle.get("max_source_files") if isinstance(recycle, dict) else None
-        )
+        build_max_files = recycle.get("max_source_files") if isinstance(recycle, dict) else None
         if build_max_files is not None:
             execution = payload.setdefault("execution", {})
             if not isinstance(execution, dict):
@@ -367,9 +387,7 @@ def _normalize_calculated_fact_phase_contract(
             execution["max_source_files_per_task"] = min(
                 int(build_max_files), int(root_max_files or build_max_files)
             )
-        changes.append(
-            _change("build_sidecar.execution", "execution.max_source_files_per_task")
-        )
+        changes.append(_change("build_sidecar.execution", "execution.max_source_files_per_task"))
 
     save = payload.pop("save_dataset", None)
     if not isinstance(save, dict):
@@ -377,7 +395,9 @@ def _normalize_calculated_fact_phase_contract(
     if str(save.get("input") or "").strip() != str(materialize.get("alias") or "").strip():
         raise ValueError("0102 v2 save_dataset.input은 materialize.alias와 일치해야 합니다.")
     if save.get("partition_by") != partition_by:
-        raise ValueError("0102 v2 save_dataset.partition_by는 materialize.partition_by와 일치해야 합니다.")
+        raise ValueError(
+            "0102 v2 save_dataset.partition_by는 materialize.partition_by와 일치해야 합니다."
+        )
     if save.get("operations") not in (None, []):
         raise ValueError("0102 v2 save_dataset.operations는 비어 있어야 합니다.")
     changes.append(_change("save_dataset", "implicit terminal dataset commit"))
@@ -432,9 +452,7 @@ def _normalize_calculated_fact_operation_contract(
     calculate = deepcopy(compound[0])
     calculate_alias = str(calculate.get("alias") or "calculate").strip() or "calculate"
     used_aliases = {
-        str(item.get("alias") or "").strip()
-        for item in operations
-        if isinstance(item, dict)
+        str(item.get("alias") or "").strip() for item in operations if isinstance(item, dict)
     }
     used_aliases.update(
         str(section.get("alias") or "").strip()
@@ -444,9 +462,7 @@ def _normalize_calculated_fact_operation_contract(
     upstreams = payload.get("define_upstream")
     if isinstance(upstreams, list):
         used_aliases.update(
-            str(item.get("alias") or "").strip()
-            for item in upstreams
-            if isinstance(item, dict)
+            str(item.get("alias") or "").strip() for item in upstreams if isinstance(item, dict)
         )
     used_aliases.discard("")
 
@@ -634,9 +650,7 @@ def _normalize_calculated_fact_in_place_list_contract(
         if all(isinstance(item, str) for item in columns):
             continue
         source_key, target_key = (
-            ("source", "element_alias")
-            if kind == "expand_list_rows"
-            else ("source", "output")
+            ("source", "element_alias") if kind == "expand_list_rows" else ("source", "output")
         )
         names: list[str] = []
         for item in columns:
@@ -684,6 +698,139 @@ def _normalize_curated_phase_contract(
     if not isinstance(build_sidecar, dict) or not isinstance(materialize, dict):
         return
 
+    execution_value = payload.get("execution")
+    if execution_value is None:
+        execution: dict[str, Any] = {}
+        payload["execution"] = execution
+    elif not isinstance(execution_value, dict):
+        raise ValueError("0201 execution은 object여야 합니다.")
+    else:
+        execution = execution_value
+
+    sidecar_execution = build_sidecar.pop("execution", None)
+    if sidecar_execution is not None and not isinstance(sidecar_execution, dict):
+        raise ValueError("0201 build_sidecar.execution은 object여야 합니다.")
+    sidecar_execution = sidecar_execution or {}
+    worker_recycle = sidecar_execution.get("worker_recycle")
+    if worker_recycle is not None and not isinstance(worker_recycle, dict):
+        raise ValueError("0201 build_sidecar.execution.worker_recycle은 object여야 합니다.")
+    worker_recycle = worker_recycle or {}
+
+    memory_value = execution.get("memory") or {}
+    if not isinstance(memory_value, dict):
+        raise ValueError("0201 execution.memory는 object여야 합니다.")
+    phase_values = memory_value.get("phases") or {}
+    if not isinstance(phase_values, dict):
+        raise ValueError("0201 execution.memory.phases는 object여야 합니다.")
+
+    def requested_for(phase_name: str, *fallbacks: Any) -> int:
+        phase = phase_values.get(phase_name)
+        if isinstance(phase, dict) and isinstance(phase.get("workers"), dict):
+            value = phase["workers"].get("requested")
+            if value is not None:
+                return int(value)
+        return int(next((value for value in fallbacks if value is not None), 1))
+
+    def worker_range(phase_name: str, requested: int, legacy_name: str) -> dict[str, int]:
+        phase = phase_values.get(phase_name)
+        workers = phase.get("workers") if isinstance(phase, dict) else None
+        legacy = phase_values.get(legacy_name)
+        legacy_workers = legacy.get("workers") if isinstance(legacy, dict) else None
+        source = workers if isinstance(workers, dict) else legacy_workers or {}
+        minimum = min(int(source.get("min", requested)), requested)
+        maximum = max(int(source.get("max", requested)), requested)
+        return {"requested": requested, "min": minimum, "max": maximum}
+
+    sidecar_default = requested_for(
+        "build_sidecar.01_candidate",
+        execution.get("sidecar_workers"),
+        sidecar_execution.get("workers"),
+    )
+    active_workers = requested_for("build_sidecar.03_active_selection", sidecar_default)
+    materialize_workers = requested_for(
+        "materialize.01_payload",
+        execution.get("workers"),
+        materialize.pop("workers", None),
+    )
+    existing_candidate = phase_values.get("build_sidecar.01_candidate")
+    existing_recycle = (
+        existing_candidate.get("recycle")
+        if isinstance(existing_candidate, dict)
+        and isinstance(existing_candidate.get("recycle"), dict)
+        else {}
+    )
+    materialize_phase = phase_values.get("materialize.01_payload")
+    materialize_max_tasks = (
+        materialize_phase.get("max_tasks_per_child")
+        if isinstance(materialize_phase, dict)
+        else None
+    )
+    materialize_max_tasks = next(
+        (
+            value
+            for value in (
+                materialize_max_tasks,
+                execution.get("max_tasks_per_child"),
+                materialize.pop("max_tasks_per_child", None),
+            )
+            if value is not None
+        ),
+        1,
+    )
+    ordered_phases = {
+        "build_sidecar.01_candidate": {
+            "workers": worker_range("build_sidecar.01_candidate", sidecar_default, "build_sidecar"),
+            "recycle": {
+                "mode": existing_recycle.get(
+                    "mode",
+                    execution.get(
+                        "sidecar_worker_recycle_mode", worker_recycle.get("mode", "adaptive")
+                    ),
+                ),
+                "max_source_files": existing_recycle.get(
+                    "max_source_files",
+                    execution.get(
+                        "sidecar_max_source_files", worker_recycle.get("max_source_files", 16)
+                    ),
+                ),
+                "max_projected_bytes_mb": existing_recycle.get(
+                    "max_projected_bytes_mb",
+                    execution.get(
+                        "sidecar_max_projected_bytes_mb",
+                        worker_recycle.get("max_projected_bytes_mb", 512),
+                    ),
+                ),
+            },
+        },
+        "build_sidecar.02_ipc_writer": {"mode": "coordinator_only"},
+        "build_sidecar.03_active_selection": {
+            "workers": worker_range(
+                "build_sidecar.03_active_selection", active_workers, "build_sidecar"
+            )
+        },
+        "materialize.01_payload": {
+            "workers": worker_range("materialize.01_payload", materialize_workers, "materialize"),
+            "max_tasks_per_child": int(materialize_max_tasks),
+        },
+        "save_dataset.01_commit": {"mode": "coordinator_only"},
+    }
+    for old_key in (
+        "workers",
+        "sidecar_workers",
+        "max_tasks_per_child",
+        "sidecar_worker_recycle_mode",
+        "sidecar_max_source_files",
+        "sidecar_max_projected_bytes_mb",
+    ):
+        execution.pop(old_key, None)
+    execution["memory"] = {"phases": ordered_phases}
+    changes.append(
+        _change(
+            "legacy 0201 worker settings",
+            "execution.memory.phases ordered worker lifecycle contract",
+        )
+    )
+
     sidecar_operations = build_sidecar.get("operations")
     if isinstance(sidecar_operations, list):
         for selector_index, selector in enumerate(sidecar_operations):
@@ -729,9 +876,7 @@ def _normalize_curated_phase_contract(
                 calculated.append(
                     {
                         "name": name,
-                        (
-                            "sql" if source_kind == "column" else source_kind
-                        ): (
+                        ("sql" if source_kind == "column" else source_kind): (
                             '"' + source.replace('"', '""') + '"'
                             if source_kind == "column"
                             else source
@@ -739,7 +884,9 @@ def _normalize_curated_phase_contract(
                     }
                 )
             if len(set(names)) != len(names):
-                raise ValueError("active_row_selection.group_keys에는 중복 이름을 사용할 수 없습니다.")
+                raise ValueError(
+                    "active_row_selection.group_keys에는 중복 이름을 사용할 수 없습니다."
+                )
             selector["group_keys"] = names
             if calculated:
                 used_aliases = {
@@ -796,17 +943,13 @@ def _normalize_curated_phase_contract(
             )
         build_sidecar["partition_by"] = deepcopy(materialize_partition)
         sidecar_partition = build_sidecar["partition_by"]
-        changes.append(
-            _change("materialize.partition_by", "build_sidecar.partition_by")
-        )
+        changes.append(_change("materialize.partition_by", "build_sidecar.partition_by"))
     elif materialize_partition is not None:
         if materialize_partition != sidecar_partition:
             raise ValueError(
                 "materialize.partition_by는 build_sidecar.partition_by와 일치해야 정규화할 수 있습니다."
             )
-        changes.append(
-            _change("materialize.partition_by", "build_sidecar.partition_by")
-        )
+        changes.append(_change("materialize.partition_by", "build_sidecar.partition_by"))
 
     materialize_boundary = materialize.pop("part_boundary", None)
     sidecar_boundary = build_sidecar.get("part_boundary")
@@ -816,17 +959,13 @@ def _normalize_curated_phase_contract(
                 "0201 YAML에는 build_sidecar.part_boundary 또는 legacy materialize.part_boundary가 필요합니다."
             )
         build_sidecar["part_boundary"] = deepcopy(materialize_boundary)
-        changes.append(
-            _change("materialize.part_boundary", "build_sidecar.part_boundary")
-        )
+        changes.append(_change("materialize.part_boundary", "build_sidecar.part_boundary"))
     elif materialize_boundary is not None:
         if materialize_boundary != sidecar_boundary:
             raise ValueError(
                 "materialize.part_boundary는 build_sidecar.part_boundary와 일치해야 정규화할 수 있습니다."
             )
-        changes.append(
-            _change("materialize.part_boundary", "build_sidecar.part_boundary")
-        )
+        changes.append(_change("materialize.part_boundary", "build_sidecar.part_boundary"))
 
     execution = payload.get("execution")
     memory = execution.get("memory") if isinstance(execution, dict) else None
@@ -857,8 +996,7 @@ def _normalize_curated_phase_contract(
         )
     assertions = save.get("operations") or []
     if not isinstance(assertions, list) or any(
-        not isinstance(item, dict) or item.get("op") != "data_assertion"
-        for item in assertions
+        not isinstance(item, dict) or item.get("op") != "data_assertion" for item in assertions
     ):
         raise ValueError(
             "save_dataset.operations는 data_assertion 목록이어야 materialize.operations로 이동할 수 있습니다."
@@ -902,8 +1040,7 @@ def _normalize_join_upstream_contract(
     source_ops = [
         deepcopy(item)
         for item in flat_operations
-        if isinstance(item, dict)
-        and item.get("op") in {"define_asset", "define_dataset"}
+        if isinstance(item, dict) and item.get("op") in {"define_asset", "define_dataset"}
     ]
     existing = payload.get("define_upstream")
     if existing is not None:
@@ -915,9 +1052,7 @@ def _normalize_join_upstream_contract(
             )
     else:
         if not source_ops:
-            raise ValueError(
-                "0301 YAML에는 define_asset 또는 define_dataset source가 필요합니다."
-            )
+            raise ValueError("0301 YAML에는 define_asset 또는 define_dataset source가 필요합니다.")
         payload["define_upstream"] = source_ops
         changes.append(
             _change(
@@ -929,10 +1064,7 @@ def _normalize_join_upstream_contract(
     downstream = [
         deepcopy(item)
         for item in flat_operations
-        if not (
-            isinstance(item, dict)
-            and item.get("op") in {"define_asset", "define_dataset"}
-        )
+        if not (isinstance(item, dict) and item.get("op") in {"define_asset", "define_dataset"})
     ]
     upstream = payload.get("define_upstream")
     first_alias = (
@@ -997,8 +1129,7 @@ def _normalize_join_upstream_contract(
         nested = [
             item
             for item in downstream
-            if not isinstance(item, dict)
-            or item.get("op") not in {"materialize", "save_dataset"}
+            if not isinstance(item, dict) or item.get("op") not in {"materialize", "save_dataset"}
         ]
         terminal_alias = (
             str(nested[-1].get("alias") or "")
@@ -1053,18 +1184,12 @@ def _normalize_join_upstream_contract(
             raise ValueError("0301 build_sidecar.method는 union_distinct_keys여야 합니다.")
     else:
         first_join = next(
-            (
-                item
-                for item in nested
-                if isinstance(item, dict) and item.get("op") == "join"
-            ),
+            (item for item in nested if isinstance(item, dict) and item.get("op") == "join"),
             None,
         )
         left_keys = first_join.get("left_on") if isinstance(first_join, dict) else []
         boundary_groups = (
-            legacy_boundary.get("preserve_groups")
-            if isinstance(legacy_boundary, dict)
-            else None
+            legacy_boundary.get("preserve_groups") if isinstance(legacy_boundary, dict) else None
         )
         keys: list[str] = []
         for value in [*(legacy_partition or []), *(boundary_groups or []), *(left_keys or [])]:
@@ -1072,7 +1197,9 @@ def _normalize_join_upstream_contract(
             if text and text not in keys:
                 keys.append(text)
         if not keys:
-            raise ValueError("0301 keyspace keys를 기존 join/materialize 계약에서 추론할 수 없습니다.")
+            raise ValueError(
+                "0301 keyspace keys를 기존 join/materialize 계약에서 추론할 수 없습니다."
+            )
         partition_by = [str((legacy_partition or keys)[0])]
         boundary = deepcopy(legacy_boundary) if isinstance(legacy_boundary, dict) else {}
         boundary.setdefault("target_rows", 20000)
@@ -1087,9 +1214,7 @@ def _normalize_join_upstream_contract(
             "null_key_policy": "error",
         }
         materialize_alias = str(materialize.get("alias") or "materialize_selected_payload")
-        used_aliases = {
-            str(item.get("alias") or "") for item in nested if isinstance(item, dict)
-        }
+        used_aliases = {str(item.get("alias") or "") for item in nested if isinstance(item, dict)}
         payload_alias = f"join_{source_alias}"
         suffix = 2
         while payload_alias in used_aliases:
@@ -1201,9 +1326,7 @@ def _normalize_snapshot_phase_contract(
         return
     if header.get("schema_version") == CURRENT_SNAPSHOT_SCHEMA:
         materialize = payload.get("materialize")
-        if isinstance(materialize, dict) and isinstance(
-            materialize.get("operations"), list
-        ):
+        if isinstance(materialize, dict) and isinstance(materialize.get("operations"), list):
             operations = materialize["operations"]
             retained = [
                 item
@@ -1225,8 +1348,7 @@ def _normalize_snapshot_phase_contract(
                 retained = [
                     item
                     for item in sidecar_operations
-                    if not isinstance(item, dict)
-                    or item.get("op") != "active_row_selection"
+                    if not isinstance(item, dict) or item.get("op") != "active_row_selection"
                 ]
                 if len(retained) != len(sidecar_operations):
                     if retained:
@@ -1312,9 +1434,10 @@ def _normalize_snapshot_phase_contract(
     materialize = materializations[0]
     source_alias = str(upstream.get("alias") or "").strip()
     materialize_inputs = materialize.get("inputs")
-    if not isinstance(materialize_inputs, dict) or str(
-        materialize_inputs.get("source") or ""
-    ) != source_alias:
+    if (
+        not isinstance(materialize_inputs, dict)
+        or str(materialize_inputs.get("source") or "") != source_alias
+    ):
         raise ValueError("0401 materialize.inputs.source가 단일 upstream alias와 일치해야 합니다.")
     save = saves[0]
     save_inputs = save.get("inputs")
@@ -1396,7 +1519,9 @@ def _mapping(value: Any, path: str) -> dict[str, Any]:
     return value
 
 
-def _pipeline_output(payload: dict[str, Any], *, artifact_type: str, asset_code: str) -> dict[str, Any]:
+def _pipeline_output(
+    payload: dict[str, Any], *, artifact_type: str, asset_code: str
+) -> dict[str, Any]:
     output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
     root = output.get("output_dir") or f"DATA/{asset_code}/{{job_name}}"
     logging = payload.get("logging") if isinstance(payload.get("logging"), dict) else {}
@@ -1426,9 +1551,7 @@ def _pipeline_output(payload: dict[str, Any], *, artifact_type: str, asset_code:
                 "0301": "joined_reuse_v1",
                 "0401": "analysis_snapshot_adaptive_v1",
             }[asset_code],
-            "adaptation_scope": (
-                "task_adaptive" if asset_code == "0401" else "generation_fixed"
-            ),
+            "adaptation_scope": ("task_adaptive" if asset_code == "0401" else "generation_fixed"),
             "row_group_rows": "auto",
         },
     }
@@ -1494,18 +1617,31 @@ def _normalize_public_output(
     layout_changed = False
     for key, value in {
         "profile": profiles.get(asset_code, "reusable_dataset_v1"),
-        "adaptation_scope": (
-            "task_adaptive" if asset_code == "0401" else "generation_fixed"
-        ),
+        "adaptation_scope": ("task_adaptive" if asset_code == "0401" else "generation_fixed"),
         "row_group_rows": legacy_row_group_rows or "auto",
     }.items():
         if key not in layout:
             layout[key] = value
             layout_changed = True
     if layout_changed:
-        changes.append(
-            _change("output writer layout", "output.artifact.physical_layout")
-        )
+        changes.append(_change("output writer layout", "output.artifact.physical_layout"))
+    publication = artifact.get("publication")
+    if isinstance(publication, dict):
+        for key in (
+            "enabled",
+            "dataset_prefix",
+            "mode",
+            "failure_policy",
+            "verification",
+        ):
+            if key in publication:
+                publication.pop(key)
+                changes.append(
+                    _change(
+                        f"output.artifact.publication.{key}",
+                        ".smoking-data/config.yaml",
+                    )
+                )
     if isinstance(artifact.get("parquet_writer"), dict) and not artifact["parquet_writer"]:
         artifact.pop("parquet_writer")
     if asset_code == "0101":
@@ -1574,14 +1710,28 @@ def _convert_legacy_pipeline(
         upstream = _required_mapping(payload, "upstream")
         source = _required_mapping(payload, "source")
         paths = _legacy_source_paths(upstream.get("source_paths"), path="upstream.source_paths")
-        keys = [str(item) for item in (_mapping(payload.get("row_selection"), "row_selection").get("sort_first", {}).get("group_keys") or [])]
-        keys = keys or [str(item.get("name")) for item in source.get("payload", {}).get("select", []) if isinstance(item, dict) and item.get("name")]
+        keys = [
+            str(item)
+            for item in (
+                _mapping(payload.get("row_selection"), "row_selection")
+                .get("sort_first", {})
+                .get("group_keys")
+                or []
+            )
+        ]
+        keys = keys or [
+            str(item.get("name"))
+            for item in source.get("payload", {}).get("select", [])
+            if isinstance(item, dict) and item.get("name")
+        ]
         keys = keys or ["partition"]
         operations = [
             _define_dataset("main", paths),
         ]
         output = _pipeline_output(payload, artifact_type="curated_dataset", asset_code="0201")
-        converted = _current_pipeline(name, "0201", CURRENT_CURATED_SCHEMA, output, operations, keys)
+        converted = _current_pipeline(
+            name, "0201", CURRENT_CURATED_SCHEMA, output, operations, keys
+        )
         warnings.append("legacy transform/list_restore/pivot 세부 동작은 자동 추정하지 않았습니다.")
         changes.append(_change("stage.id etl.01.04", "yaml.asset_code 0201"))
         return converted, changes, warnings
@@ -1614,7 +1764,14 @@ def _convert_legacy_pipeline(
         for index, item in enumerate(right_sources):
             right = _mapping(item, f"join.right_sources[{index}]")
             alias = f"right_{index + 1}"
-            operations.append(_define_dataset(alias, _legacy_source_paths(right.get("source_paths"), path=f"join.right_sources[{index}].source_paths")))
+            operations.append(
+                _define_dataset(
+                    alias,
+                    _legacy_source_paths(
+                        right.get("source_paths"), path=f"join.right_sources[{index}].source_paths"
+                    ),
+                )
+            )
             joins.append({"alias": alias, "source": right})
             join_alias = f"join_{index + 1}"
             joinspec = {
@@ -1637,36 +1794,124 @@ def _convert_legacy_pipeline(
                 "partition_by": [partition_column],
             }
         )
-        converted = _current_pipeline(name, "0301", CURRENT_PIPELINE_SCHEMA, _pipeline_output(payload, artifact_type="joined_dataset", asset_code="0301"), operations)
-        warnings.append("legacy right_select/right_exclude patterns are recorded but not auto-translated to post-join operations.")
+        converted = _current_pipeline(
+            name,
+            "0301",
+            CURRENT_PIPELINE_SCHEMA,
+            _pipeline_output(payload, artifact_type="joined_dataset", asset_code="0301"),
+            operations,
+        )
+        warnings.append(
+            "legacy right_select/right_exclude patterns are recorded but not auto-translated to post-join operations."
+        )
         changes.append(_change(f"stage.id {stage_id}", "yaml.asset_code 0301"))
         return converted, changes, warnings
     upstream = _required_mapping(payload, "upstream")
     paths = _legacy_source_paths(upstream.get("source_paths"), path="upstream.source_paths")
     date_window = payload.get("date_window") if isinstance(payload.get("date_window"), dict) else {}
-    operations: list[dict[str, Any]] = [_define_dataset("source", paths), {"op": "materialize", "alias": "materialize_snapshot", "inputs": {"source": "source"}, "partition_by": [str(date_window.get("column") or "partition")], "part_boundary": {"target_rows": 20000, "preserve_groups": [str(date_window.get("column") or "partition")]}, "workers": 1, "max_tasks_per_child": 1}, {"op": "save_dataset", "alias": "write_snapshot", "inputs": {"data": "materialize_snapshot"}, "partition_by": [str(date_window.get("column") or "partition")] }]
-    converted = _current_pipeline(name, "0401", CURRENT_SNAPSHOT_SCHEMA, _pipeline_output(payload, artifact_type="analysis_snapshot", asset_code="0401"), operations)
-    warnings.append("legacy filters, joins, column_rename and indexed_snapshot options require manual operation mapping.")
+    operations: list[dict[str, Any]] = [
+        _define_dataset("source", paths),
+        {
+            "op": "materialize",
+            "alias": "materialize_snapshot",
+            "inputs": {"source": "source"},
+            "partition_by": [str(date_window.get("column") or "partition")],
+            "part_boundary": {
+                "target_rows": 20000,
+                "preserve_groups": [str(date_window.get("column") or "partition")],
+            },
+            "workers": 1,
+            "max_tasks_per_child": 1,
+        },
+        {
+            "op": "save_dataset",
+            "alias": "write_snapshot",
+            "inputs": {"data": "materialize_snapshot"},
+            "partition_by": [str(date_window.get("column") or "partition")],
+        },
+    ]
+    converted = _current_pipeline(
+        name,
+        "0401",
+        CURRENT_SNAPSHOT_SCHEMA,
+        _pipeline_output(payload, artifact_type="analysis_snapshot", asset_code="0401"),
+        operations,
+    )
+    warnings.append(
+        "legacy filters, joins, column_rename and indexed_snapshot options require manual operation mapping."
+    )
     changes.append(_change(f"stage.id {stage_id}", "yaml.asset_code 0401"))
     return converted, changes, warnings
 
 
-def _current_pipeline(job_name: str, asset_code: str, schema: str, output: dict[str, Any], operations: list[dict[str, Any]], keys: list[str] | None = None) -> dict[str, Any]:
+def _current_pipeline(
+    job_name: str,
+    asset_code: str,
+    schema: str,
+    output: dict[str, Any],
+    operations: list[dict[str, Any]],
+    keys: list[str] | None = None,
+) -> dict[str, Any]:
     if keys is not None:
         partition = keys[0]
-        return {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "define_upstream": [{**operations[0]}], "build_sidecar": {"alias": "select_rows", "source": operations[0]["alias"], "partition_by": [partition], "part_boundary": {"target_rows": 20000, "preserve_groups": keys}, "columns": "auto", "operations": [{"op": "active_row_selection", "method": "sort_first", "group_keys": list(keys), "sort": [{"column": partition, "direction": "asc", "nulls": "last"}]}]}, "materialize": {"alias": "materialize_rows", "workers": 1, "max_tasks_per_child": 1, "operations": []}, "execution": {"reset_before_run": False}}
+        return {
+            "yaml": {"schema_version": schema, "asset_code": asset_code},
+            "job": {"name": job_name},
+            "output": output,
+            "define_upstream": [{**operations[0]}],
+            "build_sidecar": {
+                "alias": "select_rows",
+                "source": operations[0]["alias"],
+                "partition_by": [partition],
+                "part_boundary": {"target_rows": 20000, "preserve_groups": keys},
+                "columns": "auto",
+                "operations": [
+                    {
+                        "op": "active_row_selection",
+                        "method": "sort_first",
+                        "group_keys": list(keys),
+                        "sort": [{"column": partition, "direction": "asc", "nulls": "last"}],
+                    }
+                ],
+            },
+            "materialize": {
+                "alias": "materialize_rows",
+                "operations": [],
+            },
+            "execution": _default_curated_execution(),
+        }
     if asset_code == "0301":
-        result = {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "operations": operations, "execution": {"reset_before_run": False}}
+        result = {
+            "yaml": {"schema_version": schema, "asset_code": asset_code},
+            "job": {"name": job_name},
+            "output": output,
+            "operations": operations,
+            "execution": {"reset_before_run": False},
+        }
         _normalize_join_upstream_contract(result, changes=[])
         return result
     if asset_code == "0401":
-        result = {"yaml": {"schema_version": CURRENT_PIPELINE_SCHEMA, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "operations": operations, "execution": {"reset_before_run": False}}
+        result = {
+            "yaml": {"schema_version": CURRENT_PIPELINE_SCHEMA, "asset_code": asset_code},
+            "job": {"name": job_name},
+            "output": output,
+            "operations": operations,
+            "execution": {"reset_before_run": False},
+        }
         _normalize_snapshot_phase_contract(result, changes=[])
         return result
-    return {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "operations": operations, "execution": {"reset_before_run": False}}
+    return {
+        "yaml": {"schema_version": schema, "asset_code": asset_code},
+        "job": {"name": job_name},
+        "output": output,
+        "operations": operations,
+        "execution": {"reset_before_run": False},
+    }
 
 
-def _convert_legacy_chain(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, str]], list[str]]:
+def _convert_legacy_chain(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, str]], list[str]]:
     chain = _required_mapping(payload, "chain")
     stages = payload.get("stages")
     if not isinstance(stages, list) or not stages:
@@ -1680,15 +1925,38 @@ def _convert_legacy_chain(payload: dict[str, Any]) -> tuple[dict[str, Any], list
         if not path:
             raise ValueError(f"stages[{index}].yaml_path가 필요합니다.")
         normalized = path.lower().replace("_", ".")
-        code = "0401" if "03.01" in normalized else "0301" if "02.04" in normalized else "0201" if "01.04" in normalized else "0101"
-        asset = {"id": str(stage.get("name") or f"stage_{index + 1}"), "asset_code": code, "definition": path}
+        code = (
+            "0401"
+            if "03.01" in normalized
+            else "0301"
+            if "02.04" in normalized
+            else "0201"
+            if "01.04" in normalized
+            else "0101"
+        )
+        asset = {
+            "id": str(stage.get("name") or f"stage_{index + 1}"),
+            "asset_code": code,
+            "definition": path,
+        }
         depends = stage.get("depends_on")
         if isinstance(depends, list) and depends:
             asset["inputs"] = {"source": str(depends[-1])}
         assets.append(asset)
-    converted = {"yaml": {"schema_version": CURRENT_CHAIN_SCHEMA}, "chain": {"name": str(chain.get("name") or "migrated_chain")}, "assets": assets, "execution": {"failure_policy": "stop_downstream", "unchanged_policy": "skip", "max_parallel_assets": 1}}
+    converted = {
+        "yaml": {"schema_version": CURRENT_CHAIN_SCHEMA},
+        "chain": {"name": str(chain.get("name") or "migrated_chain")},
+        "assets": assets,
+        "execution": {
+            "failure_policy": "stop_downstream",
+            "unchanged_policy": "skip",
+            "max_parallel_assets": 1,
+        },
+    }
     changes.append(_change("stage.id etl.chain", "yaml.schema_version smoking-data.asset-chain.v2"))
-    warnings.append("legacy stage yaml_path는 자동 변환되지 않으므로 각 Asset YAML도 migrate yaml로 별도 변환해야 합니다.")
+    warnings.append(
+        "legacy stage yaml_path는 자동 변환되지 않으므로 각 Asset YAML도 migrate yaml로 별도 변환해야 합니다."
+    )
     return converted, changes, warnings
 
 
@@ -1722,9 +1990,7 @@ def _needs_source_normalization(payload: dict[str, Any]) -> bool:
         return False
     select = sql.get("select")
     return any(
-        isinstance(item, dict)
-        and list(item)[:2] != ["name", "expr"]
-        and "expr" in item
+        isinstance(item, dict) and list(item)[:2] != ["name", "expr"] and "expr" in item
         for item in select or []
     )
 
@@ -1738,9 +2004,7 @@ def _normalize_current_source(
     source = _required_mapping(converted, "source")
     request = _required_mapping(source, "api_request")
     changes: list[dict[str, str]] = []
-    warnings = [
-        "0101 Source YAML을 source.v5 canonical 구조로 정규화했습니다."
-    ]
+    warnings = ["0101 Source YAML을 source.v5 canonical 구조로 정규화했습니다."]
     converted.setdefault("yaml", {})["schema_version"] = CURRENT_SOURCE_SCHEMA
     if _source_schema(payload) != CURRENT_SOURCE_SCHEMA:
         changes.append(_change(LEGACY_SOURCE_SCHEMA, CURRENT_SOURCE_SCHEMA))
@@ -1770,7 +2034,9 @@ def _normalize_current_source(
         for key in ("sql_file_path", "date_window"):
             if key in request:
                 sql.setdefault(key, request.pop(key))
-                changes.append(_change(f"source.api_request.{key}", f"source.api_request.sql.{key}"))
+                changes.append(
+                    _change(f"source.api_request.{key}", f"source.api_request.sql.{key}")
+                )
 
     _normalize_legacy_source_filters(request, changes=changes, warnings=warnings)
     _order_legacy_source_fields(source, request)
@@ -1796,12 +2062,16 @@ def _convert_legacy_source(
     warnings: list[str] = []
     if asset is None:
         source_candidate = payload.get("source")
-        if not isinstance(source_candidate, dict) or not isinstance(
-            source_candidate.get("api_request"), dict
-        ) or not isinstance(payload.get("output"), dict):
+        if (
+            not isinstance(source_candidate, dict)
+            or not isinstance(source_candidate.get("api_request"), dict)
+            or not isinstance(payload.get("output"), dict)
+        ):
             raise ValueError("legacy Source YAML의 0101 식별 정보가 없습니다.")
         changes.append(_change("implicit legacy source asset", "asset_code 0101"))
-        warnings.append("legacy Source YAML에 asset.code가 없어 source 구조를 기준으로 0101을 추론했습니다.")
+        warnings.append(
+            "legacy Source YAML에 asset.code가 없어 source 구조를 기준으로 0101을 추론했습니다."
+        )
         asset = {"code": "0101"}
     if not isinstance(asset, dict) or str(asset.get("code")) != "0101":
         raise ValueError("현재 결정론적 변환기는 legacy Source asset code 0101만 지원합니다.")
@@ -1843,7 +2113,9 @@ def _convert_legacy_source(
         if not isinstance(spi_options, dict):
             raise ValueError("source.api_request.spi는 object여야 합니다.")
         if "adapter_options" in converted_request:
-            raise ValueError("source.api_request.spi와 adapter_options를 동시에 사용할 수 없습니다.")
+            raise ValueError(
+                "source.api_request.spi와 adapter_options를 동시에 사용할 수 없습니다."
+            )
         converted_request["adapter_options"] = spi_options
         changes.append(_change("source.api_request.spi", "source.api_request.adapter_options"))
     converted_request.setdefault("adapter", "spi")
@@ -1993,9 +2265,7 @@ def _order_legacy_source_output(output: dict[str, Any]) -> None:
 def _reorder_mapping(mapping: dict[str, Any], preferred_keys: tuple[str, ...]) -> None:
     """Move known keys to a stable order while retaining unknown keys at the end."""
 
-    ordered: dict[str, Any] = {
-        key: mapping[key] for key in preferred_keys if key in mapping
-    }
+    ordered: dict[str, Any] = {key: mapping[key] for key in preferred_keys if key in mapping}
     ordered.update({key: value for key, value in mapping.items() if key not in ordered})
     mapping.clear()
     mapping.update(ordered)
@@ -2017,7 +2287,9 @@ def _normalize_legacy_source_filters(
     if raw is None:
         container["filters"] = {"common": [], "sub_job": []}
         changes.append(_change("source.api_request.filters: null", "filters.common/sub_job"))
-        warnings.append("legacy 0101 filters의 null 값을 빈 canonical filter 블록으로 변환했습니다.")
+        warnings.append(
+            "legacy 0101 filters의 null 값을 빈 canonical filter 블록으로 변환했습니다."
+        )
         return
 
     if isinstance(raw, list):
@@ -2031,7 +2303,9 @@ def _normalize_legacy_source_filters(
 
     unknown = sorted(set(raw) - {"common", "sub_job", "sub_jobs"})
     if unknown:
-        raise ValueError(f"legacy source.api_request.payload.filters의 알 수 없는 키입니다: {unknown}")
+        raise ValueError(
+            f"legacy source.api_request.payload.filters의 알 수 없는 키입니다: {unknown}"
+        )
     if "sub_job" in raw and "sub_jobs" in raw:
         raise ValueError(
             "legacy source.api_request.payload.filters에 sub_job과 sub_jobs를 동시에 사용할 수 없습니다."
@@ -2045,7 +2319,9 @@ def _normalize_legacy_source_filters(
     elif isinstance(common, list):
         common_filters = [str(item) for item in common]
     else:
-        raise ValueError("legacy source.api_request.payload.filters.common은 str 또는 list여야 합니다.")
+        raise ValueError(
+            "legacy source.api_request.payload.filters.common은 str 또는 list여야 합니다."
+        )
 
     raw_sub_jobs = raw.get("sub_job", raw.get("sub_jobs"))
     if raw_sub_jobs is None:
@@ -2055,7 +2331,9 @@ def _normalize_legacy_source_filters(
     elif isinstance(raw_sub_jobs, list):
         sub_job_items = raw_sub_jobs
     else:
-        raise ValueError("legacy source.api_request.payload.filters.sub_job은 dict 또는 list여야 합니다.")
+        raise ValueError(
+            "legacy source.api_request.payload.filters.sub_job은 dict 또는 list여야 합니다."
+        )
 
     sub_jobs: list[dict[str, Any]] = []
     used_alias = "sub_jobs" in raw
@@ -2086,7 +2364,9 @@ def _normalize_legacy_source_filters(
     canonical = {"common": common_filters, "sub_job": sub_jobs}
     if raw != canonical:
         container["filters"] = canonical
-        changes.append(_change("source.api_request.filters (legacy aliases)", "filters.common/sub_job"))
+        changes.append(
+            _change("source.api_request.filters (legacy aliases)", "filters.common/sub_job")
+        )
         warnings.append("legacy 0101 filters alias를 현재 canonical 형태로 정규화했습니다.")
     elif used_alias:
         container["filters"] = canonical
@@ -2186,7 +2466,9 @@ def _convert_output(
     changes.extend(
         [
             _change("output.output_dir", "output.artifact.root_dir"),
-            _change("output.file_name_rule.raw_dataset", "output.artifact.file_name_rule.raw_dataset"),
+            _change(
+                "output.file_name_rule.raw_dataset", "output.artifact.file_name_rule.raw_dataset"
+            ),
             _change("output.logging_dir", "output.logging.root_dir"),
             _change("output.file_name_rule.logging", "output.logging.file_name_rule.logging"),
         ]

@@ -162,9 +162,7 @@ def run_pipeline_yaml(
     from smoking_data.runtime.parquet_probe import ensure_pipeline_probes_profiled
 
     phase_started = time.perf_counter()
-    probe_handles, probe_profile = ensure_pipeline_probes_profiled(
-        pipeline_spec, config=config
-    )
+    probe_handles, probe_profile = ensure_pipeline_probes_profiled(pipeline_spec, config=config)
     pipeline_phases["probe_sec"] = time.perf_counter() - phase_started
     pipeline_phases["probe_profile"] = probe_profile
     phase_started = time.perf_counter()
@@ -453,12 +451,27 @@ def _apply_execution_overrides(config: Any, execution: Any) -> Any:
         if not isinstance(phases, dict):
             raise ValidationError("execution.memory.phases must be a mapping.")
         phase_memory: dict[str, PhaseMemoryPolicy] = dict(config.phase_memory)
-        for phase in ("build_sidecar", "materialize", "save_dataset"):
+        for phase in (
+            "build_sidecar",
+            "materialize",
+            "save_dataset",
+            "build_sidecar.01_candidate",
+            "build_sidecar.02_ipc_writer",
+            "build_sidecar.03_active_selection",
+            "materialize.01_payload",
+        ):
             raw = phases.get(phase)
             if raw is None:
                 continue
             if not isinstance(raw, dict):
                 raise ValidationError(f"execution.memory.phases.{phase} must be a mapping.")
+            if phase == "build_sidecar.02_ipc_writer":
+                if raw != {"mode": "coordinator_only"}:
+                    raise ValidationError(
+                        "execution.memory.phases.build_sidecar.02_ipc_writer requires "
+                        "mode=coordinator_only."
+                    )
+                continue
             unknown_phase_keys = sorted(set(raw) - {"workers"})
             if unknown_phase_keys:
                 raise ValidationError(
@@ -494,6 +507,9 @@ def _apply_execution_overrides(config: Any, execution: Any) -> Any:
         )
     if "sidecar_workers" in execution:
         updates["sidecar_workers"] = max(1, int(execution.get("sidecar_workers") or 1))
+    for key in ("candidate_workers", "bucketize_workers", "active_selection_workers"):
+        if key in execution:
+            updates[key] = max(1, int(execution.get(key) or 1))
     if "sidecar_worker_recycle_mode" in execution:
         mode = str(execution.get("sidecar_worker_recycle_mode") or "adaptive").lower()
         if mode != "adaptive":
@@ -696,12 +712,17 @@ def main(argv: list[str] | None = None) -> int:
         return _main_schedule_validate(argv[2:])
     if argv[:2] == ["schedule", "tick"]:
         return _main_schedule_tick(argv[2:])
-    if len(argv) >= 2 and argv[0] == "inspect" and argv[1] in {
-        "dataset",
-        "failure",
-        "missing",
-        "profile",
-    }:
+    if (
+        len(argv) >= 2
+        and argv[0] == "inspect"
+        and argv[1]
+        in {
+            "dataset",
+            "failure",
+            "missing",
+            "profile",
+        }
+    ):
         return _main_inspect(argv[1], argv[2:])
     if argv and argv[0] == "inspect":
         return _main_parquet_preview(argv[1:])
@@ -740,7 +761,9 @@ def _main_capabilities(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Return the installed smoking-data capability contract."
     )
-    parser.add_argument("--json", action="store_true", help="Print the capability manifest as JSON.")
+    parser.add_argument(
+        "--json", action="store_true", help="Print the capability manifest as JSON."
+    )
     args = parser.parse_args(argv)
     from smoking_data.runtime.capabilities import get_capabilities
 
@@ -787,7 +810,9 @@ def _run_definition_cli(args: argparse.Namespace) -> int:
                 if asset_code == "0101":
                     from smoking_data.assets.a0101_source import execute_yaml
 
-                    source_result = execute_yaml(args.yaml_path, project_root=effective_project_root)
+                    source_result = execute_yaml(
+                        args.yaml_path, project_root=effective_project_root
+                    )
                     payload = source_result.to_dict()
                     ok = source_result.ok
                 elif asset_code == "0102":
@@ -865,9 +890,7 @@ def _console_progress_environment(*, json_output: bool):
 
 
 def _main_run(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        description="Run an Asset Definition or Asset Chain YAML."
-    )
+    parser = argparse.ArgumentParser(description="Run an Asset Definition or Asset Chain YAML.")
     parser.add_argument("yaml_path", help="Asset or Asset Chain YAML path.")
     parser.add_argument("--config", dest="config_path", default=None)
     parser.add_argument("--project-root", default=None)
@@ -945,7 +968,9 @@ def _print_cli_help(group: str | None = None) -> None:
         print("       smoking-data inspect SUBCOMMAND [OPTIONS]")
         print("\nDefault: recursively select the sorted first Parquet file and print 10 rows.")
         print("All columns are always wrapped into terminal-width blocks.")
-        print("Options: --rows ROWS (default: 10), --repeat-columns COL,..., --project-root ROOT, --json")
+        print(
+            "Options: --rows ROWS (default: 10), --repeat-columns COL,..., --project-root ROOT, --json"
+        )
         print("\ninspect forms:")
     else:
         print(f"usage: smoking-data {group} SUBCOMMAND [OPTIONS]")
@@ -958,7 +983,6 @@ def _print_cli_help(group: str | None = None) -> None:
 def _looks_like_definition_path(value: str) -> bool:
     path = Path(value).expanduser()
     return path.exists() or path.suffix.casefold() in {".yaml", ".yml"}
-
 
 
 def _main_publication_inspect(argv: list[str]) -> int:
@@ -1213,7 +1237,9 @@ def _main_migrate_parquet(argv: list[str]) -> int:
     )
     parser.add_argument("input_path", help="Parquet file or recursive dataset directory")
     parser.add_argument("--output", required=True, help="Generated 0201 YAML path")
-    parser.add_argument("--source-asset", required=True, choices=["0101", "0102", "0103", "0201", "0301", "0401"])
+    parser.add_argument(
+        "--source-asset", required=True, choices=["0101", "0102", "0103", "0201", "0301", "0401"]
+    )
     parser.add_argument("--job-name", default="parquet_migration")
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--json", action="store_true")
@@ -1270,7 +1296,10 @@ def _main_verify_migrated_chain(argv: list[str]) -> int:
         if not isinstance(document, dict):
             raise ValueError("Chain YAML root must be an object.")
         header = document.get("yaml")
-        if not isinstance(header, dict) or header.get("schema_version") != "smoking-data.asset-chain.v2":
+        if (
+            not isinstance(header, dict)
+            or header.get("schema_version") != "smoking-data.asset-chain.v2"
+        ):
             raise ValueError("Chain verification requires smoking-data.asset-chain.v2.")
         assets = document.get("assets")
         if not isinstance(assets, list) or not assets:
@@ -1291,7 +1320,9 @@ def _main_verify_migrated_chain(argv: list[str]) -> int:
                 "asset_code": item.get("asset_code"),
             }
             if not definition_path.is_file():
-                asset_result.update({"ok": False, "phase": "resolve", "error": "definition_missing"})
+                asset_result.update(
+                    {"ok": False, "phase": "resolve", "error": "definition_missing"}
+                )
                 overall_ok = False
                 results.append(asset_result)
                 continue
@@ -1359,7 +1390,9 @@ def _main_verify_migrated_chain(argv: list[str]) -> int:
     if args.json:
         print(json.dumps(to_json_safe(result_payload), ensure_ascii=False, indent=2))
     elif result_payload["ok"]:
-        print(f"[smoking-data] migrated Chain verification passed assets={len(result_payload['assets'])}")
+        print(
+            f"[smoking-data] migrated Chain verification passed assets={len(result_payload['assets'])}"
+        )
     else:
         print("[smoking-data] migrated Chain verification failed")
     return exit_code
@@ -1400,7 +1433,10 @@ def _main_migrate_chain_run(argv: list[str]) -> int:
         if not isinstance(document, dict):
             raise ValueError("Chain YAML root must be an object.")
         header = document.get("yaml")
-        if not isinstance(header, dict) or header.get("schema_version") != "smoking-data.asset-chain.v2":
+        if (
+            not isinstance(header, dict)
+            or header.get("schema_version") != "smoking-data.asset-chain.v2"
+        ):
             raise ValueError("Chain migration run requires smoking-data.asset-chain.v2.")
         assets = document.get("assets")
         if not isinstance(assets, list) or not assets:
@@ -1440,7 +1476,13 @@ def _main_migrate_chain_run(argv: list[str]) -> int:
             validation_output = io.StringIO()
             with contextlib.redirect_stdout(validation_output):
                 validation_code = main(
-                    ["validate", str(definition_path), "--project-root", str(project_root), "--json"]
+                    [
+                        "validate",
+                        str(definition_path),
+                        "--project-root",
+                        str(project_root),
+                        "--json",
+                    ]
                 )
             result["validation"] = _parse_cli_json(validation_output.getvalue())
             if validation_code != 0:
@@ -1450,7 +1492,11 @@ def _main_migrate_chain_run(argv: list[str]) -> int:
                 continue
             asset_payload = yaml.safe_load(definition_path.read_text(encoding="utf-8")) or {}
             job = asset_payload.get("job") if isinstance(asset_payload, dict) else {}
-            job_name = str(job.get("name") or definition_path.stem) if isinstance(job, dict) else definition_path.stem
+            job_name = (
+                str(job.get("name") or definition_path.stem)
+                if isinstance(job, dict)
+                else definition_path.stem
+            )
             asset_smoke_root = isolated_root / asset_id
             asset_output_root = asset_smoke_root / asset_code / job_name
             smoke_output = io.StringIO()
@@ -1522,7 +1568,9 @@ def _main_migrate_chain_run(argv: list[str]) -> int:
                 )
             result["migration_smoke"] = _parse_cli_json(migration_smoke_output.getvalue())
             result["ok"] = migration_smoke_code == 0
-            result["status"] = "migrated_and_smoke_verified" if result["ok"] else "migration_smoke_failed"
+            result["status"] = (
+                "migrated_and_smoke_verified" if result["ok"] else "migration_smoke_failed"
+            )
             overall_ok = overall_ok and result["ok"]
             results.append(result)
         result_payload = {
@@ -2158,7 +2206,10 @@ def _main_validate(argv: list[str]) -> int:
     try:
         raw_document = yaml.safe_load(Path(args.yaml_path).read_text(encoding="utf-8")) or {}
         raw_header = raw_document.get("yaml") if isinstance(raw_document, dict) else None
-        if isinstance(raw_header, dict) and raw_header.get("schema_version") == "smoking-data.publication.v1":
+        if (
+            isinstance(raw_header, dict)
+            and raw_header.get("schema_version") == "smoking-data.publication.v1"
+        ):
             from smoking_data.runtime.object_store.config import PublicationSpec
 
             publication = PublicationSpec.from_mapping(raw_document.get("publication"))
@@ -2195,7 +2246,10 @@ def _main_validate(argv: list[str]) -> int:
         elif asset_code_from_definition_path(args.yaml_path) == "0102":
             from smoking_data.assets.a0102_calculated_fact.spec import load_calculated_fact_spec
 
-            spec = load_calculated_fact_spec(args.yaml_path)
+            spec = load_calculated_fact_spec(
+                args.yaml_path,
+                project_root=effective_project_root,
+            )
             payload = {
                 "ok": True,
                 "kind": "asset",
@@ -2276,9 +2330,7 @@ def _main_validate(argv: list[str]) -> int:
     if args.json:
         print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
     elif payload["ok"]:
-        graph_suffix = (
-            f" graph_hash={payload['graph_hash']}" if payload.get("graph_hash") else ""
-        )
+        graph_suffix = f" graph_hash={payload['graph_hash']}" if payload.get("graph_hash") else ""
         print(f"[smoking-data] valid job={payload['job_name']}{graph_suffix}")
     else:
         print(

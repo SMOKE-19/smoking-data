@@ -15,5 +15,10 @@ output:
       profile: analysis_snapshot_adaptive_v1
       adaptation_scope: task_adaptive
       row_group_rows: auto
+    publication:
+      parquet:
+        enabled: false
+      sbdf:
+        enabled: true
   logging:
     root_dir: f"{asset_log_root}"

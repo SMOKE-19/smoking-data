@@ -9,7 +9,10 @@ from typing import Any
 import yaml
 
 from smoking_data.core.exceptions import ValidationError
+from smoking_data.runtime.asset_config import deep_merge, load_effective_asset_config
 from smoking_data.runtime.object_store.config import PublicationSpec
+from smoking_data.runtime.paths import infer_project_root
+from smoking_data.runtime.publication_defaults import publication_aware_defaults
 
 SCHEMA_VERSION = "smoking-data.calculated-fact.v4"
 SUPPORTED_UPSTREAM_CODES = frozenset({"0201", "0301"})
@@ -76,13 +79,34 @@ class CalculatedFactSpec:
     canonical_hash: str
 
 
-def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
+def load_calculated_fact_spec(
+    path: str | Path,
+    *,
+    project_root: str | Path | None = None,
+) -> CalculatedFactSpec:
     definition_path = Path(path).expanduser().resolve()
     if not definition_path.is_file():
         _fail("external_file.not_found", "0102 definition does not exist.", path=definition_path)
-    raw = yaml.safe_load(definition_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(raw, dict):
+    payload = yaml.safe_load(definition_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
         _fail("yaml.invalid_type", "0102 definition root must be a mapping.", path="$.")
+    root = (
+        Path(project_root).expanduser().resolve()
+        if project_root is not None
+        else infer_project_root(definition_path)
+    )
+    defaults = load_effective_asset_config(root, "0102").payload
+    defaults = {
+        key: value
+        for key, value in defaults.items()
+        if key not in {"config", "paths", "contract", "execution"}
+    }
+    defaults = publication_aware_defaults(
+        defaults,
+        payload=payload,
+        asset_code="0102",
+    )
+    raw = deep_merge(defaults, payload)
     _unknown(
         raw,
         {
@@ -144,9 +168,7 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
         build.get("identity_columns"),
         path="build_sidecar.identity_columns",
     )
-    partition_by = _strings(
-        build.get("partition_by"), path="build_sidecar.partition_by"
-    )
+    partition_by = _strings(build.get("partition_by"), path="build_sidecar.partition_by")
     if not set(partition_by).issubset(identity_columns):
         _fail(
             "incremental.invalid_identity",
@@ -168,17 +190,13 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
         path="materialize",
     )
     materialize_alias = _string(materialize.get("alias"), path="materialize.alias")
-    materialize_workers = _positive_int(
-        materialize.get("workers", 1), path="materialize.workers"
-    )
+    materialize_workers = _positive_int(materialize.get("workers", 1), path="materialize.workers")
     _one(
         materialize.get("max_tasks_per_child", 1),
         path="materialize.max_tasks_per_child",
     )
 
-    operations = _operation_list(
-        materialize.get("operations"), path="materialize.operations"
-    )
+    operations = _operation_list(materialize.get("operations"), path="materialize.operations")
     operation_kinds = [str(item.get("op") or "") for item in operations]
     allowed_kinds = {
         "include_columns",
@@ -208,7 +226,11 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
         )
     has_expand = "expand_list_rows" in operation_kinds
     has_compact = "compact_list_rows" in operation_kinds
-    if has_expand != has_compact or operation_kinds.count("expand_list_rows") > 1 or operation_kinds.count("compact_list_rows") > 1:
+    if (
+        has_expand != has_compact
+        or operation_kinds.count("expand_list_rows") > 1
+        or operation_kinds.count("compact_list_rows") > 1
+    ):
         _fail(
             "list.phase_pair_required",
             "expand_list_rows and compact_list_rows must occur exactly once as a pair.",
@@ -353,7 +375,11 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
 
 def _expression_file(value: Any, *, owner: Path) -> ExpressionFileSpec:
     item = _mapping(value, path="calculate_columns.expression_file")
-    _unknown(item, {"path", "column_name_field", "expression_field"}, path="calculate_columns.expression_file")
+    _unknown(
+        item,
+        {"path", "column_name_field", "expression_field"},
+        path="calculate_columns.expression_file",
+    )
     path = _supported_external_path(item.get("path"), owner)
     return ExpressionFileSpec(
         path=path,
@@ -373,7 +399,9 @@ def _lookup_files(value: Any, *, owner: Path) -> tuple[LookupFileSpec, ...]:
     result: list[LookupFileSpec] = []
     for index, raw in enumerate(value):
         item = _mapping(raw, path=f"lookup_files[{index}]")
-        _unknown(item, {"alias", "path", "source_keys", "lookup_keys"}, path=f"lookup_files[{index}]")
+        _unknown(
+            item, {"alias", "path", "source_keys", "lookup_keys"}, path=f"lookup_files[{index}]"
+        )
         source_keys = _strings(item.get("source_keys"), path=f"lookup_files[{index}].source_keys")
         lookup_keys = _strings(item.get("lookup_keys"), path=f"lookup_files[{index}].lookup_keys")
         if len(source_keys) != len(lookup_keys):
@@ -454,9 +482,7 @@ def _part_boundary(value: Any, *, identity_columns: tuple[str, ...]) -> int:
     return target_rows
 
 
-def _execution(
-    value: Any, *, requested_materialize_workers: int
-) -> tuple[int, int]:
+def _execution(value: Any, *, requested_materialize_workers: int) -> tuple[int, int]:
     execution = _mapping(value or {}, path="execution")
     _unknown(
         execution,
@@ -482,9 +508,7 @@ def _execution(
     )
     materialize_worker_max = requested_materialize_workers
     for phase_name, phase_value in phases.items():
-        phase = _mapping(
-            phase_value, path=f"execution.memory.phases.{phase_name}"
-        )
+        phase = _mapping(phase_value, path=f"execution.memory.phases.{phase_name}")
         _unknown(
             phase,
             {"workers"},
@@ -526,9 +550,7 @@ def _expand_operation(
     return alias, _in_place_list_columns(operation.get("columns"), path=f"{path}.columns")
 
 
-def _include_operation(
-    operation: dict[str, Any], *, path: str
-) -> tuple[str, tuple[str, ...]]:
+def _include_operation(operation: dict[str, Any], *, path: str) -> tuple[str, tuple[str, ...]]:
     _unknown(operation, {"op", "alias", "columns"}, path=path)
     return (
         _string(operation.get("alias"), path=f"{path}.alias"),
@@ -540,9 +562,7 @@ def _reference_replace_operation(
     operation: dict[str, Any], *, owner: Path, path: str
 ) -> tuple[str, tuple[ColumnAliasFileSpec, ...]]:
     _unknown(operation, {"op", "alias", "files"}, path=path)
-    files = _column_alias_files(
-        operation.get("files") or [], owner=owner, path=f"{path}.files"
-    )
+    files = _column_alias_files(operation.get("files") or [], owner=owner, path=f"{path}.files")
     if not files:
         _fail(
             "yaml.invalid_type",
@@ -635,7 +655,11 @@ def _in_place_list_columns(value: Any, *, path: str) -> tuple[ListColumnSpec, ..
 def _supported_external_path(value: Any, owner: Path) -> Path:
     path = _external_path(value, owner, path="external_file.path")
     if path.suffix.lower() not in SUPPORTED_EXTERNAL_SUFFIXES:
-        _fail("external_file.unsupported_extension", "External files must be CSV or Parquet.", path=path)
+        _fail(
+            "external_file.unsupported_extension",
+            "External files must be CSV or Parquet.",
+            path=path,
+        )
     return path
 
 

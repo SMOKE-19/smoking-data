@@ -12,6 +12,7 @@ from smoking_data.runtime.asset_config import deep_merge, load_effective_asset_c
 from smoking_data.runtime.config import load_config
 from smoking_data.runtime.object_store.config import PublicationSpec
 from smoking_data.runtime.paths import file_sha256, infer_project_root, resolve_project_path
+from smoking_data.runtime.publication_defaults import publication_aware_defaults
 from smoking_data.runtime.template_resolution import resolve_contract_templates
 
 CSV_SOURCE_SCHEMA_VERSION = "smoking-data.csv-source.v1"
@@ -64,7 +65,11 @@ def load_csv_source_spec(
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, dict):
         _fail("0103 YAML root must be a mapping.", path="$")
-    defaults = load_effective_asset_config(root, "0103").payload
+    defaults = publication_aware_defaults(
+        load_effective_asset_config(root, "0103").payload,
+        payload=payload,
+        asset_code="0103",
+    )
     effective = deep_merge(
         {key: value for key, value in defaults.items() if key not in {"config", "paths", "contract"}},
         payload,

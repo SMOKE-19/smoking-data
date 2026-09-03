@@ -29,6 +29,11 @@ from smoking_data.runtime.active_sidecar_plan import (
 from smoking_data.runtime.memory import current_rss_mb, peak_rss_mb, process_io_bytes
 from smoking_data.runtime.naming import part_file_name, partition_dir_name, task_id
 from smoking_data.runtime.paths import ensure_dir, reset_path
+from smoking_data.runtime.selector_ipc import (
+    read_sidecar_frame,
+    scan_sidecar,
+    write_ipc_frame_atomic,
+)
 from smoking_data.runtime.task_telemetry import task_telemetry_phase
 
 ESTIMATED_PAYLOAD_BYTES_COLUMN = "__estimated_payload_bytes"
@@ -106,14 +111,13 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
     partition_column = str(request["partition_column"])
     group_keys = [str(item) for item in request.get("group_keys") or []]
     window_partitions = [
-        tuple(str(column) for column in item)
-        for item in request.get("window_partitions") or []
+        tuple(str(column) for column in item) for item in request.get("window_partitions") or []
     ]
     pivot = dict(request.get("pivot") or {})
     pivot_enabled = bool(pivot.get("enabled", False))
     pivot_row_keys = [str(item) for item in pivot.get("row_keys") or []]
     active_lf = pl.concat(
-        [pl.scan_parquet(path) for path in piece_paths], how="diagonal_relaxed"
+        [scan_sidecar(path) for path in piece_paths], how="diagonal_relaxed"
     ).drop(SPILL_REQUIRED_COLUMN, strict=False)
     active_schema = active_lf.collect_schema()
     if partition_column not in active_schema:
@@ -168,11 +172,7 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
             resolved = (
                 active_lf.filter(pl.col(partition_column) == pl.lit(raw_partition_value))
                 .sort(
-                    list(
-                        dict.fromkeys(
-                            [*group_keys, SOURCE_FILE_COLUMN, SOURCE_ROW_INDEX_COLUMN]
-                        )
-                    )
+                    list(dict.fromkeys([*group_keys, SOURCE_FILE_COLUMN, SOURCE_ROW_INDEX_COLUMN]))
                 )
                 .collect(engine="streaming")
             )
@@ -199,9 +199,9 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
             )
             snapshot_source_row_groups.update(
                 (str(item[SOURCE_FILE_COLUMN]), int(item[SOURCE_ROW_GROUP_COLUMN]))
-                for item in resolved.select(
-                    [SOURCE_FILE_COLUMN, SOURCE_ROW_GROUP_COLUMN]
-                ).unique().iter_rows(named=True)
+                for item in resolved.select([SOURCE_FILE_COLUMN, SOURCE_ROW_GROUP_COLUMN])
+                .unique()
+                .iter_rows(named=True)
             )
             window_max_group_rows = max(
                 window_max_group_rows,
@@ -209,8 +209,8 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
             )
             if pivot_required and all(column in resolved for column in pivot_required):
                 pivot_samples.append(resolved.select(pivot_required).head(sample_per_partition))
-            snapshot_shard = snapshot_staging / f"part-{partition_index:05d}.parquet"
-            resolved.write_parquet(snapshot_shard, compression="uncompressed")
+            snapshot_shard = snapshot_staging / f"part-{partition_index:05d}.arrow"
+            write_ipc_frame_atomic(resolved, snapshot_shard)
             for values in (
                 resolved.select(PART_INDEX_COLUMN)
                 .unique()
@@ -230,9 +230,9 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
                 )
                 coordinate_path = ensure_dir(
                     coordinate_staging / partition_dir_name(partition_value)
-                ) / part_file_name(part_index, suffix=".coordinates.parquet")
-                coordinates.write_parquet(coordinate_path, compression="uncompressed")
-                arrow_path = coordinate_path.with_suffix(".arrow")
+                ) / part_file_name(part_index, suffix=".coordinates.arrow")
+                write_ipc_frame_atomic(coordinates, coordinate_path)
+                arrow_path = coordinate_path.with_name(f"{coordinate_path.stem}.rust.arrow")
                 write_rust_coordinate_file(coordinates, arrow_path)
                 relative = coordinate_path.relative_to(coordinate_staging)
                 coordinate_tasks.append(
@@ -244,9 +244,7 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
                         "rust_coordinate_path": str(
                             Path("parts") / arrow_path.relative_to(coordinate_staging)
                         ),
-                        "spill_required": bool(
-                            task_frame.get_column(SPILL_REQUIRED_COLUMN).any()
-                        ),
+                        "spill_required": bool(task_frame.get_column(SPILL_REQUIRED_COLUMN).any()),
                     }
                 )
             del resolved
@@ -255,7 +253,9 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
             pivot_input = (
                 pl.concat(pivot_samples, how="diagonal_relaxed")
                 if pivot_samples
-                else pl.DataFrame(schema={column: active_schema[column] for column in pivot_required})
+                else pl.DataFrame(
+                    schema={column: active_schema[column] for column in pivot_required}
+                )
             )
             pivot_profile = build_pivot_shape_profile(pivot_input, pivot)
             pivot_profile["estimator_mode"] = "bounded_partition_sample"
@@ -281,8 +281,13 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
                 "source_files": len(snapshot_source_files),
                 "source_row_groups": len(snapshot_source_row_groups),
                 "estimated_size_bytes": snapshot_estimated_size,
-                "layout": "partition_sharded_dataset",
+                "layout": "partition_sharded_arrow_ipc_dataset",
+                "storage": "arrow_ipc_file",
                 "shards": len(partition_values),
+            },
+            "coordinate_storage": {
+                "planner": "arrow_ipc_file",
+                "rust_materialize": "arrow_ipc_file",
             },
             "coordinate_tasks": coordinate_tasks,
             "coordinate_boundary_fanout": _fanout_profile_from_tasks(
@@ -450,9 +455,7 @@ def _pivot_required_columns(pivot: dict[str, Any]) -> list[str]:
     )
 
 
-def _max_window_group_rows(
-    frame: pl.DataFrame, window_partitions: list[tuple[str, ...]]
-) -> int:
+def _max_window_group_rows(frame: pl.DataFrame, window_partitions: list[tuple[str, ...]]) -> int:
     if not window_partitions:
         return 0
     keys = list(window_partitions[0])
@@ -498,9 +501,8 @@ def _fanout_profile_from_tasks(
     for task in tasks:
         relative = Path(str(task["coordinate_path"]))
         coordinate_path = coordinate_staging / Path(*relative.parts[1:])
-        coordinates = pl.read_parquet(
-            coordinate_path,
-            columns=[SOURCE_FILE_COLUMN, SOURCE_ROW_GROUP_COLUMN],
+        coordinates = read_sidecar_frame(coordinate_path).select(
+            [SOURCE_FILE_COLUMN, SOURCE_ROW_GROUP_COLUMN]
         )
         files.append(coordinates.get_column(SOURCE_FILE_COLUMN).n_unique())
         row_groups.append(

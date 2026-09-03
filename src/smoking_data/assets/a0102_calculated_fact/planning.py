@@ -62,7 +62,7 @@ def preflight_calculated_fact_yaml(
         asset_code="0102",
     )
     definition = resolve_project_path(definition_path, project_root=config.project_root)
-    spec = load_calculated_fact_spec(definition)
+    spec = load_calculated_fact_spec(definition, project_root=config.project_root)
     upstream_config = load_config(
         project_root=config.project_root,
         asset_code=spec.upstream_asset_code,

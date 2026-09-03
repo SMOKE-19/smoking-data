@@ -216,7 +216,7 @@
               }
             },
             "parquet_writer": {"$ref": "#/$defs/parquetWriter"},
-            "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
+            "publication": {"$ref": "publication-v1.schema.json#/$defs/publicationOverride"}
           }
         },
         "logging": {"$ref": "#/$defs/loggingOutput"}

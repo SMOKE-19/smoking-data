@@ -3,6 +3,17 @@
   "$id": "publication-v1.schema.json",
   "title": "smoking-data immutable object-store publication",
   "$defs": {
+    "publicationOverride": {
+      "type": "object",
+      "description": "Asset Definition opts in with target and may add dataset-specific representation settings; shared policy comes from common config.",
+      "additionalProperties": false,
+      "required": ["target"],
+      "properties": {
+        "target": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"},
+        "parquet": {"$ref": "#/$defs/publication/properties/parquet"},
+        "sbdf": {"$ref": "#/$defs/publication/properties/sbdf"}
+      }
+    },
     "publication": {
       "type": "object",
       "additionalProperties": false,

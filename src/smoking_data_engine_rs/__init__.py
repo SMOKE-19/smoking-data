@@ -65,7 +65,7 @@ __all__ = [
     "validate_expression_ir",
 ]
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 RestoreWorkerArgs = tuple[
     str,

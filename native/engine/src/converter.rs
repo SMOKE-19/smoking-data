@@ -29,8 +29,10 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::coord::read_coord_groups;
@@ -148,6 +150,8 @@ struct WriterConfig {
     #[serde(default)]
     ordered_operations: Vec<OrderedOperation>,
     compression: Option<String>,
+    #[serde(default = "default_writer_queue_capacity_batches")]
+    writer_queue_capacity_batches: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -288,6 +292,168 @@ struct ManagedParquetWriter {
     temp_path: PathBuf,
 }
 
+#[derive(Clone)]
+struct ParquetOutputConfig {
+    output_file_name: Option<String>,
+    single_partition_guaranteed: bool,
+    file_name_rule: Option<String>,
+    source_stem: Option<String>,
+    coord_chunk_id: Option<usize>,
+    partition_columns: Vec<String>,
+    file_name_prefix: Option<String>,
+    output_row_group_rows: Option<usize>,
+    compression: Option<String>,
+    long_fact_enabled: bool,
+}
+
+impl From<&WriterConfig> for ParquetOutputConfig {
+    fn from(config: &WriterConfig) -> Self {
+        Self {
+            output_file_name: config.output_file_name.clone(),
+            single_partition_guaranteed: config.single_partition_guaranteed,
+            file_name_rule: config.file_name_rule.clone(),
+            source_stem: config.source_stem.clone(),
+            coord_chunk_id: config.coord_chunk_id,
+            partition_columns: config.partition_columns.clone(),
+            file_name_prefix: config.file_name_prefix.clone(),
+            output_row_group_rows: config.output_row_group_rows,
+            compression: config.compression.clone(),
+            long_fact_enabled: config.long_fact.is_some(),
+        }
+    }
+}
+
+struct WriterBatch {
+    output_schema: Arc<Schema>,
+    batch: RecordBatch,
+    source_row_group_id: usize,
+}
+
+struct WriterPipelineResult {
+    output_paths: Vec<String>,
+    output_file_write_touches: usize,
+    batches_written: usize,
+    rows_written: usize,
+    writer_write_sec: f64,
+    writer_finalize_sec: f64,
+}
+
+struct MaterializeWriterPipeline {
+    sender: Option<SyncSender<WriterBatch>>,
+    handle: Option<JoinHandle<Result<WriterPipelineResult, String>>>,
+    commit: Arc<AtomicBool>,
+    capacity: usize,
+}
+
+impl MaterializeWriterPipeline {
+    fn start(
+        output_dir: String,
+        config: ParquetOutputConfig,
+        capacity: usize,
+    ) -> pyo3::PyResult<Self> {
+        let capacity = capacity.max(1);
+        let (sender, receiver) = sync_channel::<WriterBatch>(capacity);
+        let commit = Arc::new(AtomicBool::new(false));
+        let writer_commit = Arc::clone(&commit);
+        let handle = thread::Builder::new()
+            .name("smoking-materialize-writer".to_string())
+            .spawn(move || {
+                let mut writers: HashMap<String, ManagedParquetWriter> = HashMap::new();
+                let mut output_file_write_touches = 0usize;
+                let mut batches_written = 0usize;
+                let mut rows_written = 0usize;
+                let mut writer_write_sec = 0.0f64;
+                for message in receiver {
+                    let started = Instant::now();
+                    let result = write_partitioned_batch(
+                        &mut writers,
+                        &output_dir,
+                        &config,
+                        message.output_schema,
+                        &message.batch,
+                        message.source_row_group_id,
+                    );
+                    writer_write_sec += started.elapsed().as_secs_f64();
+                    match result {
+                        Ok(touches) => {
+                            output_file_write_touches += touches;
+                            batches_written += 1;
+                            rows_written += message.batch.num_rows();
+                        }
+                        Err(error) => {
+                            cleanup_managed_writer_temporaries(writers);
+                            return Err(error.to_string());
+                        }
+                    }
+                }
+                if !writer_commit.load(AtomicOrdering::Acquire) {
+                    cleanup_managed_writer_temporaries(writers);
+                    return Err("materialize writer pipeline aborted".to_string());
+                }
+                let finalize_started = Instant::now();
+                let output_paths = finalize_managed_writers(writers)?;
+                Ok(WriterPipelineResult {
+                    output_paths,
+                    output_file_write_touches,
+                    batches_written,
+                    rows_written,
+                    writer_write_sec,
+                    writer_finalize_sec: finalize_started.elapsed().as_secs_f64(),
+                })
+            })
+            .map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to spawn materialize writer thread: {error}"
+                ))
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            handle: Some(handle),
+            commit,
+            capacity,
+        })
+    }
+
+    fn send(&self, message: WriterBatch) -> pyo3::PyResult<()> {
+        self.sender
+            .as_ref()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "materialize writer channel is already closed",
+                )
+            })?
+            .send(message)
+            .map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "materialize writer channel failed: {error}"
+                ))
+            })
+    }
+
+    fn finish(mut self) -> pyo3::PyResult<WriterPipelineResult> {
+        self.commit.store(true, AtomicOrdering::Release);
+        self.sender.take();
+        let handle = self.handle.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("materialize writer thread is missing")
+        })?;
+        handle
+            .join()
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("materialize writer thread panicked")
+            })?
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+}
+
+impl Drop for MaterializeWriterPipeline {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct TempOutputGuard {
     path: PathBuf,
     committed: bool,
@@ -338,6 +504,10 @@ type DenseIndexCache = HashMap<String, DenseIndex>;
 
 fn default_restore_enabled() -> bool {
     true
+}
+
+fn default_writer_queue_capacity_batches() -> usize {
+    2
 }
 
 fn validate_writer_input_contract(writer_config: &WriterConfig) -> pyo3::PyResult<()> {
@@ -1333,13 +1503,13 @@ fn partition_key_for_row(
 
 fn output_path_for_partition(
     output_dir: &str,
-    writer_config: &WriterConfig,
+    writer_config: &ParquetOutputConfig,
     partition_key: &[(String, String)],
     row_group_id: usize,
 ) -> std::path::PathBuf {
     let mut path = std::path::PathBuf::from(output_dir);
     for (column, value) in partition_key {
-        if writer_config.long_fact.is_some() {
+        if writer_config.long_fact_enabled {
             path.push(format!(
                 "partition-{}-{}",
                 sanitize_path_component(column),
@@ -1354,7 +1524,10 @@ fn output_path_for_partition(
     path
 }
 
-fn render_output_file_name(writer_config: &WriterConfig, row_group_id: Option<usize>) -> String {
+fn render_output_file_name(
+    writer_config: &ParquetOutputConfig,
+    row_group_id: Option<usize>,
+) -> String {
     if let Some(rule) = &writer_config.file_name_rule {
         let source_stem = writer_config.source_stem.as_deref().unwrap_or("source");
         let chunk_id = writer_config.coord_chunk_id.unwrap_or(0);
@@ -1379,7 +1552,7 @@ fn render_output_file_name(writer_config: &WriterConfig, row_group_id: Option<us
 fn write_partitioned_batch(
     writers: &mut HashMap<String, ManagedParquetWriter>,
     output_dir: &str,
-    writer_config: &WriterConfig,
+    writer_config: &ParquetOutputConfig,
     output_schema: Arc<Schema>,
     batch: &RecordBatch,
     row_group_id: usize,
@@ -1472,6 +1645,86 @@ fn write_partitioned_batch(
         files_touched += 1;
     }
     Ok(files_touched)
+}
+
+fn cleanup_managed_writer_temporaries(writers: HashMap<String, ManagedParquetWriter>) {
+    let temporary_paths = writers
+        .values()
+        .map(|managed| managed.temp_path.clone())
+        .collect::<Vec<_>>();
+    drop(writers);
+    for path in temporary_paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn finalize_managed_writers(
+    writers: HashMap<String, ManagedParquetWriter>,
+) -> Result<Vec<String>, String> {
+    if writers.is_empty() {
+        return Err("curated task produced no output writers".to_string());
+    }
+    let mut pending = writers.into_values().collect::<Vec<_>>();
+    pending.sort_by(|left, right| left.final_path.cmp(&right.final_path));
+    let mut pending = pending.into_iter();
+    let mut managed = Vec::new();
+    while let Some(item) = pending.next() {
+        let ManagedParquetWriter {
+            writer,
+            final_path,
+            temp_path,
+        } = item;
+        if let Err(error) = writer.close() {
+            let failed_path = temp_path.display().to_string();
+            let _ = std::fs::remove_file(&temp_path);
+            for (temporary, _) in &managed {
+                let _ = std::fs::remove_file(temporary);
+            }
+            for remaining in pending {
+                let temporary = remaining.temp_path.clone();
+                drop(remaining);
+                let _ = std::fs::remove_file(temporary);
+            }
+            return Err(format!(
+                "failed to finalize output parquet {failed_path}: {error}"
+            ));
+        }
+        managed.push((temp_path, final_path));
+    }
+    let mut output_paths = Vec::with_capacity(managed.len());
+    let mut published_paths = Vec::new();
+    for (temp_path, final_path) in &managed {
+        if final_path.exists() {
+            if let Err(error) = remove_file_with_retry(final_path) {
+                for path in &published_paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                for (pending_temp, _) in &managed {
+                    let _ = std::fs::remove_file(pending_temp);
+                }
+                return Err(format!(
+                    "failed to replace existing output parquet {}: {error}",
+                    final_path.display()
+                ));
+            }
+        }
+        if let Err(error) = rename_with_retry(temp_path, final_path) {
+            for path in &published_paths {
+                let _ = std::fs::remove_file(path);
+            }
+            for (pending_temp, _) in &managed {
+                let _ = std::fs::remove_file(pending_temp);
+            }
+            return Err(format!(
+                "failed to publish output parquet {} -> {}: {error}",
+                temp_path.display(),
+                final_path.display()
+            ));
+        }
+        published_paths.push(final_path.clone());
+        output_paths.push(final_path.to_string_lossy().to_string());
+    }
+    Ok(output_paths)
 }
 
 fn write_batch_to_path(
@@ -2439,6 +2692,7 @@ pub fn execute_curated_task_impl(
             post_operations: Vec::new(),
             ordered_operations: Vec::new(),
             compression: None,
+            writer_queue_capacity_batches: default_writer_queue_capacity_batches(),
         },
     };
     validate_writer_input_contract(&writer_config)?;
@@ -2538,12 +2792,18 @@ pub fn execute_curated_task_impl(
             "failed to create output dir {output_dir}: {err}"
         ))
     })?;
-    let mut writers: HashMap<String, ManagedParquetWriter> = HashMap::new();
+    let writer_pipeline = MaterializeWriterPipeline::start(
+        output_dir.clone(),
+        ParquetOutputConfig::from(&writer_config),
+        writer_config.writer_queue_capacity_batches,
+    )?;
+    let writer_queue_capacity = writer_pipeline.capacity;
+    let mut writer_queue_send_wait_sec = 0.0f64;
+    let mut writer_batches_produced = 0usize;
     let mut output_schema: Option<Arc<Schema>> = None;
     let mut rows_written = 0usize;
     let mut source_files_seen: HashSet<String> = HashSet::new();
     let mut row_group_count = 0usize;
-    let mut output_file_write_touches = 0usize;
     let mut detailed_profile = DetailedProfile::default();
     let mut long_fact_fingerprint_cursor = 0usize;
     let source_bytes_read = Arc::new(AtomicU64::new(0));
@@ -2730,16 +2990,14 @@ pub fn execute_curated_task_impl(
                 .max_restored_batch_array_bytes
                 .max(restored_batch_array_bytes);
             detailed_profile.sum_restored_batch_array_bytes += restored_batch_array_bytes;
-            let writer_write_started = Instant::now();
-            output_file_write_touches += write_partitioned_batch(
-                &mut writers,
-                &output_dir,
-                &writer_config,
-                group_output_schema.clone(),
-                &restored,
-                group.row_group_id,
-            )?;
-            detailed_profile.writer_write_sec += writer_write_started.elapsed().as_secs_f64();
+            let writer_send_started = Instant::now();
+            writer_pipeline.send(WriterBatch {
+                output_schema: group_output_schema.clone(),
+                batch: restored,
+                source_row_group_id: group.row_group_id,
+            })?;
+            writer_queue_send_wait_sec += writer_send_started.elapsed().as_secs_f64();
+            writer_batches_produced += 1;
         }
         if drop_cache_hint {
             if let Ok(file) = File::open(&group.source_file) {
@@ -2793,56 +3051,30 @@ pub fn execute_curated_task_impl(
             .max_restored_batch_array_bytes
             .max(restored_batch_array_bytes);
         detailed_profile.sum_restored_batch_array_bytes += restored_batch_array_bytes;
-        let writer_write_started = Instant::now();
-        output_file_write_touches += write_partitioned_batch(
-            &mut writers,
-            &output_dir,
-            &writer_config,
-            group_output_schema,
-            &restored,
-            0,
-        )?;
-        detailed_profile.writer_write_sec += writer_write_started.elapsed().as_secs_f64();
+        let writer_send_started = Instant::now();
+        writer_pipeline.send(WriterBatch {
+            output_schema: group_output_schema,
+            batch: restored,
+            source_row_group_id: 0,
+        })?;
+        writer_queue_send_wait_sec += writer_send_started.elapsed().as_secs_f64();
+        writer_batches_produced += 1;
     }
     let restore_sec = restore_started.elapsed().as_secs_f64();
 
-    let write_started = Instant::now();
-    if writers.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "curated task produced no output writers",
-        ));
+    let writer_result = writer_pipeline.finish()?;
+    let output_paths = writer_result.output_paths;
+    let output_file_write_touches = writer_result.output_file_write_touches;
+    detailed_profile.writer_write_sec = writer_result.writer_write_sec;
+    let parquet_write_sec = writer_result.writer_finalize_sec;
+    if writer_result.batches_written != writer_batches_produced
+        || writer_result.rows_written != rows_written
+    {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "materialize writer count mismatch: produced_batches={writer_batches_produced} written_batches={} produced_rows={rows_written} written_rows={}",
+            writer_result.batches_written, writer_result.rows_written
+        )));
     }
-    let mut output_paths: Vec<String> = Vec::new();
-    for (_path, managed) in writers {
-        let ManagedParquetWriter {
-            writer,
-            final_path,
-            temp_path,
-        } = managed;
-        writer.close().map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to finalize output parquet {}: {err}",
-                temp_path.display()
-            ))
-        })?;
-        if final_path.exists() {
-            remove_file_with_retry(&final_path).map_err(|err| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "failed to replace existing output parquet {}: {err}",
-                    final_path.display()
-                ))
-            })?;
-        }
-        rename_with_retry(&temp_path, &final_path).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to publish output parquet {} -> {}: {err}",
-                temp_path.display(),
-                final_path.display()
-            ))
-        })?;
-        output_paths.push(final_path.to_string_lossy().to_string());
-    }
-    let parquet_write_sec = write_started.elapsed().as_secs_f64();
     if drop_cache_hint {
         for output_path in &output_paths {
             if let Ok(file) = File::open(output_path) {
@@ -3027,6 +3259,28 @@ pub fn execute_curated_task_impl(
     stats.insert(
         "writer_write_sec".to_string(),
         detailed_profile.writer_write_sec,
+    );
+    stats.insert("writer_pipeline_enabled".to_string(), 1.0);
+    stats.insert("writer_thread_count".to_string(), 1.0);
+    stats.insert(
+        "writer_queue_capacity_batches".to_string(),
+        writer_queue_capacity as f64,
+    );
+    stats.insert(
+        "writer_batches_produced".to_string(),
+        writer_batches_produced as f64,
+    );
+    stats.insert(
+        "writer_batches_written".to_string(),
+        writer_result.batches_written as f64,
+    );
+    stats.insert(
+        "writer_queue_send_wait_sec".to_string(),
+        writer_queue_send_wait_sec,
+    );
+    stats.insert(
+        "writer_finalize_sec".to_string(),
+        writer_result.writer_finalize_sec,
     );
     stats.insert(
         "cache_hint_calls".to_string(),

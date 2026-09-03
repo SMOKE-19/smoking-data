@@ -15,6 +15,7 @@ from typing import Any
 import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
 from smoking_data.backends.rust_engine import (
@@ -95,7 +96,6 @@ from smoking_data.runtime.active_sidecar_plan import (
 )
 from smoking_data.runtime.active_sidecar_plan import (
     load_active_sidecar_plan,
-    run_active_sidecar_pipeline_subprocess,
     run_active_sidecar_plan_subprocess,
 )
 from smoking_data.runtime.adaptive_sizing_registry import (
@@ -139,10 +139,16 @@ from smoking_data.runtime.paths import (
     reset_path,
     resolve_project_path,
 )
-from smoking_data.runtime.selector_piece import (
-    REQUEST_SCHEMA_VERSION as SELECTOR_PIECE_REQUEST_VERSION,
+from smoking_data.runtime.selector_ipc import (
+    ipc_file_is_valid,
+    open_ipc_file,
+    read_ipc_frame,
+    read_sidecar_frame,
+    scan_sidecar,
+    sidecar_rows,
+    sidecar_schema,
+    write_ipc_frame_atomic,
 )
-from smoking_data.runtime.selector_piece import run_selector_piece_subprocess
 from smoking_data.runtime.task_runner import run_tasks_in_subprocesses
 from smoking_data.runtime.task_telemetry import (
     emit_task_telemetry_event,
@@ -184,7 +190,7 @@ RUST_DIRECT_TYPE_MAP = {
 }
 ESTIMATED_PAYLOAD_BYTES_COLUMN = "__estimated_payload_bytes"
 SPILL_REQUIRED_COLUMN = "__spill_required"
-CANDIDATE_MANIFEST_VERSION = "smoking-data.0201-candidates.v1"
+CANDIDATE_MANIFEST_VERSION = "smoking-data.0201-candidates.v2"
 SOURCE_SNAPSHOT_CHANGED_MARKER = "SOURCE_SNAPSHOT_CHANGED "
 INTERNAL_DISABLE_TASK_TELEMETRY_ENV = "SMOKING_DATA_INTERNAL_DISABLE_TASK_TELEMETRY"
 INTERNAL_DISABLE_ACTIVE_SIDECAR_PLAN_ENV = "SMOKING_DATA_INTERNAL_DISABLE_ACTIVE_SIDECAR_PLAN"
@@ -342,22 +348,29 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         project_root=config.project_root,
         model_key=str(adaptive_sizing_key["model_key"]),
     )
-    sidecar_memory_policy = config.phase_memory_policy(
-        "build_sidecar", requested_workers=config.sidecar_workers
+    candidate_memory_policy = config.phase_memory_policy(
+        "build_sidecar.01_candidate", requested_workers=config.candidate_workers
     )
     sidecar_memory_history = load_phase_memory_history(
         project_root=config.project_root,
         model_key=str(adaptive_sizing_key["model_key"]),
-        phase_name="build_sidecar.candidate",
+        phase_name="build_sidecar.01_candidate",
         admission_limit_mb=int(config.memory_budget_mb * config.memory_safety_ratio),
     )
+    bucketize_memory_policy = config.phase_memory_policy(
+        "build_sidecar.02_ipc_writer", requested_workers=1
+    )
+    active_selection_memory_policy = config.phase_memory_policy(
+        "build_sidecar.03_active_selection",
+        requested_workers=config.active_selection_workers,
+    )
     materialize_memory_policy = config.phase_memory_policy(
-        "materialize", requested_workers=config.workers
+        "materialize.01_payload", requested_workers=config.workers
     )
     materialize_memory_history = load_phase_memory_history(
         project_root=config.project_root,
         model_key=str(adaptive_sizing_key["model_key"]),
-        phase_name="materialize.fused",
+        phase_name="materialize.01_payload",
         admission_limit_mb=int(config.memory_budget_mb * config.memory_safety_ratio),
     )
     registry_history_metadata = deepcopy(
@@ -415,25 +428,49 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         if isinstance(local_active_sidecar_decision, dict)
         else None
     )
-    sidecar_memory_admission = build_phase_memory_admission(
-        phase="build_sidecar",
+    candidate_memory_admission = build_phase_memory_admission(
+        phase="build_sidecar.01_candidate",
         hard_limit_mb=config.memory_budget_mb,
         safety_ratio=config.memory_safety_ratio,
-        policy=sidecar_memory_policy,
-        requested_workers=config.sidecar_workers,
+        policy=candidate_memory_policy,
+        requested_workers=config.candidate_workers,
         historical_worker_peak_p95_mb=sidecar_memory_history["peak_rss_p95_mb"],
         fallback_worker_peak_mb=min(
             config.sidecar_max_projected_bytes_mb,
             max(64, int(config.memory_budget_mb * config.memory_safety_ratio) // 2),
         ),
     )
-    sidecar_phase_budget_mb = int(sidecar_memory_admission["safe_envelope_mb"])
-    admitted_sidecar_workers = int(sidecar_memory_admission["admitted_workers"])
+    bucketize_memory_admission = build_phase_memory_admission(
+        phase="build_sidecar.02_ipc_writer",
+        hard_limit_mb=config.memory_budget_mb,
+        safety_ratio=config.memory_safety_ratio,
+        policy=bucketize_memory_policy,
+        requested_workers=1,
+        historical_worker_peak_p95_mb=None,
+        fallback_worker_peak_mb=max(64, config.sidecar_max_projected_bytes_mb),
+    )
+    active_selection_memory_admission = build_phase_memory_admission(
+        phase="build_sidecar.03_active_selection",
+        hard_limit_mb=config.memory_budget_mb,
+        safety_ratio=config.memory_safety_ratio,
+        policy=active_selection_memory_policy,
+        requested_workers=config.active_selection_workers,
+        historical_worker_peak_p95_mb=None,
+        fallback_worker_peak_mb=max(64, config.sidecar_max_projected_bytes_mb),
+    )
+    sidecar_phase_budget_mb = min(
+        int(candidate_memory_admission["safe_envelope_mb"]),
+        int(bucketize_memory_admission["safe_envelope_mb"]),
+        int(active_selection_memory_admission["safe_envelope_mb"]),
+    )
+    admitted_candidate_workers = int(candidate_memory_admission["admitted_workers"])
+    admitted_bucketize_workers = int(bucketize_memory_admission["admitted_workers"])
+    admitted_active_selection_workers = int(active_selection_memory_admission["admitted_workers"])
     sidecar_projected_limit_mb = max(
         1,
         min(
             config.sidecar_max_projected_bytes_mb,
-            int(sidecar_memory_admission["worker_pool_mb"]) // max(1, admitted_sidecar_workers),
+            int(candidate_memory_admission["worker_pool_mb"]) // max(1, admitted_candidate_workers),
         ),
     )
     materialize_phase_budget_mb = int(config.memory_budget_mb * config.memory_safety_ratio)
@@ -461,7 +498,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     try:
         with task_telemetry_phase(
             sidecar_telemetry_endpoint,
-            "build_sidecar.active_selection",
+            "build_sidecar.03_active_selection",
         ):
             active_snapshot, sidecar_profile = _build_active_coordinate_snapshot(
                 files,
@@ -478,7 +515,9 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 memory_budget_mb=sidecar_phase_budget_mb,
                 max_source_files_per_task=config.max_source_files_per_task,
                 max_source_row_groups_per_task=config.max_source_row_groups_per_task,
-                sidecar_workers=admitted_sidecar_workers,
+                candidate_workers=admitted_candidate_workers,
+                bucketize_workers=admitted_bucketize_workers,
+                active_selection_workers=admitted_active_selection_workers,
                 sidecar_worker_recycle_mode=config.sidecar_worker_recycle_mode,
                 sidecar_max_source_files=config.sidecar_max_source_files,
                 sidecar_max_projected_bytes_mb=sidecar_projected_limit_mb,
@@ -507,7 +546,11 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         if sidecar_telemetry_handle is not None:
             sidecar_telemetry_profile = sidecar_telemetry_handle.stop()
     sidecar_profile["phase_elapsed_sec"] = time.perf_counter() - selector_started
-    sidecar_profile["memory_admission"] = sidecar_memory_admission
+    sidecar_profile["memory_admission"] = {
+        "build_sidecar.01_candidate": candidate_memory_admission,
+        "build_sidecar.02_ipc_writer": bucketize_memory_admission,
+        "build_sidecar.03_active_selection": active_selection_memory_admission,
+    }
     sidecar_profile["memory_history"] = sidecar_memory_history
     sidecar_profile["effective_max_projected_bytes_mb"] = sidecar_projected_limit_mb
     phase_profile["active_row_selection_sec"] = sidecar_profile["phase_elapsed_sec"]
@@ -623,7 +666,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                     task.task_id,
                     {"read_path": "row_group_selected", "reason": "probe_unavailable"},
                 ),
-                "__telemetry_phase_name": "materialize.fused",
+                "__telemetry_phase_name": "materialize.01_payload",
             },
         )
         for task in coordinate_tasks
@@ -793,7 +836,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         memory_budget_bytes=materialize_phase_budget_mb * 1024 * 1024,
     )
     materialize_memory_admission = build_phase_memory_admission(
-        phase="materialize",
+        phase="materialize.01_payload",
         hard_limit_mb=config.memory_budget_mb,
         safety_ratio=config.memory_safety_ratio,
         policy=materialize_memory_policy,
@@ -1077,11 +1120,11 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             shared_telemetry_endpoint,
             "phase_planned",
             task_id=None,
-            details={"phase_name": "save_dataset.commit", "total": 1, "unit": "generation"},
+            details={"phase_name": "save_dataset.01_commit", "total": 1, "unit": "generation"},
         )
         with task_telemetry_phase(
             shared_telemetry_endpoint,
-            "save_dataset.commit",
+            "save_dataset.01_commit",
         ):
             output_files, transaction_profile = transaction.commit()
         phase_profile["transaction_commit_sec"] = time.perf_counter() - commit_started
@@ -1297,9 +1340,11 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 "memory_contract": {
                     "hard_limit_mb": config.memory_budget_mb,
                     "safety_ratio": config.memory_safety_ratio,
-                    "build_sidecar": sidecar_memory_admission,
-                    "materialize": materialize_memory_admission,
-                    "save_dataset": {
+                    "build_sidecar.01_candidate": candidate_memory_admission,
+                    "build_sidecar.02_ipc_writer": bucketize_memory_admission,
+                    "build_sidecar.03_active_selection": active_selection_memory_admission,
+                    "materialize.01_payload": materialize_memory_admission,
+                    "save_dataset.01_commit": {
                         "safe_envelope_mb": int(
                             config.memory_budget_mb * config.memory_safety_ratio
                         ),
@@ -1338,12 +1383,11 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 sidecar_telemetry_profile,
                 task_telemetry_profile,
                 admission_limits_mb={
-                    "build_sidecar.candidate": sidecar_phase_budget_mb,
-                    "build_sidecar.active_selection": sidecar_phase_budget_mb,
-                    "build_sidecar.bucketize": sidecar_phase_budget_mb,
-                    "build_sidecar.selector_bucket": sidecar_phase_budget_mb,
-                    "materialize.fused": materialize_phase_budget_mb,
-                    "save_dataset.commit": int(
+                    "build_sidecar.01_candidate": sidecar_phase_budget_mb,
+                    "build_sidecar.02_ipc_writer": sidecar_phase_budget_mb,
+                    "build_sidecar.03_active_selection": sidecar_phase_budget_mb,
+                    "materialize.01_payload": materialize_phase_budget_mb,
+                    "save_dataset.01_commit": int(
                         config.memory_budget_mb * config.memory_safety_ratio
                     ),
                 },
@@ -1355,6 +1399,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             "task_memory": _task_memory_profile(task_results),
             "task_phase_profile": task_phase_profile,
             "rust_task_phase_profile": rust_phase_profile,
+            "materialize_writer_pipeline": _materialize_writer_pipeline_profile(task_results),
             "window_planner": window_profile,
         },
     )
@@ -1475,7 +1520,7 @@ def _summarize_coordinate_task_source_span(
     expected_payload_bytes = 0
     for task in tasks:
         partitions.add(str(task.partition_value))
-        coordinates = pl.read_parquet(task.payload["coordinate_path"])
+        coordinates = read_sidecar_frame(Path(str(task.payload["coordinate_path"])))
         selected_rows += coordinates.height
         unique_files = [
             str(value)
@@ -1688,7 +1733,7 @@ def _build_0201_physical_plan(
     physical_tasks: list[PhysicalTask] = []
     for task in tasks:
         subset = (
-            pl.read_parquet(Path(str(task.payload["coordinate_path"])))
+            read_sidecar_frame(Path(str(task.payload["coordinate_path"])))
             if active_snapshot is None
             else active_snapshot.filter(
                 (pl.col(partition_column).cast(pl.String) == str(task.partition_value))
@@ -1949,7 +1994,7 @@ def indexed_curated_task_worker(task: TaskSpec) -> TaskResult:
     payload = task.payload
     partition_value = str(task.partition_value)
     task_started = time.perf_counter()
-    coordinates = pl.read_parquet(payload["coordinate_path"])
+    coordinates = read_sidecar_frame(Path(str(payload["coordinate_path"])))
     coordinate_rows = coordinates.height
     coordinate_source_files = coordinates.get_column(SOURCE_FILE_COLUMN).n_unique()
     coordinate_row_groups = coordinates.select(
@@ -2269,7 +2314,7 @@ def _coordinate_task_fingerprint(
     reference_fingerprint: str,
     source_stats: dict[str, dict[str, int]],
 ) -> str:
-    coordinates = pl.read_parquet(task.payload["coordinate_path"])
+    coordinates = read_sidecar_frame(Path(str(task.payload["coordinate_path"])))
     selected_sources = sorted(
         str(value) for value in coordinates.get_column(SOURCE_FILE_COLUMN).unique().to_list()
     )
@@ -2422,7 +2467,9 @@ def _build_active_coordinate_snapshot(
     memory_budget_mb: int,
     max_source_files_per_task: int,
     max_source_row_groups_per_task: int,
-    sidecar_workers: int,
+    candidate_workers: int,
+    bucketize_workers: int,
+    active_selection_workers: int,
     sidecar_worker_recycle_mode: str,
     sidecar_max_source_files: int,
     sidecar_max_projected_bytes_mb: int,
@@ -2496,11 +2543,13 @@ def _build_active_coordinate_snapshot(
         reference_fingerprint=reference_fingerprint,
         selector_columns=selector_columns,
         selection_group_keys=selection_group_keys,
+        sort=sort,
+        local_winner_enabled=sort_first_enabled,
         reserved_columns=reserved_columns,
         planner_payload=planner_payload,
         project_root=project_root,
         parquet_profiles=parquet_profiles,
-        workers=max(1, int(sidecar_workers)),
+        workers=max(1, int(candidate_workers)),
         worker_recycle_mode=sidecar_worker_recycle_mode,
         max_source_files=sidecar_max_source_files,
         max_projected_bytes_mb=sidecar_max_projected_bytes_mb,
@@ -2511,10 +2560,10 @@ def _build_active_coordinate_snapshot(
     sidecar_profile["parent_memory_boundaries"] = [_parent_memory_boundary("candidate_ready")]
     if not candidate_paths:
         raise ValidationError("0201 coordinate sidecar has no source files.")
-    if sort_first_enabled:
+    if all(path.suffix == ".arrow" for path in candidate_paths):
         compaction_profile = {
             "skipped": True,
-            "skip_reason": "active_selector_uses_adaptive_sidecar_path",
+            "skip_reason": "arrow_ipc_local_winner_cache",
             "input_files": len(candidate_paths),
             "output_files": len(candidate_paths),
         }
@@ -2555,8 +2604,7 @@ def _build_active_coordinate_snapshot(
             nulls_equal=True,
         )
         candidate_lf = pl.concat(
-            [pl.scan_parquet(path) for path in candidate_paths],
-            how="diagonal_relaxed",
+            [scan_sidecar(path) for path in candidate_paths], how="diagonal_relaxed"
         )
         selected_sidecar_lf = candidate_lf.join(
             impacted_keys.lazy(),
@@ -2615,7 +2663,7 @@ def _build_active_coordinate_snapshot(
             "phase_planned",
             task_id=None,
             details={
-                "phase_name": "build_sidecar.bucketize",
+                "phase_name": "build_sidecar.02_ipc_writer",
                 "total": 0,
                 "unit": "row_groups",
                 "skipped": True,
@@ -2624,8 +2672,7 @@ def _build_active_coordinate_snapshot(
         )
     if sort_first_enabled and unaffected is None and direct_selector:
         selected_sidecar_lf = pl.concat(
-            [pl.scan_parquet(path) for path in candidate_paths],
-            how="diagonal_relaxed",
+            [scan_sidecar(path) for path in candidate_paths], how="diagonal_relaxed"
         )
         sidecar = selected_sidecar_lf.collect(engine="streaming")
         group_sizes = sidecar.group_by(selection_group_keys).len()
@@ -2656,60 +2703,39 @@ def _build_active_coordinate_snapshot(
     ):
         del impacted_frames
         gc.collect()
-        if max(1, int(sidecar_workers)) == 1:
-            active_plan, bucket_profile = _build_active_sidecar_pipeline(
-                candidate_paths,
-                root=candidate_root / "_selector_buckets",
-                active_snapshot_path=previous_active_snapshot_path,
-                partition_column=partition_column,
-                selection_group_keys=selection_group_keys,
-                sort=sort,
-                group_keys=group_keys,
-                window_partitions=window_partitions,
-                pivot=pivot,
-                spill_aggregation=_pivot_spill_aggregation(pivot, payload=payload),
-                rows_per_part=rows_per_part,
-                memory_budget_mb=memory_budget_mb,
-                max_source_files_per_task=max_source_files_per_task,
-                max_source_row_groups_per_task=max_source_row_groups_per_task,
-                telemetry_endpoint=telemetry_endpoint,
-                candidate_rows=int(sidecar_profile["candidate_rows"]),
-            )
-            active_piece_result = None
-        else:
-            active_piece_result, bucket_profile = _select_active_rows_in_buckets(
-                candidate_paths,
-                root=candidate_root / "_selector_buckets",
-                partition_column=partition_column,
-                selection_group_keys=selection_group_keys,
-                sort=sort,
-                memory_budget_mb=memory_budget_mb,
-                workers=sidecar_workers,
-                telemetry_endpoint=telemetry_endpoint,
-                return_piece_paths=True,
-                candidate_rows_hint=int(sidecar_profile["candidate_rows"]),
-            )
-        if sidecar_workers != 1 and not isinstance(active_piece_result, list):
+        active_piece_result, bucket_profile = _select_active_rows_in_buckets(
+            candidate_paths,
+            root=candidate_root / "_selector_buckets",
+            partition_column=partition_column,
+            selection_group_keys=selection_group_keys,
+            sort=sort,
+            memory_budget_mb=memory_budget_mb,
+            bucketize_workers=bucketize_workers,
+            active_selection_workers=active_selection_workers,
+            telemetry_endpoint=telemetry_endpoint,
+            return_piece_paths=True,
+            candidate_rows_hint=int(sidecar_profile["candidate_rows"]),
+        )
+        if not isinstance(active_piece_result, list):
             raise TaskExecutionError("0201 selector did not return an active piece dataset.")
         sidecar_profile["parent_memory_boundaries"].extend(
             list(bucket_profile.get("parent_memory_boundaries") or [])
         )
         spill_profile = bucket_profile
-        if sidecar_workers != 1:
-            active_plan = _build_active_sidecar_plan_from_pieces(
-                active_piece_result,
-                active_snapshot_path=previous_active_snapshot_path,
-                partition_column=partition_column,
-                group_keys=group_keys,
-                window_partitions=window_partitions,
-                pivot=pivot,
-                spill_aggregation=_pivot_spill_aggregation(pivot, payload=payload),
-                rows_per_part=rows_per_part,
-                memory_budget_mb=memory_budget_mb,
-                max_source_files_per_task=max_source_files_per_task,
-                max_source_row_groups_per_task=max_source_row_groups_per_task,
-                telemetry_endpoint=telemetry_endpoint,
-            )
+        active_plan = _build_active_sidecar_plan_from_pieces(
+            active_piece_result,
+            active_snapshot_path=previous_active_snapshot_path,
+            partition_column=partition_column,
+            group_keys=group_keys,
+            window_partitions=window_partitions,
+            pivot=pivot,
+            spill_aggregation=_pivot_spill_aggregation(pivot, payload=payload),
+            rows_per_part=rows_per_part,
+            memory_budget_mb=memory_budget_mb,
+            max_source_files_per_task=max_source_files_per_task,
+            max_source_row_groups_per_task=max_source_row_groups_per_task,
+            telemetry_endpoint=telemetry_endpoint,
+        )
         sidecar_profile["active_sidecar_plan"] = active_plan
         sidecar_profile["coordinate_boundary_fanout"] = dict(
             active_plan["coordinate_boundary_fanout"]
@@ -2737,7 +2763,8 @@ def _build_active_coordinate_snapshot(
             selection_group_keys=selection_group_keys,
             sort=sort,
             memory_budget_mb=memory_budget_mb,
-            workers=sidecar_workers,
+            bucketize_workers=bucketize_workers,
+            active_selection_workers=active_selection_workers,
             telemetry_endpoint=telemetry_endpoint,
             return_piece_paths=False,
             candidate_rows_hint=int(sidecar_profile["candidate_rows"]),
@@ -2753,8 +2780,7 @@ def _build_active_coordinate_snapshot(
     elif sort_first_enabled and candidate_bytes > memory_budget_mb * 1024 * 1024:
         if selected_sidecar_lf is None:
             selected_sidecar_lf = pl.concat(
-                [pl.scan_parquet(path) for path in candidate_paths],
-                how="diagonal_relaxed",
+                [scan_sidecar(path) for path in candidate_paths], how="diagonal_relaxed"
             )
         descending = [str(item.get("direction") or "asc").lower() == "desc" for item in sort]
         nulls_last = [str(item.get("nulls") or "last").lower() == "last" for item in sort]
@@ -2785,8 +2811,7 @@ def _build_active_coordinate_snapshot(
     else:
         if selected_sidecar_lf is None:
             selected_sidecar_lf = pl.concat(
-                [pl.scan_parquet(path) for path in candidate_paths],
-                how="diagonal_relaxed",
+                [scan_sidecar(path) for path in candidate_paths], how="diagonal_relaxed"
             )
         sidecar = selected_sidecar_lf.collect(engine="streaming")
         group_sizes = sidecar.group_by(selection_group_keys).len()
@@ -3042,6 +3067,8 @@ def _refresh_candidate_sidecars(
     reference_fingerprint: str,
     selector_columns: list[str],
     selection_group_keys: list[str],
+    sort: list[dict[str, Any]],
+    local_winner_enabled: bool,
     reserved_columns: set[str],
     planner_payload: dict[str, Any],
     project_root: Path,
@@ -3061,6 +3088,10 @@ def _refresh_candidate_sidecars(
         "logical_plan_hash": logical_plan_hash,
         "reference_fingerprint": reference_fingerprint,
         "selector_columns": selector_columns,
+        "selection_group_keys": selection_group_keys,
+        "sort": sort,
+        "storage": "arrow_ipc_file",
+        "local_winner_enabled": local_winner_enabled,
     }
     full_rebuild = any(previous.get(key) != value for key, value in expected_contract.items())
     if full_rebuild:
@@ -3077,7 +3108,7 @@ def _refresh_candidate_sidecars(
         entry = previous_sources.get(source_path) or {}
         candidate_path = Path(str(entry.get("candidate_path") or ""))
         if candidate_path.is_file():
-            impacted_frames.append(pl.read_parquet(candidate_path).select(selection_group_keys))
+            impacted_frames.append(read_sidecar_frame(candidate_path).select(selection_group_keys))
             reset_path(candidate_path)
 
     source_entries: dict[str, Any] = {}
@@ -3096,22 +3127,24 @@ def _refresh_candidate_sidecars(
         resolved_path = str(source_path.resolve())
         fingerprint = file_fingerprint(source_file)
         candidate_path = (
-            candidate_root / f"{hashlib.sha256(resolved_path.encode('utf-8')).hexdigest()}.parquet"
+            candidate_root / f"{hashlib.sha256(resolved_path.encode('utf-8')).hexdigest()}.arrow"
         )
         old_entry = previous_sources.get(resolved_path) or {}
         can_reuse = (
             not full_rebuild
             and old_entry.get("fingerprint") == fingerprint
             and Path(str(old_entry.get("candidate_path") or "")) == candidate_path
-            and candidate_path.is_file()
-            and candidate_path.stat().st_size > 0
+            and ipc_file_is_valid(candidate_path)
         )
         if can_reuse:
             rows = int(old_entry.get("rows") or 0)
+            source_rows = int(old_entry.get("source_rows") or rows)
             reused += 1
         else:
             if candidate_path.is_file():
-                impacted_frames.append(pl.read_parquet(candidate_path).select(selection_group_keys))
+                impacted_frames.append(
+                    read_sidecar_frame(candidate_path).select(selection_group_keys)
+                )
             profile = parquet_profiles[resolved_path]
             projected_bytes = max(
                 1,
@@ -3128,23 +3161,28 @@ def _refresh_candidate_sidecars(
                         "source_path": str(source_path),
                         "candidate_path": str(candidate_path),
                         "selector_columns": selector_columns,
+                        "selection_group_keys": selection_group_keys,
+                        "sort": sort,
+                        "local_winner_enabled": local_winner_enabled,
                         "reserved_columns": sorted(reserved_columns),
                         "planner_payload": planner_payload,
                         "project_root": str(project_root),
                         "average_payload_bytes": average_payload_bytes,
                         "projected_source_bytes": projected_bytes,
-                        "__telemetry_phase_name": "build_sidecar.candidate",
+                        "__telemetry_phase_name": "build_sidecar.01_candidate",
                         "__telemetry_phase_only": True,
                     },
                 )
             )
             rows = None
+            source_rows = None
         source_states.append(
             {
                 "resolved_path": resolved_path,
                 "fingerprint": fingerprint,
                 "candidate_path": candidate_path,
                 "rows": rows,
+                "source_rows": source_rows,
                 "rebuilt": not can_reuse,
             }
         )
@@ -3175,7 +3213,7 @@ def _refresh_candidate_sidecars(
             "phase_planned",
             task_id=None,
             details={
-                "phase_name": "build_sidecar.candidate",
+                "phase_name": "build_sidecar.01_candidate",
                 "total": len(pending_tasks),
                 "unit": "files",
                 "skipped": not pending_tasks,
@@ -3185,7 +3223,7 @@ def _refresh_candidate_sidecars(
         for task_index, task in enumerate(pending_tasks, start=1):
             with task_telemetry_phase(
                 telemetry_endpoint,
-                "build_sidecar.candidate",
+                "build_sidecar.01_candidate",
                 task_id=task.task_id,
             ):
                 candidate_results.append(_candidate_sidecar_task_worker(task))
@@ -3194,7 +3232,7 @@ def _refresh_candidate_sidecars(
                 "phase_progress",
                 task_id=task.task_id,
                 details={
-                    "phase_name": "build_sidecar.candidate",
+                    "phase_name": "build_sidecar.01_candidate",
                     "completed": task_index,
                     "total": len(pending_tasks),
                     "unit": "files",
@@ -3289,15 +3327,21 @@ def _refresh_candidate_sidecars(
         str(result.output_paths[0]): int(result.counters.get("candidate_rows", 0))
         for result in candidate_results
     }
+    source_rows_by_path = {
+        str(result.output_paths[0]): int(result.counters.get("source_candidate_rows", 0))
+        for result in candidate_results
+    }
     for state in source_states:
         resolved_path = str(state["resolved_path"])
         candidate_path = Path(state["candidate_path"])
         rows = state["rows"]
+        source_rows = state["source_rows"]
         if state["rebuilt"]:
             rows = rows_by_path[str(candidate_path)]
-            impacted_frames.append(pl.read_parquet(candidate_path).select(selection_group_keys))
+            source_rows = source_rows_by_path[str(candidate_path)]
+            impacted_frames.append(read_sidecar_frame(candidate_path).select(selection_group_keys))
         candidate_paths.append(candidate_path)
-        candidate_schema = pl.read_parquet_schema(candidate_path)
+        candidate_schema = sidecar_schema(candidate_path)
         schema_by_source[resolved_path] = {
             name: str(dtype) for name, dtype in candidate_schema.items()
         }
@@ -3305,6 +3349,7 @@ def _refresh_candidate_sidecars(
             "fingerprint": state["fingerprint"],
             "candidate_path": str(candidate_path),
             "rows": rows,
+            "source_rows": source_rows,
             "size_bytes": candidate_path.stat().st_size,
         }
 
@@ -3328,6 +3373,13 @@ def _refresh_candidate_sidecars(
         "deleted_source_files": len(deleted_paths),
         "candidate_files": len(source_entries),
         "candidate_rows": sum(int(item["rows"]) for item in source_entries.values()),
+        "source_candidate_rows": sum(
+            int(item.get("source_rows") or item["rows"]) for item in source_entries.values()
+        ),
+        "local_winner_rows_removed": sum(
+            max(0, int(item.get("source_rows") or item["rows"]) - int(item["rows"]))
+            for item in source_entries.values()
+        ),
         "candidate_bytes": sum(int(item["size_bytes"]) for item in source_entries.values()),
         "candidate_task_processes": len(
             {
@@ -3375,17 +3427,18 @@ def _select_active_rows_in_buckets(
     selection_group_keys: list[str],
     sort: list[dict[str, Any]],
     memory_budget_mb: int,
-    workers: int,
+    bucketize_workers: int,
+    active_selection_workers: int,
     telemetry_endpoint: dict[str, Any] | None = None,
     return_piece_paths: bool = False,
     candidate_rows_hint: int | None = None,
 ) -> tuple[pl.DataFrame | list[Path], dict[str, Any]]:
-    """Hash-shard a full selector rebuild before any global winner collect."""
+    """Route candidates into one indexed IPC file, then select each hash bucket."""
     candidate_bytes = sum(path.stat().st_size for path in candidate_paths)
     candidate_rows = (
         max(0, int(candidate_rows_hint))
         if candidate_rows_hint is not None
-        else sum(pq.ParquetFile(path).metadata.num_rows for path in candidate_paths)
+        else sum(sidecar_rows(path) for path in candidate_paths)
     )
     target_bucket_bytes = max(8 * 1024 * 1024, memory_budget_mb * 1024 * 1024 // 4)
     byte_bucket_count = min(
@@ -3396,101 +3449,83 @@ def _select_active_rows_in_buckets(
         (candidate_rows + SELECTOR_TARGET_ROWS_PER_BUCKET - 1) // SELECTOR_TARGET_ROWS_PER_BUCKET,
     )
     bucket_count = max(1, byte_bucket_count, row_bucket_count)
-    if return_piece_paths and max(1, int(workers)) == 1:
-        return _select_active_piece_dataset_in_subprocess(
-            candidate_paths,
-            root=root,
-            partition_column=partition_column,
-            selection_group_keys=selection_group_keys,
-            sort=sort,
-            memory_budget_mb=memory_budget_mb,
-            candidate_rows=candidate_rows,
-            bucket_count=bucket_count,
-            telemetry_endpoint=telemetry_endpoint,
-        )
     staging = root.parent / f".{root.name}.{os.getpid()}.tmp"
     backup = root.parent / f".{root.name}.{os.getpid()}.backup"
     reset_path(staging)
     reset_path(backup)
     ensure_dir(staging)
     parent_memory_boundaries: list[dict[str, Any]] = []
-    bucketizer_profile: dict[str, Any] = {}
+    ipc_writer_profile: dict[str, Any] = {}
     selector_runner_profile: dict[str, Any] = {}
     try:
-        bucket_plan_path = staging / "_bucket-plan.json"
-        bucketizer_work = _plan_bucketizer_work(candidate_paths, workers=workers)
+        bucket_plan_path = staging / "_route-index.json"
+        route_path = staging / "candidate-routes.arrow"
         bucketizer_tasks = [
             TaskSpec(
-                task_id=f"selector-bucketize-{index:04d}",
+                task_id="selector-ipc-writer",
                 partition_value=None,
-                part_index=index,
+                part_index=0,
                 payload={
-                    "candidate_work": work,
-                    "staging": str(staging),
-                    "bucket_plan_path": str(staging / "_bucket-plans" / f"shard-{index:04d}.json"),
-                    "piece_root": str(staging / "_bucket-shards" / f"shard-{index:04d}"),
-                    "partition_column": partition_column,
+                    "candidate_paths": [str(path) for path in candidate_paths],
+                    "route_path": str(route_path),
+                    "bucket_plan_path": str(bucket_plan_path),
                     "selection_group_keys": selection_group_keys,
                     "bucket_count": bucket_count,
-                    "__telemetry_phase_name": "build_sidecar.bucketize",
+                    "__telemetry_phase_name": "build_sidecar.02_ipc_writer",
                     "__telemetry_phase_only": True,
                 },
             )
-            for index, work in enumerate(bucketizer_work)
         ]
-        bucketizer_results, bucketizer_profile = run_tasks_in_subprocesses(
+        ipc_writer_results, ipc_writer_profile = run_tasks_in_subprocesses(
             bucketizer_tasks,
-            worker=_selector_bucketize_worker,
-            workers=min(max(1, int(workers)), len(bucketizer_tasks)),
+            worker=_selector_ipc_writer_worker,
+            workers=1,
             max_tasks_per_child=1,
             return_profile=True,
             telemetry_endpoint=telemetry_endpoint,
         )
-        bucketizer_failure = next((item for item in bucketizer_results if not item.ok), None)
-        if bucketizer_failure is not None:
+        ipc_writer_failure = next((item for item in ipc_writer_results if not item.ok), None)
+        if ipc_writer_failure is not None:
             raise TaskExecutionError(
-                f"0201 selector bucketizer failed: {bucketizer_failure.error_message}",
+                f"0201 selector IPC writer failed: {ipc_writer_failure.error_message}",
                 context={
-                    "task_id": bucketizer_failure.task_id,
-                    "error_type": bucketizer_failure.error_type,
-                    "traceback_tail": bucketizer_failure.traceback_tail,
+                    "task_id": ipc_writer_failure.task_id,
+                    "error_type": ipc_writer_failure.error_type,
+                    "traceback_tail": ipc_writer_failure.traceback_tail,
                 },
             )
-        bucketizer_result = bucketizer_results[0]
-        bucket_plan = _merge_bucketizer_plans(
-            [Path(result.output_paths[0]) for result in bucketizer_results],
-            staging=staging,
-            bucket_count=bucket_count,
-        )
-        _atomic_write_json(bucket_plan_path, bucket_plan)
+        ipc_writer_result = ipc_writer_results[0]
+        bucket_plan = json.loads(bucket_plan_path.read_text(encoding="utf-8"))
         bucket_entries = list(bucket_plan.get("buckets") or [])
-        piece_index = int(bucket_plan.get("candidate_pieces") or 0)
-        parent_memory_boundaries.append(_parent_memory_boundary("bucketize_finished"))
+        piece_index = int(bucket_plan.get("record_batches") or 0)
+        parent_memory_boundaries.append(_parent_memory_boundary("ipc_writer_finished"))
 
         tasks = [
             TaskSpec(
                 task_id=f"selector-{index:06d}",
-                partition_value=str(entry["partition_value"]),
+                partition_value=None,
                 part_index=int(entry["bucket_id"]),
                 payload={
-                    "paths": [str(staging / path) for path in entry["paths"]],
+                    "route_path": str(route_path),
+                    "batch_indices": list(entry["record_batch_indices"]),
+                    "estimated_bytes": int(entry.get("estimated_bytes") or 0),
                     "output_path": str(
-                        (staging / str(entry["paths"][0])).parent / "active.parquet"
+                        staging / "active" / f"bucket-{int(entry['bucket_id']):05d}.arrow"
                     ),
                     "selection_group_keys": selection_group_keys,
                     "sort": sort,
                     "memory_budget_bytes": memory_budget_mb * 1024 * 1024,
-                    "__telemetry_phase_name": "build_sidecar.selector_bucket",
+                    "__telemetry_phase_name": "build_sidecar.03_active_selection",
                     "__telemetry_phase_only": True,
                 },
             )
             for index, entry in enumerate(bucket_entries, start=1)
         ]
-        tasks_per_child = max(1, math.ceil(len(tasks) / max(1, int(workers))))
+        tasks_per_child = max(1, math.ceil(len(tasks) / max(1, int(active_selection_workers))))
         results, selector_runner_profile = run_tasks_in_subprocesses(
             tasks,
             worker=_active_selector_bucket_worker,
-            workers=max(1, int(workers)),
+            workers=max(1, int(active_selection_workers)),
             max_tasks_per_child=tasks_per_child,
             return_profile=True,
             telemetry_endpoint=telemetry_endpoint,
@@ -3513,17 +3548,19 @@ def _select_active_rows_in_buckets(
         if not return_piece_paths:
             active = (
                 pl.concat(
-                    [pl.scan_parquet(path) for path in active_paths], how="diagonal_relaxed"
+                    [scan_sidecar(path) for path in active_paths], how="diagonal_relaxed"
                 ).collect(engine="streaming")
                 if active_paths
-                else pl.read_parquet(candidate_paths[0]).head(0)
+                else read_sidecar_frame(candidate_paths[0]).head(0)
             )
         manifest = {
-            "version": "smoking-data.selector-buckets.v1",
+            "version": "smoking-data.selector-route-ipc.v1",
+            "storage": "arrow_ipc_file",
             "hash": "polars.hash_rows.seed0.v1",
             "bucket_count": bucket_count,
             "tasks": len(tasks),
-            "candidate_pieces": piece_index,
+            "route_ipc_files": 1,
+            "record_batches": piece_index,
         }
         (staging / "_selector.manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2),
@@ -3551,29 +3588,36 @@ def _select_active_rows_in_buckets(
         if return_piece_paths
         else active
         if active is not None
-        else pl.read_parquet(candidate_paths[0]).head(0)
+        else read_sidecar_frame(candidate_paths[0]).head(0)
     )
     return selected, {
         "mode": "hash_bucket_subprocess",
-        "execution_mode": "bounded_process_pool",
+        "execution_mode": "dedicated_ipc_writer_then_bounded_selector_pool",
         "hash_contract": "polars.hash_rows.seed0.v1",
         "bucket_count": bucket_count,
         "bucket_tasks": len(results),
         "candidate_pieces": piece_index,
+        "route_ipc_files": 1,
+        "route_record_batches": piece_index,
+        "route_ipc_path": str(root / "candidate-routes.arrow"),
+        "route_index_path": str(root / "_route-index.json"),
+        "physical_candidate_files_eliminated": piece_index,
         "candidate_rows": candidate_rows,
         "target_rows_per_bucket": SELECTOR_TARGET_ROWS_PER_BUCKET,
         "selector_tasks_per_child": tasks_per_child,
         "parent_memory_boundaries": parent_memory_boundaries,
-        "bucketizer": {
-            "pid": bucketizer_result.pid,
-            "pids": sorted({result.pid for result in bucketizer_results if result.pid > 0}),
-            "shards": len(bucketizer_results),
-            "elapsed_sec": bucketizer_profile.get("total_elapsed_sec"),
+        "ipc_writer": {
+            "pid": ipc_writer_result.pid,
+            "pids": sorted({result.pid for result in ipc_writer_results if result.pid > 0}),
+            "shards": 1,
+            "requested_workers": max(1, int(bucketize_workers)),
+            "effective_writers": 1,
+            "elapsed_sec": ipc_writer_profile.get("total_elapsed_sec"),
             "peak_rss_mb": max(
-                (float(result.counters.get("rss_peak_mb") or 0.0) for result in bucketizer_results),
+                (float(result.counters.get("rss_peak_mb") or 0.0) for result in ipc_writer_results),
                 default=0.0,
             ),
-            "runner": bucketizer_profile,
+            "runner": ipc_writer_profile,
         },
         "selector_pids": sorted({result.pid for result in results if result.pid > 0}),
         "selector_runner": selector_runner_profile,
@@ -3590,441 +3634,108 @@ def _select_active_rows_in_buckets(
     }
 
 
-def _plan_bucketizer_work(
-    candidate_paths: list[Path], *, workers: int
-) -> list[list[dict[str, Any]]]:
-    """Balance immutable Parquet row groups across isolated bucketizer workers."""
-    units: list[tuple[int, str, int]] = []
-    for candidate_path in sorted(candidate_paths, key=lambda item: str(item)):
-        parquet = pq.ParquetFile(candidate_path)
-        for row_group in range(parquet.metadata.num_row_groups):
-            metadata = parquet.metadata.row_group(row_group)
-            estimated_bytes = max(1, int(metadata.total_byte_size or 0))
-            units.append((estimated_bytes, str(candidate_path), row_group))
-    if not units:
-        return [[]]
-    shard_count = min(max(1, int(workers)), len(units))
-    shards: list[list[dict[str, Any]]] = [[] for _ in range(shard_count)]
-    shard_bytes = [0] * shard_count
-    for estimated_bytes, path, row_group in sorted(
-        units, key=lambda item: (-item[0], item[1], item[2])
-    ):
-        shard_index = min(range(shard_count), key=lambda index: (shard_bytes[index], index))
-        shards[shard_index].append(
-            {
-                "path": path,
-                "row_group": row_group,
-                "estimated_bytes": estimated_bytes,
-            }
-        )
-        shard_bytes[shard_index] += estimated_bytes
-    for shard in shards:
-        shard.sort(key=lambda item: (str(item["path"]), int(item["row_group"])))
-    return shards
+def _iter_sidecar_record_batches(path: Path):
+    if path.suffix == ".arrow":
+        with open_ipc_file(path) as reader:
+            for index in range(reader.num_record_batches):
+                yield reader.get_batch(index)
+        return
+    parquet = pq.ParquetFile(path)
+    for row_group in range(parquet.metadata.num_row_groups):
+        yield from parquet.iter_batches(batch_size=65_536, row_groups=[row_group])
 
 
-def _merge_bucketizer_plans(
-    plan_paths: list[Path], *, staging: Path, bucket_count: int
-) -> dict[str, Any]:
-    buckets: dict[tuple[str, int], list[str]] = {}
-    candidate_pieces = 0
-    for plan_path in sorted(plan_paths, key=lambda item: str(item)):
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        if plan.get("schema_version") != "smoking-data.selector-bucket-plan.v1":
-            raise TaskExecutionError(
-                "0201 bucketizer returned an unsupported plan.",
-                context={"path": str(plan_path)},
-            )
-        candidate_pieces += int(plan.get("candidate_pieces") or 0)
-        for entry in plan.get("buckets") or []:
-            key = (str(entry["partition_value"]), int(entry["bucket_id"]))
-            for raw_path in entry.get("paths") or []:
-                relative_path = Path(str(raw_path))
-                resolved_path = (staging / relative_path).resolve()
-                if (
-                    relative_path.is_absolute()
-                    or ".." in relative_path.parts
-                    or not resolved_path.is_file()
-                    or staging.resolve() not in resolved_path.parents
-                ):
-                    raise TaskExecutionError(
-                        "0201 bucketizer returned an invalid piece path.",
-                        context={"path": str(relative_path), "plan_path": str(plan_path)},
-                    )
-                buckets.setdefault(key, []).append(str(relative_path))
-    return {
-        "schema_version": "smoking-data.selector-bucket-plan.v1",
-        "path_contract": "staging_relative",
-        "bucket_count": bucket_count,
-        "candidate_pieces": candidate_pieces,
-        "buckets": [
-            {
-                "partition_value": partition_value,
-                "bucket_id": bucket_id,
-                "paths": sorted(paths),
-            }
-            for (partition_value, bucket_id), paths in sorted(buckets.items())
-        ],
-    }
+def _sidecar_arrow_schema(path: Path) -> pa.Schema:
+    if path.suffix == ".arrow":
+        with open_ipc_file(path) as reader:
+            return reader.schema
+    return pq.ParquetFile(path).schema_arrow
 
 
-def _select_active_piece_dataset_in_subprocess(
-    candidate_paths: list[Path],
-    *,
-    root: Path,
-    partition_column: str,
-    selection_group_keys: list[str],
-    sort: list[dict[str, Any]],
-    memory_budget_mb: int,
-    candidate_rows: int,
-    bucket_count: int,
-    telemetry_endpoint: dict[str, Any] | None,
-) -> tuple[list[Path], dict[str, Any]]:
-    staging = root.parent / f".{root.name}.{os.getpid()}.tmp"
-    backup = root.parent / f".{root.name}.{os.getpid()}.backup"
-    reset_path(staging)
-    reset_path(backup)
-    ensure_dir(staging)
-    request_path = staging / "_selector-piece.request.json"
-    result_path = staging / "_selector-piece.result.json"
-    try:
-        _atomic_write_json(
-            request_path,
-            {
-                "schema_version": SELECTOR_PIECE_REQUEST_VERSION,
-                "staging": str(staging),
-                "candidate_paths": [str(path) for path in candidate_paths],
-                "partition_column": partition_column,
-                "selection_group_keys": selection_group_keys,
-                "sort": sort,
-                "bucket_count": bucket_count,
-                "memory_budget_bytes": memory_budget_mb * 1024 * 1024,
-                "telemetry_endpoint": telemetry_endpoint,
-            },
-        )
-        result = run_selector_piece_subprocess(request_path, result_path)
-        active_relative_paths: list[Path] = []
-        for entry in result.get("active_entries") or []:
-            relative = Path(str(entry.get("path")))
-            resolved = (staging / relative).resolve()
-            if (
-                relative.is_absolute()
-                or ".." in relative.parts
-                or not resolved.is_file()
-                or staging.resolve() not in resolved.parents
-            ):
-                raise TaskExecutionError(
-                    "0201 selector-piece returned an invalid output path.",
-                    context={"path": str(relative)},
-                )
-            active_relative_paths.append(relative)
-        _atomic_write_json(
-            staging / "_selector.manifest.json",
-            {
-                "version": "smoking-data.selector-buckets.v1",
-                "hash": "polars.hash_rows.seed0.v1",
-                "bucket_count": bucket_count,
-                "tasks": int(result.get("bucket_tasks") or 0),
-                "candidate_pieces": int(result.get("candidate_pieces") or 0),
-            },
-        )
-        reset_path(request_path)
-        reset_path(result_path)
-        moved_existing = False
-        if root.exists():
-            os.replace(root, backup)
-            moved_existing = True
-        try:
-            os.replace(staging, root)
-        except BaseException:
-            if moved_existing and backup.exists() and not root.exists():
-                os.replace(backup, root)
-            raise
-        reset_path(backup)
-    except BaseException:
-        reset_path(staging)
-        raise
-    groups = int(result.get("selector_groups") or 0)
-    rows = int(result.get("selector_input_rows") or 0)
-    pid = int(result.get("pid") or 0)
-    return [root / path for path in active_relative_paths], {
-        "mode": "hash_bucket_subprocess",
-        "execution_mode": "dedicated_selector_piece_subprocess",
-        "hash_contract": "polars.hash_rows.seed0.v1",
-        "bucket_count": bucket_count,
-        "bucket_tasks": int(result.get("bucket_tasks") or 0),
-        "candidate_pieces": int(result.get("candidate_pieces") or 0),
-        "candidate_rows": candidate_rows,
-        "target_rows_per_bucket": SELECTOR_TARGET_ROWS_PER_BUCKET,
-        "selector_tasks_per_child": int(result.get("bucket_tasks") or 0),
-        "parent_memory_boundaries": [_parent_memory_boundary("selector_piece_subprocess_finished")],
-        "bucketizer": {
-            "pid": pid,
-            "elapsed_sec": result.get("bucketize_elapsed_sec"),
-            "peak_rss_mb": result.get("peak_rss_mb"),
-            "runner": {"mode": "dedicated_selector_piece_subprocess"},
-        },
-        "selector_pids": [pid] if pid > 0 else [],
-        "selector_runner": {
-            "mode": "dedicated_selector_piece_subprocess",
-            "elapsed_sec": result.get("selector_elapsed_sec"),
-            "io_read_bytes": result.get("io_read_bytes"),
-            "io_write_bytes": result.get("io_write_bytes"),
-        },
-        "selector_key_cardinality": groups,
-        "max_rows_per_selector_group": int(result.get("max_rows_per_selector_group") or 0),
-        "avg_rows_per_selector_group": rows / groups if groups else 0.0,
-        "peak_rss_mb": float(result.get("peak_rss_mb") or 0.0),
-    }
-
-
-def _build_active_sidecar_pipeline(
-    candidate_paths: list[Path],
-    *,
-    root: Path,
-    active_snapshot_path: Path,
-    partition_column: str,
-    selection_group_keys: list[str],
-    sort: list[dict[str, Any]],
-    group_keys: list[str],
-    window_partitions: list[tuple[str, ...]],
-    pivot: dict[str, Any],
-    spill_aggregation: str | None,
-    rows_per_part: int,
-    memory_budget_mb: int,
-    max_source_files_per_task: int,
-    max_source_row_groups_per_task: int,
-    telemetry_endpoint: dict[str, Any] | None,
-    candidate_rows: int,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Select winner pieces and exec into the boundary planner in the same PID."""
-    candidate_bytes = sum(path.stat().st_size for path in candidate_paths)
-    target_bucket_bytes = max(8 * 1024 * 1024, memory_budget_mb * 1024 * 1024 // 4)
-    bucket_count = max(
-        1,
-        min(1024, (candidate_bytes + target_bucket_bytes - 1) // target_bucket_bytes),
-        min(
-            1024,
-            (candidate_rows + SELECTOR_TARGET_ROWS_PER_BUCKET - 1)
-            // SELECTOR_TARGET_ROWS_PER_BUCKET,
-        ),
-    )
-    staging = root.parent / f".{root.name}.{os.getpid()}.tmp"
-    backup = root.parent / f".{root.name}.{os.getpid()}.backup"
-    reset_path(staging)
-    reset_path(backup)
-    ensure_dir(staging)
-    request_path = staging / "_selector-pipeline.request.json"
-    result_path = staging / "_selector-pipeline.result.json"
-    plan_path = active_snapshot_path.with_name(
-        f"{active_snapshot_path.stem}.active-sidecar-plan.json"
-    )
-    try:
-        _atomic_write_json(
-            request_path,
-            {
-                "schema_version": SELECTOR_PIECE_REQUEST_VERSION,
-                "staging": str(staging),
-                "candidate_paths": [str(path) for path in candidate_paths],
-                "partition_column": partition_column,
-                "selection_group_keys": selection_group_keys,
-                "sort": sort,
-                "bucket_count": bucket_count,
-                "memory_budget_bytes": memory_budget_mb * 1024 * 1024,
-                "telemetry_endpoint": telemetry_endpoint,
-                "active_sidecar_plan_continuation": {
-                    "request": {
-                        "schema_version": ACTIVE_SIDECAR_PLAN_REQUEST_VERSION,
-                        "active_snapshot_path": str(active_snapshot_path),
-                        "plan_path": str(plan_path),
-                        "partition_column": partition_column,
-                        "group_keys": group_keys,
-                        "window_partitions": [list(item) for item in window_partitions],
-                        "pivot": pivot,
-                        "spill_aggregation": spill_aggregation,
-                        "rows_per_part": rows_per_part,
-                        "memory_budget_bytes": memory_budget_mb * 1024 * 1024,
-                        "max_source_files_per_task": max_source_files_per_task,
-                        "max_source_row_groups_per_task": max_source_row_groups_per_task,
-                        "telemetry_endpoint": telemetry_endpoint,
-                    }
-                },
-            },
-        )
-        worker = run_active_sidecar_pipeline_subprocess(request_path, result_path)
-        selector = dict(worker.get("upstream_selector") or {})
-        _atomic_write_json(
-            staging / "_selector.manifest.json",
-            {
-                "version": "smoking-data.selector-buckets.v1",
-                "hash": "polars.hash_rows.seed0.v1",
-                "bucket_count": bucket_count,
-                "tasks": int(selector.get("bucket_tasks") or 0),
-                "candidate_pieces": int(selector.get("candidate_pieces") or 0),
-            },
-        )
-        for path in (
-            request_path,
-            result_path,
-            staging / "_selector-piece.completed.json",
-            staging / "_active-sidecar-plan.request.json",
-        ):
-            reset_path(path)
-        moved_existing = False
-        if root.exists():
-            os.replace(root, backup)
-            moved_existing = True
-        try:
-            os.replace(staging, root)
-        except BaseException:
-            if moved_existing and backup.exists() and not root.exists():
-                os.replace(backup, root)
-            raise
-        reset_path(backup)
-    except BaseException:
-        reset_path(staging)
-        raise
-    plan = load_active_sidecar_plan(plan_path)
-    snapshot_relative = Path(str(plan["active_snapshot_path"]))
-    resolved_snapshot = (plan_path.parent / snapshot_relative).resolve()
-    if (
-        snapshot_relative.is_absolute()
-        or ".." in snapshot_relative.parts
-        or not resolved_snapshot.exists()
-    ):
-        raise TaskExecutionError("0201 active-sidecar pipeline returned an invalid snapshot path.")
-    normalized_plan = {
-        **plan,
-        "manifest_path": str(plan_path),
-        "active_snapshot_path": str(resolved_snapshot),
-        "worker": {
-            "pid": worker.get("pid"),
-            "elapsed_sec": worker.get("elapsed_sec"),
-            "rss_mb": worker.get("rss_mb"),
-            "peak_rss_mb": worker.get("peak_rss_mb"),
-            "io_read_bytes": worker.get("io_read_bytes"),
-            "io_write_bytes": worker.get("io_write_bytes"),
-            "process_replacement": True,
-        },
-    }
-    groups = int(selector.get("selector_groups") or 0)
-    rows = int(selector.get("selector_input_rows") or 0)
-    selector_pid = int(selector.get("pid") or 0)
-    profile = {
-        "mode": "hash_bucket_subprocess",
-        "execution_mode": "selector_to_boundary_exec",
-        "hash_contract": "polars.hash_rows.seed0.v1",
-        "bucket_count": bucket_count,
-        "bucket_tasks": int(selector.get("bucket_tasks") or 0),
-        "candidate_pieces": int(selector.get("candidate_pieces") or 0),
-        "candidate_rows": candidate_rows,
-        "target_rows_per_bucket": SELECTOR_TARGET_ROWS_PER_BUCKET,
-        "selector_tasks_per_child": int(selector.get("bucket_tasks") or 0),
-        "parent_memory_boundaries": [_parent_memory_boundary("active_pipeline_finished")],
-        "bucketizer": {
-            "pid": selector_pid,
-            "elapsed_sec": selector.get("bucketize_elapsed_sec"),
-            "peak_rss_mb": selector.get("peak_rss_mb"),
-            "runner": {"mode": "selector_to_boundary_exec"},
-        },
-        "selector_pids": [selector_pid] if selector_pid > 0 else [],
-        "selector_runner": {
-            "mode": "selector_to_boundary_exec",
-            "elapsed_sec": selector.get("selector_elapsed_sec"),
-            "io_read_bytes": selector.get("io_read_bytes"),
-            "io_write_bytes": selector.get("io_write_bytes"),
-        },
-        "selector_key_cardinality": groups,
-        "max_rows_per_selector_group": int(selector.get("max_rows_per_selector_group") or 0),
-        "avg_rows_per_selector_group": rows / groups if groups else 0.0,
-        "peak_rss_mb": float(selector.get("peak_rss_mb") or 0.0),
-    }
-    return normalized_plan, profile
-
-
-def _selector_bucketize_worker(task: TaskSpec) -> TaskResult:
+def _selector_ipc_writer_worker(task: TaskSpec) -> TaskResult:
+    """Own one IPC File writer and index every bucket-homogeneous RecordBatch."""
     payload = task.payload
-    candidate_work = [
-        {
-            "path": Path(str(item["path"])),
-            "row_group": int(item["row_group"]),
-            "estimated_bytes": max(1, int(item.get("estimated_bytes") or 1)),
-        }
-        for item in payload.get("candidate_work") or []
-    ]
-    if not candidate_work:
-        candidate_work = [
-            {
-                "path": candidate_path,
-                "row_group": row_group,
-                "estimated_bytes": max(
-                    1,
-                    int(parquet.metadata.row_group(row_group).total_byte_size or 0),
-                ),
-            }
-            for candidate_path in [Path(str(item)) for item in payload["candidate_paths"]]
-            for parquet in [pq.ParquetFile(candidate_path)]
-            for row_group in range(parquet.metadata.num_row_groups)
-        ]
-    candidate_paths = sorted(
-        {Path(str(item["path"])) for item in candidate_work}, key=lambda item: str(item)
-    )
-    staging = Path(str(payload["staging"]))
-    piece_root = Path(str(payload.get("piece_root") or staging))
+    candidate_paths = [Path(str(item)) for item in payload["candidate_paths"]]
+    route_path = Path(str(payload["route_path"]))
     bucket_plan_path = Path(str(payload["bucket_plan_path"]))
-    partition_column = str(payload["partition_column"])
     selection_group_keys = [str(item) for item in payload["selection_group_keys"]]
     bucket_count = max(1, int(payload["bucket_count"]))
-    total_row_groups = len(candidate_work)
-    piece_index = 0
-    bucket_files: dict[tuple[str, int], list[Path]] = {}
-    opened_path: Path | None = None
-    parquet: pq.ParquetFile | None = None
-    for work in candidate_work:
-        candidate_path = Path(str(work["path"]))
-        row_group = int(work["row_group"])
-        if parquet is None or candidate_path != opened_path:
-            parquet = pq.ParquetFile(candidate_path)
-            opened_path = candidate_path
-        for batch in parquet.iter_batches(batch_size=65_536, row_groups=[row_group]):
-            frame = pl.from_arrow(batch)
-            if frame.is_empty():
-                continue
-            hashes = frame.select(selection_group_keys).hash_rows(seed=0)
-            frame = frame.with_columns(
-                (hashes % bucket_count).cast(pl.UInt32).alias("__selector_bucket")
-            )
-            for key, piece in frame.partition_by(
-                [partition_column, "__selector_bucket"],
-                as_dict=True,
-                maintain_order=False,
-            ).items():
-                partition_value, bucket_value = key
-                bucket_key = (str(partition_value), int(bucket_value))
-                bucket_dir = ensure_dir(
-                    piece_root
-                    / partition_dir_name(partition_value)
-                    / f"bucket-{int(bucket_value):05d}"
-                )
-                piece_path = bucket_dir / f"candidate-{piece_index:08d}.parquet"
-                piece.drop("__selector_bucket").write_parquet(
-                    piece_path,
-                    compression="uncompressed",
-                )
-                bucket_files.setdefault(bucket_key, []).append(piece_path)
-                piece_index += 1
+    if not candidate_paths:
+        raise ValidationError("0201 IPC writer requires at least one candidate sidecar.")
+    schema = _sidecar_arrow_schema(candidate_paths[0])
+    schema_hash = hashlib.sha256(str(schema).encode("utf-8")).hexdigest()
+    generation_id = f"route-{os.getpid()}-{time.time_ns()}"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    bucket_batches: dict[int, list[int]] = {}
+    bucket_rows: dict[int, int] = {}
+    bucket_bytes: dict[int, int] = {}
+    record_batch_index = 0
+    input_rows = 0
+    with pa.OSFile(str(route_path), "wb") as sink:
+        with pa_ipc.new_file(sink, schema) as writer:
+            for candidate_path in candidate_paths:
+                candidate_schema = _sidecar_arrow_schema(candidate_path)
+                if not candidate_schema.equals(schema, check_metadata=False):
+                    raise ValidationError(
+                        f"0201 candidate IPC schemas differ before routing: {candidate_path}"
+                    )
+                for batch in _iter_sidecar_record_batches(candidate_path):
+                    frame = pl.from_arrow(batch)
+                    if frame.is_empty():
+                        continue
+                    input_rows += frame.height
+                    routed = frame.with_columns(
+                        (frame.select(selection_group_keys).hash_rows(seed=0) % bucket_count)
+                        .cast(pl.UInt32)
+                        .alias("__selector_bucket")
+                    )
+                    for raw_key, piece in routed.partition_by(
+                        "__selector_bucket", as_dict=True, maintain_order=False
+                    ).items():
+                        bucket_id = int(raw_key[0] if isinstance(raw_key, tuple) else raw_key)
+                        candidate_piece = piece.drop("__selector_bucket")
+                        for output_batch in candidate_piece.to_arrow().to_batches(
+                            max_chunksize=65_536
+                        ):
+                            if not output_batch.schema.equals(schema, check_metadata=False):
+                                output_batch = (
+                                    pa.Table.from_batches([output_batch])
+                                    .cast(schema)
+                                    .to_batches()[0]
+                                )
+                            writer.write_batch(output_batch)
+                            bucket_batches.setdefault(bucket_id, []).append(record_batch_index)
+                            bucket_rows[bucket_id] = (
+                                bucket_rows.get(bucket_id, 0) + output_batch.num_rows
+                            )
+                            bucket_bytes[bucket_id] = (
+                                bucket_bytes.get(bucket_id, 0) + output_batch.nbytes
+                            )
+                            record_batch_index += 1
+    with open_ipc_file(route_path) as reader:
+        if reader.num_record_batches != record_batch_index:
+            raise TaskExecutionError("0201 route IPC footer does not match its batch index.")
     bucket_plan = {
-        "schema_version": "smoking-data.selector-bucket-plan.v1",
-        "path_contract": "staging_relative",
+        "schema_version": "smoking-data.selector-route-index.v1",
+        "path_contract": "route_file_plus_record_batch_index",
+        "storage": "arrow_ipc_file",
+        "route_path": route_path.name,
+        "generation_id": generation_id,
+        "schema_hash": schema_hash,
+        "source_sidecars": [str(path) for path in candidate_paths],
+        "hash_contract": "polars.hash_rows.seed0.v1",
         "bucket_count": bucket_count,
-        "candidate_pieces": piece_index,
+        "route_ipc_files": 1,
+        "record_batches": record_batch_index,
+        "candidate_rows": input_rows,
         "buckets": [
             {
-                "partition_value": partition_value,
                 "bucket_id": bucket_id,
-                "paths": [str(path.relative_to(staging)) for path in paths],
+                "record_batch_indices": indices,
+                "rows": bucket_rows[bucket_id],
+                "estimated_bytes": bucket_bytes[bucket_id],
             }
-            for (partition_value, bucket_id), paths in sorted(bucket_files.items())
+            for bucket_id, indices in sorted(bucket_batches.items())
         ],
     }
     _atomic_write_json(bucket_plan_path, bucket_plan)
@@ -4034,27 +3745,30 @@ def _selector_bucketize_worker(task: TaskSpec) -> TaskResult:
         pid=os.getpid(),
         partition_value=task.partition_value,
         part_index=task.part_index,
-        output_paths=[bucket_plan_path],
+        output_paths=[bucket_plan_path, route_path],
         counters={
             "candidate_files": len(candidate_paths),
-            "candidate_bytes": sum(int(item["estimated_bytes"]) for item in candidate_work),
-            "candidate_row_groups": total_row_groups,
-            "candidate_pieces": piece_index,
-            "selector_buckets": len(bucket_files),
+            "candidate_rows": input_rows,
+            "route_ipc_files": 1,
+            "route_record_batches": record_batch_index,
+            "selector_buckets": len(bucket_batches),
+            "physical_candidate_files_eliminated": record_batch_index,
         },
     )
 
 
 def _active_selector_bucket_worker(task: TaskSpec) -> TaskResult:
     payload = task.payload
-    paths = [Path(str(item)) for item in payload["paths"]]
+    route_path = Path(str(payload["route_path"]))
+    batch_indices = [int(item) for item in payload["batch_indices"]]
     output_path = Path(str(payload["output_path"]))
     group_keys = [str(item) for item in payload["selection_group_keys"]]
     sort = list(payload.get("sort") or [])
     sort_columns = [str(item.get("column") or "") for item in sort]
     descending = [str(item.get("direction") or "asc").lower() == "desc" for item in sort]
     nulls_last = [str(item.get("nulls") or "last").lower() == "last" for item in sort]
-    lf = pl.concat([pl.scan_parquet(path) for path in paths], how="diagonal_relaxed")
+    frame = read_ipc_frame(route_path, batch_indices=batch_indices)
+    lf = frame.lazy()
     ordered_columns = [
         *sort_columns,
         SOURCE_FILE_COLUMN,
@@ -4063,7 +3777,9 @@ def _active_selector_bucket_worker(task: TaskSpec) -> TaskResult:
     ]
     ordered_descending = [*descending, False, False, False]
     ordered_nulls_last = [*nulls_last, False, False, False]
-    spill_used = sum(path.stat().st_size for path in paths) > int(payload["memory_budget_bytes"])
+    spill_used = int(payload.get("estimated_bytes") or frame.estimated_size()) > int(
+        payload["memory_budget_bytes"]
+    )
     if spill_used:
         spill = write_sorted_intermediate(
             lf,
@@ -4101,7 +3817,7 @@ def _active_selector_bucket_worker(task: TaskSpec) -> TaskResult:
     selector_groups = selected.height
     max_rows_per_selector_group = int(group_size.max() or 0)
     active = selected.drop("__smoking_data_selector_group_size")
-    _atomic_write_parquet(active, output_path)
+    write_ipc_frame_atomic(active, output_path)
     return TaskResult(
         task_id=task.task_id,
         ok=True,
@@ -4113,7 +3829,8 @@ def _active_selector_bucket_worker(task: TaskSpec) -> TaskResult:
             "selector_input_rows": selector_input_rows,
             "selector_groups": selector_groups,
             "max_rows_per_selector_group": max_rows_per_selector_group,
-            "candidate_files": len(paths),
+            "candidate_files": 1,
+            "record_batches": len(batch_indices),
             "spill_used": int(spill_used),
         },
     )
@@ -4127,8 +3844,14 @@ def _read_previous_active_snapshot(
     if not path.exists() or (path.is_file() and path.stat().st_size == 0):
         return None
     try:
-        frame = pl.read_parquet(path)
-    except (OSError, pl.exceptions.PolarsError):
+        if path.is_dir():
+            shards = sorted(path.glob("*.arrow"))
+            if not shards:
+                return None
+            frame = pl.concat([read_ipc_frame(shard) for shard in shards], how="diagonal_relaxed")
+        else:
+            frame = read_sidecar_frame(path)
+    except (OSError, pl.exceptions.PolarsError, pa.ArrowException):
         return None
     required = {
         *expected_columns,
@@ -4253,6 +3976,9 @@ def _build_source_candidate_sidecar(
     source_path: Path,
     *,
     selector_columns: list[str],
+    selection_group_keys: list[str],
+    sort: list[dict[str, Any]],
+    local_winner_enabled: bool,
     reserved_columns: set[str],
     planner_payload: dict[str, Any],
     project_root: Path,
@@ -4283,8 +4009,27 @@ def _build_source_candidate_sidecar(
             "0201 payload transformations multiplied source rows; "
             f"reference mappings must be unique: {source_path}"
         )
-    return attach_row_group_ids(thin, source_path).with_columns(
+    candidate = attach_row_group_ids(thin, source_path).with_columns(
         pl.lit(average_payload_bytes, dtype=pl.Int64).alias(ESTIMATED_PAYLOAD_BYTES_COLUMN)
+    )
+    if not local_winner_enabled or candidate.is_empty():
+        return candidate
+    sort_columns = [str(item.get("column") or "") for item in sort]
+    descending = [str(item.get("direction") or "asc").lower() == "desc" for item in sort]
+    nulls_last = [str(item.get("nulls") or "last").lower() == "last" for item in sort]
+    return (
+        candidate.sort(
+            [
+                *sort_columns,
+                SOURCE_FILE_COLUMN,
+                SOURCE_ROW_GROUP_COLUMN,
+                SOURCE_ROW_INDEX_COLUMN,
+            ],
+            descending=[*descending, False, False, False],
+            nulls_last=[*nulls_last, False, False, False],
+        )
+        .group_by(selection_group_keys, maintain_order=True)
+        .first()
     )
 
 
@@ -4292,15 +4037,19 @@ def _candidate_sidecar_task_worker(task: TaskSpec) -> TaskResult:
     payload = task.payload
     source_path = Path(str(payload["source_path"]))
     candidate_path = Path(str(payload["candidate_path"]))
+    source_rows = int(pq.ParquetFile(source_path).metadata.num_rows)
     thin = _build_source_candidate_sidecar(
         source_path,
         selector_columns=[str(item) for item in payload["selector_columns"]],
+        selection_group_keys=[str(item) for item in payload["selection_group_keys"]],
+        sort=list(payload.get("sort") or []),
+        local_winner_enabled=bool(payload.get("local_winner_enabled", False)),
         reserved_columns={str(item) for item in payload["reserved_columns"]},
         planner_payload=dict(payload["planner_payload"]),
         project_root=Path(str(payload["project_root"])),
         average_payload_bytes=int(payload["average_payload_bytes"]),
     )
-    _atomic_write_parquet(thin, candidate_path)
+    write_ipc_frame_atomic(thin, candidate_path)
     return TaskResult(
         task_id=task.task_id,
         ok=True,
@@ -4308,6 +4057,8 @@ def _candidate_sidecar_task_worker(task: TaskSpec) -> TaskResult:
         output_paths=[candidate_path],
         counters={
             "candidate_rows": thin.height,
+            "source_candidate_rows": source_rows,
+            "local_winner_rows_removed": max(0, source_rows - thin.height),
             "candidate_bytes": candidate_path.stat().st_size,
             "source_files_touched": 1,
             "row_groups_touched": pq.ParquetFile(source_path).metadata.num_row_groups,
@@ -4408,7 +4159,7 @@ def _write_active_coordinate_snapshot(
     partition_column: str,
 ) -> tuple[Path, list[TaskSpec]]:
     ensure_dir(output_path.parent)
-    _atomic_write_parquet(active_snapshot, output_path)
+    write_ipc_frame_atomic(active_snapshot, output_path)
     coordinate_root = output_path.parent / "parts"
     coordinate_staging = output_path.parent / f".parts.{os.getpid()}.tmp"
     reset_path(coordinate_staging)
@@ -4434,9 +4185,11 @@ def _write_active_coordinate_snapshot(
         ).select(coordinate_columns)
         coordinate_path = ensure_dir(
             coordinate_staging / partition_dir_name(partition_value)
-        ) / part_file_name(part_index, suffix=".coordinates.parquet")
-        coordinates.write_parquet(coordinate_path, compression="uncompressed")
-        rust_coordinate_path = coordinate_path.with_suffix(".arrow")
+        ) / part_file_name(part_index, suffix=".coordinates.arrow")
+        write_ipc_frame_atomic(coordinates, coordinate_path)
+        rust_coordinate_path = coordinate_path.with_name(
+            f"{coordinate_path.stem}.rust.arrow"
+        )
         write_rust_coordinate_file(coordinates, rust_coordinate_path)
         tasks.append(
             TaskSpec(
@@ -5466,6 +5219,13 @@ def _rust_task_phase_profile(task_results: list[TaskResult]) -> dict[str, Any]:
         "rust_active_order_sort_sec",
         "rust_pivot_sec",
         "rust_writer_write_sec",
+        "rust_writer_finalize_sec",
+        "rust_writer_queue_send_wait_sec",
+        "rust_writer_pipeline_enabled",
+        "rust_writer_thread_count",
+        "rust_writer_queue_capacity_batches",
+        "rust_writer_batches_produced",
+        "rust_writer_batches_written",
         "rust_coord_read_sec",
     ]
     profile: dict[str, Any] = {}
@@ -5477,6 +5237,45 @@ def _rust_task_phase_profile(task_results: list[TaskResult]) -> dict[str, Any]:
             "avg": (sum(values) / len(values)) if values else 0.0,
         }
     return profile
+
+
+def _materialize_writer_pipeline_profile(task_results: list[TaskResult]) -> dict[str, Any]:
+    enabled = [
+        item
+        for item in task_results
+        if float(item.counters.get("rust_writer_pipeline_enabled") or 0.0) > 0
+    ]
+    return {
+        "mode": "dedicated_thread",
+        "tasks_reported": len(enabled),
+        "thread_count_per_task": max(
+            (int(item.counters.get("rust_writer_thread_count") or 0) for item in enabled),
+            default=0,
+        ),
+        "queue_capacity_batches": max(
+            (
+                int(item.counters.get("rust_writer_queue_capacity_batches") or 0)
+                for item in enabled
+            ),
+            default=0,
+        ),
+        "batches_produced": sum(
+            int(item.counters.get("rust_writer_batches_produced") or 0) for item in enabled
+        ),
+        "batches_written": sum(
+            int(item.counters.get("rust_writer_batches_written") or 0) for item in enabled
+        ),
+        "queue_send_wait_sec": sum(
+            float(item.counters.get("rust_writer_queue_send_wait_sec") or 0.0)
+            for item in enabled
+        ),
+        "writer_write_sec": sum(
+            float(item.counters.get("rust_writer_write_sec") or 0.0) for item in enabled
+        ),
+        "writer_finalize_sec": sum(
+            float(item.counters.get("rust_writer_finalize_sec") or 0.0) for item in enabled
+        ),
+    }
 
 
 def _linear_slope(values: list[float]) -> float | None:

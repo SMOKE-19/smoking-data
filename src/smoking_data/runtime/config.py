@@ -47,6 +47,9 @@ class RuntimeConfig:
     max_source_row_groups_per_task: int = 512
     sidecar_target_bytes_mb: int = 128
     sidecar_workers: int = 1
+    candidate_workers: int = 1
+    bucketize_workers: int = 1
+    active_selection_workers: int = 1
     sidecar_worker_recycle_mode: str = "adaptive"
     sidecar_max_source_files: int = 16
     sidecar_max_projected_bytes_mb: int = 512
@@ -60,6 +63,10 @@ class RuntimeConfig:
 
     def phase_memory_policy(self, phase: str, *, requested_workers: int) -> PhaseMemoryPolicy:
         configured = self.phase_memory.get(phase)
+        if configured is None and phase.startswith("build_sidecar."):
+            configured = self.phase_memory.get("build_sidecar")
+        if configured is None and phase.startswith("materialize."):
+            configured = self.phase_memory.get("materialize")
         if configured is not None:
             return configured
         return PhaseMemoryPolicy(
@@ -157,6 +164,18 @@ def load_config(
         ),
         sidecar_workers=_positive_int(
             execution.get("sidecar_workers", 1), path="execution.sidecar_workers"
+        ),
+        candidate_workers=_positive_int(
+            execution.get("candidate_workers", execution.get("sidecar_workers", 1)),
+            path="execution.candidate_workers",
+        ),
+        bucketize_workers=_positive_int(
+            execution.get("bucketize_workers", execution.get("sidecar_workers", 1)),
+            path="execution.bucketize_workers",
+        ),
+        active_selection_workers=_positive_int(
+            execution.get("active_selection_workers", execution.get("sidecar_workers", 1)),
+            path="execution.active_selection_workers",
         ),
         sidecar_worker_recycle_mode=_sidecar_worker_recycle_mode(
             execution.get("sidecar_worker_recycle_mode", "adaptive")

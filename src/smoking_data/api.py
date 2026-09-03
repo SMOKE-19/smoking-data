@@ -111,7 +111,7 @@ def validate_definition(
         if asset_code == "0102":
             from smoking_data.assets.a0102_calculated_fact.spec import load_calculated_fact_spec
 
-            spec = load_calculated_fact_spec(path)
+            spec = load_calculated_fact_spec(path, project_root=config.project_root)
             return ValidationResult(
                 ok=True,
                 definition_path=path,

@@ -138,7 +138,7 @@
                 }
               }
             },
-            "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
+            "publication": {"$ref": "publication-v1.schema.json#/$defs/publicationOverride"}
           }
         },
         "logging": {"type": "object"}

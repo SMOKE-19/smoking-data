@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,7 @@ from smoking_data.runtime.asset_config import deep_merge, load_effective_asset_c
 from smoking_data.runtime.asset_contract import load_effective_asset_contract
 from smoking_data.runtime.config import RuntimeConfig
 from smoking_data.runtime.paths import file_sha256, resolve_project_path
+from smoking_data.runtime.publication_defaults import publication_aware_defaults
 from smoking_data.runtime.template_resolution import resolve_contract_templates
 
 
@@ -63,10 +63,25 @@ def load_pipeline_spec(yaml_path: str | Path, *, config: RuntimeConfig) -> Pipel
             asset_code=asset_code,
         )
         if isinstance(configured_execution, dict):
+            definition_exclusions = {"memory"}
+            if asset_code == "0201":
+                definition_exclusions.update(
+                    {
+                        "workers",
+                        "sidecar_workers",
+                        "candidate_workers",
+                        "bucketize_workers",
+                        "active_selection_workers",
+                        "max_tasks_per_child",
+                        "sidecar_worker_recycle_mode",
+                        "sidecar_max_source_files",
+                        "sidecar_max_projected_bytes_mb",
+                    }
+                )
             contract_defaults["execution"] = {
                 key: value
                 for key, value in configured_execution.items()
-                if key in EXECUTION_KEYS and key != "memory"
+                if key in EXECUTION_KEYS and key not in definition_exclusions
             }
         payload = deep_merge(contract_defaults, payload)
         output = payload.get("output")
@@ -207,8 +222,6 @@ def _resolve_asset_source(
             asset_code=asset_code,
         )
         effective = deep_merge(definition_defaults, asset_defaults)
-        if asset_code == "0201" and _publication_override(payload) is None:
-            _remove_publication_default(effective)
         effective = deep_merge(effective, payload)
         job = effective.get("job")
         job_name = str(job.get("name") or "") if isinstance(job, dict) else ""
@@ -262,38 +275,11 @@ def _definition_defaults(
     payload: dict[str, Any],
     asset_code: str,
 ) -> dict[str, Any]:
-    defaults = deepcopy(definition)
-    if asset_code != "0201":
-        return defaults
-    publication = _publication_override(payload)
-    if publication is None:
-        _remove_publication_default(defaults)
-        return defaults
-    unknown = sorted(set(publication) - {"target"})
-    if unknown:
-        raise ValidationError(
-            "Asset 0201 Definition publication supports only target; shared publication policy belongs in .smoking-data/assets/0201/config.yaml.",
-            code="output.publication_override_invalid",
-            context={
-                "path": "output.artifact.publication",
-                "unsupported_keys": unknown,
-            },
-        )
-    return defaults
-
-
-def _publication_override(payload: dict[str, Any]) -> dict[str, Any] | None:
-    output = payload.get("output")
-    artifact = output.get("artifact") if isinstance(output, dict) else None
-    publication = artifact.get("publication") if isinstance(artifact, dict) else None
-    return publication if isinstance(publication, dict) else None
-
-
-def _remove_publication_default(payload: dict[str, Any]) -> None:
-    output = payload.get("output")
-    artifact = output.get("artifact") if isinstance(output, dict) else None
-    if isinstance(artifact, dict):
-        artifact.pop("publication", None)
+    return publication_aware_defaults(
+        definition,
+        payload=payload,
+        asset_code=asset_code,
+    )
 
 
 def _select_asset_dataset_paths(

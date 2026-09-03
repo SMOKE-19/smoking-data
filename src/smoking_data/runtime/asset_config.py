@@ -193,7 +193,7 @@ def _read_config_text(
     if not isinstance(payload, dict):
         raise ValueError(f"Asset config root는 mapping이어야 합니다: {source}")
     allowed = {
-        "common": {"config", "paths", "execution", "contract"},
+        "common": {"config", "paths", "execution", "contract", "output"},
         "0101": {"config", "paths", "execution", "contract", "output"},
         "0102": {"config", "paths", "execution", "contract", "output"},
         "0103": {"config", "paths", "execution", "contract", "output"},

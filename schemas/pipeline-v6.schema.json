@@ -286,7 +286,7 @@
             "format": {"const": "parquet"},
             "compression": {"type": "string", "enum": ["snappy", "zstd", "uncompressed"], "default": "zstd"},
             "physical_layout": {"$ref": "#/$defs/physicalLayout"},
-            "publication": {"$ref": "publication-v1.schema.json#/$defs/publication"}
+            "publication": {"$ref": "publication-v1.schema.json#/$defs/publicationOverride"}
           }
         },
         "logging": {"$ref": "#/$defs/outputAuxiliary"}

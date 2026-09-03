@@ -17,10 +17,6 @@ output:
       adaptation_scope: generation_fixed
       row_group_rows: auto
     publication:
-      enabled: true
-      dataset_prefix: f"assets/{asset_code}/{job_name}"
-      mode: mirror_after_local_commit
-      failure_policy: required
       parquet:
         enabled: true
         random_access_index:

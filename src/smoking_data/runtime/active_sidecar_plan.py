@@ -8,7 +8,7 @@ from typing import Any
 
 from smoking_data.core.exceptions import TaskExecutionError
 
-PLAN_SCHEMA_VERSION = "smoking-data.active-sidecar-plan.v2"
+PLAN_SCHEMA_VERSION = "smoking-data.active-sidecar-plan.v3"
 REQUEST_SCHEMA_VERSION = "smoking-data.active-sidecar-plan-request.v1"
 RESULT_SCHEMA_VERSION = "smoking-data.active-sidecar-plan-result.v1"
 
@@ -55,59 +55,6 @@ def run_active_sidecar_plan_subprocess(
     ):
         raise TaskExecutionError(
             "0201 active-sidecar-plan subprocess failed.",
-            context={
-                "exit_code": completed.returncode,
-                "error_type": payload.get("error_type"),
-                "error_message": payload.get("error_message"),
-                "traceback_tail": payload.get("traceback_tail"),
-            },
-        )
-    return payload
-
-
-def run_active_sidecar_pipeline_subprocess(
-    request_path: Path,
-    result_path: Path,
-    *,
-    timeout_sec: float = 3600.0,
-) -> dict[str, Any]:
-    """Run selector and replace its process image with the boundary planner."""
-    try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "smoking_data.runtime.selector_piece_worker",
-                "--request",
-                str(request_path),
-                "--result",
-                str(result_path),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=timeout_sec,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TaskExecutionError(
-            "0201 active-sidecar pipeline timed out.",
-            context={"request_path": str(request_path), "timeout_sec": timeout_sec},
-        ) from exc
-    try:
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
-        raise TaskExecutionError(
-            "0201 active-sidecar pipeline returned no valid result.",
-            context={"exit_code": completed.returncode, "result_path": str(result_path)},
-        ) from exc
-    if (
-        completed.returncode != 0
-        or payload.get("schema_version") != RESULT_SCHEMA_VERSION
-        or payload.get("status") != "completed"
-    ):
-        raise TaskExecutionError(
-            "0201 active-sidecar pipeline failed.",
             context={
                 "exit_code": completed.returncode,
                 "error_type": payload.get("error_type"),

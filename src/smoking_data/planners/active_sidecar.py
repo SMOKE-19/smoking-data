@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
 MIB = 1024 * 1024
@@ -38,10 +40,19 @@ def profile_selector_shape(
     rows_per_file = max(1, MAX_SAMPLE_ROWS // len(sample_paths))
     row_groups = 0
     for path in paths:
-        row_groups += int(pq.ParquetFile(path).metadata.num_row_groups)
+        if path.suffix == ".arrow":
+            with pa.memory_map(str(path), "r") as source:
+                row_groups += int(ipc.open_file(source).num_record_batches)
+        else:
+            row_groups += int(pq.ParquetFile(path).metadata.num_row_groups)
     try:
         sample = pl.concat(
-            [pl.scan_parquet(path).head(rows_per_file) for path in sample_paths],
+            [
+                (pl.scan_ipc(path) if path.suffix == ".arrow" else pl.scan_parquet(path)).head(
+                    rows_per_file
+                )
+                for path in sample_paths
+            ],
             how="diagonal_relaxed",
         ).collect(engine="streaming")
         if sample.is_empty():

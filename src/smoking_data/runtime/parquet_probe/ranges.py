@@ -11,6 +11,7 @@ from smoking_data.ops.coordinates import (
     SOURCE_ROW_GROUP_COLUMN,
     SOURCE_ROW_INDEX_COLUMN,
 )
+from smoking_data.runtime.selector_ipc import read_sidecar_frame
 
 
 def plan_coordinate_page_ranges(
@@ -29,7 +30,7 @@ def plan_coordinate_page_ranges(
     artifacts = dict(manifest.get("artifacts") or {})
     if not manifest.get("capabilities", {}).get("page_index") or "pages" not in artifacts:
         return {"read_path": "row_group_selected", "reason": "page_index_unavailable"}
-    coordinates = pl.read_parquet(coordinate_path)
+    coordinates = read_sidecar_frame(Path(coordinate_path))
     coordinates = coordinates.with_columns(
         pl.col(SOURCE_FILE_COLUMN)
         .map_elements(

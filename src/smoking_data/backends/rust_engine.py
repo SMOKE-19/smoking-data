@@ -60,6 +60,7 @@ class CuratedTaskRequest:
     batch_size: int | None = None
     drop_cache_hint: bool = False
     print_timing: bool = False
+    writer_queue_capacity_batches: int = 2
 
 
 def execute_join_task(task: dict[str, Any]) -> dict[str, float]:
@@ -145,6 +146,9 @@ def execute_curated_task(request: CuratedTaskRequest) -> dict[str, float]:
             "ordered_operations": request.ordered_operations or [],
             "compression": request.compression,
             "output_row_group_rows": request.output_row_group_rows,
+            "writer_queue_capacity_batches": max(
+                1, int(request.writer_queue_capacity_batches)
+            ),
         },
         batch_size=request.batch_size,
         drop_cache_hint=request.drop_cache_hint,

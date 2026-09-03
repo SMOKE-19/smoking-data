@@ -22,10 +22,6 @@ execution:
   max_source_files_per_task: 40
   max_source_row_groups_per_task: 512
   sidecar_target_bytes_mb: 128
-  sidecar_workers: 1
-  sidecar_worker_recycle_mode: adaptive
-  sidecar_max_source_files: 16
-  sidecar_max_projected_bytes_mb: 512
   optimizer_enabled: true
   reset_before_run: false
   range_merge_gap_bytes: 65536
@@ -37,3 +33,15 @@ contract:
   partition_grid:
     anchor_date: "2021-07-26"
     step_days: 28
+
+output:
+  artifact:
+    publication:
+      enabled: true
+      dataset_prefix: f"assets/{asset_code}/{job_name}"
+      mode: mirror_after_local_commit
+      failure_policy: required
+      verification:
+        checksum: sha256
+        verify_remote_head: true
+        verify_sidecar_references: true

@@ -216,6 +216,9 @@ def _validate_internal_pipeline_document(raw: dict[str, Any]) -> None:
         "max_source_files_per_task",
         "max_source_row_groups_per_task",
         "sidecar_workers",
+        "candidate_workers",
+        "bucketize_workers",
+        "active_selection_workers",
         "sidecar_max_source_files",
         "sidecar_max_projected_bytes_mb",
     ):
@@ -242,11 +245,32 @@ def _validate_internal_pipeline_document(raw: dict[str, Any]) -> None:
         phases = _mapping(memory.get("phases"), path="execution.memory.phases")
         _reject_unknown(
             phases,
-            {"build_sidecar", "materialize", "save_dataset"},
+            {
+                "build_sidecar",
+                "materialize",
+                "save_dataset",
+                "build_sidecar.01_candidate",
+                "build_sidecar.02_ipc_writer",
+                "build_sidecar.03_active_selection",
+                "materialize.01_payload",
+            },
             path="execution.memory.phases",
         )
         for phase_name, phase_value in phases.items():
             phase = _mapping(phase_value, path=f"execution.memory.phases.{phase_name}")
+            if phase_name == "build_sidecar.02_ipc_writer":
+                _reject_unknown(
+                    phase,
+                    {"mode"},
+                    path=f"execution.memory.phases.{phase_name}",
+                )
+                if phase.get("mode") != "coordinator_only":
+                    raise ValidationError(
+                        "IPC writer phase requires mode=coordinator_only.",
+                        code="yaml.invalid_value",
+                        context={"path": f"execution.memory.phases.{phase_name}.mode"},
+                    )
+                continue
             _reject_unknown(
                 phase,
                 {"workers"},
@@ -328,12 +352,8 @@ def parse_sources(raw: dict[str, Any]) -> dict[str, SourceSpec]:
                 else None
             ),
             asset_code=(str(config["asset_code"]) if config.get("asset_code") else None),
-            combined_members=tuple(
-                dict(item) for item in config.get("combined_members") or []
-            ),
-            source_column=(
-                dict(config["source_column"]) if config.get("source_column") else None
-            ),
+            combined_members=tuple(dict(item) for item in config.get("combined_members") or []),
+            source_column=(dict(config["source_column"]) if config.get("source_column") else None),
             duplicate_path_policy=(
                 str(config["duplicate_path_policy"])
                 if config.get("duplicate_path_policy")
@@ -673,9 +693,7 @@ def _compile_operation(
                     context={"path": f"{path}.sort[{index}].nulls"},
                 )
         ordering = _ordering(sort_items, path=f"{path}.sort")
-        inputs = tuple(
-            dict.fromkeys([*group_keys, *(name for name, _ in ordering)])
-        )
+        inputs = tuple(dict.fromkeys([*group_keys, *(name for name, _ in ordering)]))
         lineage = {name: (name,) for name in group_keys}
         return _operation(
             operation_id,
@@ -880,8 +898,7 @@ def _compile_operation(
             input_columns=tuple(sources),
             output_columns=tuple(ColumnContract(name) for name in outputs),
             alias_lineage={
-                output: (source,)
-                for source, output in zip(sources, outputs, strict=True)
+                output: (source,) for source, output in zip(sources, outputs, strict=True)
             },
         )
     if kind is OperationKind.UNPIVOT:
@@ -1430,10 +1447,7 @@ def _resolve_join_output_columns(
         and not any(pattern.search(name) for pattern in exclude_patterns)
         and name not in right_on
     ]
-    outputs = [
-        f"{name}{collision_suffix}" if name in known_columns else name
-        for name in selected
-    ]
+    outputs = [f"{name}{collision_suffix}" if name in known_columns else name for name in selected]
     if len(outputs) != len(set(outputs)) or any(name in known_columns for name in outputs):
         raise ValidationError(
             "Join output column collision cannot be resolved by suffix.",
@@ -1441,9 +1455,7 @@ def _resolve_join_output_columns(
             context={"path": path, "columns": outputs},
         )
     resolved_policy = (
-        {"include": list(dict.fromkeys([*right_on, *selected]))}
-        if source_columns
-        else dict(policy)
+        {"include": list(dict.fromkeys([*right_on, *selected]))} if source_columns else dict(policy)
     )
     return outputs, resolved_policy
 

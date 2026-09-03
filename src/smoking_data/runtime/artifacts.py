@@ -17,7 +17,7 @@ def active_snapshot_path_for(
     root = ensure_dir(artifact_root_for(spec, config=config) / "active_snapshot")
     if operation_id:
         root = ensure_dir(root / _operation_artifact_name(operation_id))
-    return root / "active_snapshot.parquet"
+    return root / "active_snapshot.arrow"
 
 
 def candidate_sidecar_root_for(

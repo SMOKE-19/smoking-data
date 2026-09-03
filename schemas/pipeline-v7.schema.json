@@ -4,7 +4,7 @@
   "title": "Smoking Data 0201 Phase Pipeline v7",
   "type": "object",
   "additionalProperties": false,
-  "required": ["yaml", "job", "define_upstream", "build_sidecar", "materialize", "output"],
+  "required": ["yaml", "job", "define_upstream", "build_sidecar", "materialize", "output", "execution"],
   "properties": {
     "yaml": {
       "type": "object",
@@ -34,20 +34,22 @@
   },
   "$defs": {
     "stringArray": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "phaseMemory": {
+    "phaseWorkers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "min", "max"],
+      "properties": {
+        "requested": {"type": "integer", "minimum": 1},
+        "min": {"type": "integer", "minimum": 1},
+        "max": {"type": "integer", "minimum": 1}
+      }
+    },
+    "workerPhase": {
       "type": "object",
       "additionalProperties": false,
       "required": ["workers"],
       "properties": {
-        "workers": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["min", "max"],
-          "properties": {
-            "min": {"type": "integer", "minimum": 1},
-            "max": {"type": "integer", "minimum": 1}
-          }
-        }
+        "workers": {"$ref": "#/$defs/phaseWorkers"}
       }
     },
     "upstream": {
@@ -156,22 +158,6 @@
           }
         },
         "columns": {},
-        "execution": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "workers": {"type": "integer", "minimum": 1},
-            "worker_recycle": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "mode": {"const": "adaptive"},
-                "max_source_files": {"type": "integer", "minimum": 1},
-                "max_projected_bytes_mb": {"type": "integer", "minimum": 1}
-              }
-            }
-          }
-        },
         "operations": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/operation"}}
       }
     },
@@ -181,18 +167,18 @@
       "required": ["alias", "operations"],
       "properties": {
         "alias": {"type": "string", "minLength": 1},
-        "workers": {"type": "integer", "minimum": 1},
-        "max_tasks_per_child": {"type": "integer", "minimum": 1},
         "operations": {"type": "array", "items": {"$ref": "#/$defs/operation"}}
       }
     },
     "publicationOverride": {
       "type": "object",
-      "description": "0201 Definition은 게시 target만 선택하며 나머지 정책은 Asset config에서 상속한다.",
+      "description": "Definition은 게시 target과 dataset별 표현 설정만 선언하며 공통 정책은 common config에서 상속한다.",
       "additionalProperties": false,
       "required": ["target"],
       "properties": {
-        "target": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"}
+        "target": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"},
+        "parquet": {"$ref": "publication-v1.schema.json#/$defs/publication/properties/parquet"},
+        "sbdf": {"$ref": "publication-v1.schema.json#/$defs/publication/properties/sbdf"}
       }
     },
     "output": {
@@ -219,9 +205,8 @@
     "execution": {
       "type": "object",
       "additionalProperties": false,
+      "required": ["memory"],
       "properties": {
-        "workers": {"type": "integer", "minimum": 1},
-        "max_tasks_per_child": {"type": ["integer", "null"], "minimum": 1},
         "memory": {
           "type": "object",
           "additionalProperties": false,
@@ -230,9 +215,54 @@
             "phases": {
               "type": "object",
               "additionalProperties": false,
+              "required": [
+                "build_sidecar.01_candidate",
+                "build_sidecar.02_ipc_writer",
+                "build_sidecar.03_active_selection",
+                "materialize.01_payload",
+                "save_dataset.01_commit"
+              ],
               "properties": {
-                "build_sidecar": {"$ref": "#/$defs/phaseMemory"},
-                "materialize": {"$ref": "#/$defs/phaseMemory"}
+                "build_sidecar.01_candidate": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["workers", "recycle"],
+                  "properties": {
+                    "workers": {"$ref": "#/$defs/phaseWorkers"},
+                    "recycle": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["mode", "max_source_files", "max_projected_bytes_mb"],
+                      "properties": {
+                        "mode": {"const": "adaptive"},
+                        "max_source_files": {"type": "integer", "minimum": 1},
+                        "max_projected_bytes_mb": {"type": "integer", "minimum": 1}
+                      }
+                    }
+                  }
+                },
+                "build_sidecar.02_ipc_writer": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["mode"],
+                  "properties": {"mode": {"const": "coordinator_only"}}
+                },
+                "build_sidecar.03_active_selection": {"$ref": "#/$defs/workerPhase"},
+                "materialize.01_payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["workers", "max_tasks_per_child"],
+                  "properties": {
+                    "workers": {"$ref": "#/$defs/phaseWorkers"},
+                    "max_tasks_per_child": {"type": ["integer", "null"], "minimum": 1}
+                  }
+                },
+                "save_dataset.01_commit": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["mode"],
+                  "properties": {"mode": {"const": "coordinator_only"}}
+                }
               }
             }
           }

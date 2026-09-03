@@ -14,6 +14,7 @@ from smoking_data.assets.a0101_source.spec_common.project import (
 from smoking_data.assets.a0101_source.spec_common.sections import with_yaml_error_context
 from smoking_data.runtime.asset_config import deep_merge
 from smoking_data.runtime.object_store.config import PublicationSpec
+from smoking_data.runtime.publication_defaults import publication_aware_defaults
 
 from .defaults import apply_asset_defaults, load_yaml_dict
 from .models import (
@@ -61,6 +62,11 @@ def load_source_spec(path: str | Path) -> SourceSpec:
             }
         }
         defaults = deep_merge(project.contract_definition, runtime_defaults)
+        defaults = publication_aware_defaults(
+            defaults,
+            payload=raw,
+            asset_code="0101",
+        )
         merged = apply_asset_defaults(raw=raw, defaults=defaults)
         # Definition YAML is an override document. Validate the complete effective
         # contract after bundled/workspace config merging so ``output: {}`` remains

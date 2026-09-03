@@ -61,7 +61,7 @@ def load_pipeline_spec(yaml_path: str | Path, *, config: RuntimeConfig) -> Pipel
             contract_defaults["execution"] = {
                 key: value
                 for key, value in configured_execution.items()
-                if key in EXECUTION_KEYS
+                if key in EXECUTION_KEYS and key != "memory"
             }
         payload = deep_merge(contract_defaults, payload)
         output = payload.get("output")

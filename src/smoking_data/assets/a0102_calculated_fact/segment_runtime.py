@@ -22,7 +22,7 @@ from .calculation_manifest import (
 from .coordinates import load_coordinate_batch
 from .invalidation import group_all_coordinate_expressions
 from .segment_append import SegmentAppendTransaction
-from .task import build_calculated_fact_task_request
+from .task import build_calculated_fact_task_request, wide_output_column_names
 from .upstream_delta import UpstreamDeltaPlan, UpstreamSegment, plan_upstream_delta
 
 
@@ -193,7 +193,7 @@ def execute_segment_plan(
             )
             return result
 
-        materialize_admission = _materialize_admission(plan)
+        materialize_admission = _materialize_admission(plan, config=config)
         task_count = 0
         calculated_fact_count = 0
         with task_telemetry_phase(telemetry.endpoint, "0102.transaction_setup"):
@@ -202,6 +202,12 @@ def execute_segment_plan(
                 run_key=run_key,
                 identity_columns=plan.spec.identity_columns,
                 partition_by=plan.spec.partition_by,
+                contract=plan.output_mode,
+                output_columns=(
+                    wide_output_column_names(plan)
+                    if plan.output_mode == "wide_calculated_v1"
+                    else ()
+                ),
             )
         with transaction_context as transaction:
             materializer = _BoundedMaterializeExecutor(
@@ -211,8 +217,9 @@ def execute_segment_plan(
             )
             try:
                 for coordinate_index, coordinate_path in enumerate(coordinate_paths):
-                    coordinate = load_coordinate_batch(coordinate_path, plan)
-                    list_shapes.observe(coordinate.projected_batch)
+                    coordinate = load_coordinate_batch(
+                        coordinate_path, plan, load_payload=False
+                    )
                     source_paths = {
                         str(Path(item.source_file).expanduser().resolve())
                         for item in coordinate.coordinates
@@ -225,7 +232,7 @@ def execute_segment_plan(
                         _fail_missing_segment(coordinate_path, source_path)
                     expression_names, missing_expressions = _segment_expression_names(
                         plan,
-                        available_columns=set(coordinate.projected_batch.schema.names),
+                        available_columns=set(coordinate.source_columns),
                     )
                     for item in missing_expressions:
                         segment_skip = {
@@ -248,14 +255,16 @@ def execute_segment_plan(
                                 "upstream_generation_id": upstream_delta.generation_id,
                             },
                         )
-                    if not expression_names:
+                    wide_output = plan.output_mode == "wide_calculated_v1"
+                    if not expression_names and not wide_output:
                         continue
-                    calculated_fact_count += coordinate.projected_batch.num_rows * len(
+                    calculated_fact_count += coordinate.selected_row_count * len(
                         expression_names
                     )
                     group = group_all_coordinate_expressions(
                         coordinate,
                         expression_order=expression_names,
+                        allow_empty=wide_output,
                     )
                     task_root = work_root / "tasks" / f"{task_count:06d}"
                     request = build_calculated_fact_task_request(
@@ -271,6 +280,7 @@ def execute_segment_plan(
                             segment, upstream_delta.calculation_contract_hash
                         ),
                         calculated_at=calculated_at,
+                        available_columns=coordinate.source_columns,
                     )
                     materializer.submit(
                         request,

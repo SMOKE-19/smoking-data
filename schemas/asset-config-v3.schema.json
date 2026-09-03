@@ -29,7 +29,28 @@
     },
     "execution": {
       "type": "object",
-      "description": "공통 또는 Asset별 런타임 설정"
+      "description": "공통 또는 Asset별 런타임 설정. process-wide memory는 scope=common에서만 선언한다.",
+      "properties": {
+        "memory": {
+          "type": "object",
+          "description": "scope=common 전용 process-wide memory envelope",
+          "additionalProperties": false,
+          "properties": {
+            "hard_limit_mb": {"type": "integer", "minimum": 1},
+            "safety_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+            "phases": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "build_sidecar": {"$ref": "#/$defs/phaseWorkers"},
+                "materialize": {"$ref": "#/$defs/phaseWorkers"},
+                "save_dataset": {"$ref": "#/$defs/phaseWorkers"}
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": true
     },
     "contract": {
       "type": "object",
@@ -49,6 +70,24 @@
     "output": {
       "type": "object",
       "description": "Asset Definition에 바로 병합되는 output 기본값"
+    }
+  },
+  "$defs": {
+    "phaseWorkers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workers"],
+      "properties": {
+        "workers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["min", "max"],
+          "properties": {
+            "min": {"type": "integer", "minimum": 1},
+            "max": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
     }
   }
 }

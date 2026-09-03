@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import quote
 
+import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
@@ -44,11 +45,17 @@ class SegmentAppendTransaction:
         run_key: str,
         identity_columns: Sequence[str],
         partition_by: Sequence[str],
+        contract: str = LONG_FACT_CONTRACT_VERSION,
+        output_columns: Sequence[str] = (),
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.run_key = str(run_key).strip()
         self.identity_columns = tuple(identity_columns)
         self.partition_by = tuple(partition_by)
+        self.contract = contract
+        self.output_columns = tuple(output_columns)
+        if self.contract not in {LONG_FACT_CONTRACT_VERSION, "wide_calculated_v1"}:
+            _fail("append.invalid_contract", "Unsupported 0102 append contract.")
         if not self.run_key:
             _fail("append.invalid_run_key", "Append run_key must be non-empty.")
         if not self.partition_by or not set(self.partition_by).issubset(self.identity_columns):
@@ -56,7 +63,17 @@ class SegmentAppendTransaction:
                 "incremental.partition_mismatch",
                 "Append partition_by must be a non-empty subset of identity columns.",
             )
-        self.generation_seq = _reserve_generation(self.dataset_root, self.run_key)
+        manifest = _read_manifest(
+            self.dataset_root / "_dataset.manifest.json", contract=self.contract
+        )
+        self._expected_schema = (
+            _manifest_output_schema(self.dataset_root, manifest)
+            if self.contract == "wide_calculated_v1"
+            else None
+        )
+        self.generation_seq = _reserve_generation(
+            self.dataset_root, self.run_key, contract=self.contract
+        )
         self._stage_root = (
             self.dataset_root
             / "_smoking_data"
@@ -81,9 +98,19 @@ class SegmentAppendTransaction:
         missing = [name for name in self.identity_columns if name not in schema.names]
         if missing:
             _fail("append.invalid_task_output", "Task output misses identity columns.", columns=missing)
-        expected = long_fact_schema([schema.field(name) for name in self.identity_columns])
-        if schema != expected:
-            _fail("long_fact.schema_mismatch", "Task output does not match long_fact_v1.")
+        if self.contract == LONG_FACT_CONTRACT_VERSION:
+            expected = long_fact_schema([schema.field(name) for name in self.identity_columns])
+            if schema != expected:
+                _fail("long_fact.schema_mismatch", "Task output does not match long_fact_v1.")
+        elif tuple(schema.names) != self.output_columns:
+            _fail(
+                "wide_output.schema_mismatch",
+                "Task output columns do not match the planned wide output.",
+                expected=list(self.output_columns),
+                actual=list(schema.names),
+            )
+        if self.contract == "wide_calculated_v1":
+            self._expected_schema = _merge_wide_schema(self._expected_schema, schema)
         partition_table = parquet.read(columns=list(self.partition_by))
         values: dict[str, Any] = {}
         for name in self.partition_by:
@@ -116,7 +143,7 @@ class SegmentAppendTransaction:
         manifest_path = self.dataset_root / "_dataset.manifest.json"
         moved: list[Path] = []
         with _dataset_lock(self.dataset_root):
-            manifest = _read_manifest(manifest_path)
+            manifest = _read_manifest(manifest_path, contract=self.contract)
             existing = next(
                 (item for item in manifest["generations"] if item.get("run_key") == self.run_key),
                 None,
@@ -131,6 +158,9 @@ class SegmentAppendTransaction:
             try:
                 file_records = []
                 for staged, relative, rows, segment_id in self._staged:
+                    if self.contract == "wide_calculated_v1":
+                        assert self._expected_schema is not None
+                        _normalize_wide_parquet(staged, self._expected_schema)
                     destination = self.dataset_root / relative
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     staged.replace(destination)
@@ -152,6 +182,11 @@ class SegmentAppendTransaction:
                 }
                 manifest["generations"].append(generation)
                 manifest["active_generation_seq"] = self.generation_seq
+                manifest["output_schema"] = (
+                    str(self._expected_schema)
+                    if self._expected_schema is not None
+                    else manifest.get("output_schema")
+                )
                 _atomic_write_json(manifest_path, manifest)
             except BaseException:
                 for path in moved:
@@ -169,10 +204,12 @@ class SegmentAppendTransaction:
         self._staged.clear()
 
 
-def _reserve_generation(dataset_root: Path, run_key: str) -> int:
+def _reserve_generation(dataset_root: Path, run_key: str, *, contract: str) -> int:
     state_path = dataset_root / "_smoking_data" / "generation-sequence.json"
     with _dataset_lock(dataset_root):
-        manifest = _read_manifest(dataset_root / "_dataset.manifest.json")
+        manifest = _read_manifest(
+            dataset_root / "_dataset.manifest.json", contract=contract
+        )
         existing = next(
             (item for item in manifest["generations"] if item.get("run_key") == run_key), None
         )
@@ -223,11 +260,14 @@ def _dataset_lock(dataset_root: Path) -> Iterator[None]:
             pass
 
 
-def _read_manifest(path: Path) -> dict[str, Any]:
+def _read_manifest(
+    path: Path, *, contract: str = LONG_FACT_CONTRACT_VERSION
+) -> dict[str, Any]:
     if not path.is_file():
         return {
             "schema_version": MANIFEST_SCHEMA_VERSION,
-            "contract": LONG_FACT_CONTRACT_VERSION,
+            "contract": contract,
+            "output_schema": None,
             "active_generation_seq": None,
             "generations": [],
         }
@@ -238,7 +278,7 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != MANIFEST_SCHEMA_VERSION
-        or payload.get("contract") != LONG_FACT_CONTRACT_VERSION
+        or payload.get("contract") != contract
         or not isinstance(payload.get("generations"), list)
     ):
         _fail("append.invalid_manifest", "Calculated FACT manifest is incompatible.")
@@ -252,6 +292,80 @@ def _parts_by_segment(files: Sequence[Mapping[str, Any]]) -> dict[str, tuple[str
         if segment_id:
             grouped.setdefault(str(segment_id), []).append(str(item["path"]))
     return {key: tuple(value) for key, value in grouped.items()}
+
+
+def _manifest_output_schema(dataset_root: Path, manifest: Mapping[str, Any]) -> pa.Schema | None:
+    for generation in reversed(manifest.get("generations") or []):
+        for item in generation.get("files") or []:
+            path = dataset_root / str(item.get("path") or "")
+            if path.is_file():
+                return pq.ParquetFile(path).schema_arrow
+    return None
+
+
+def _merge_wide_schema(expected: pa.Schema | None, actual: pa.Schema) -> pa.Schema:
+    if expected is None:
+        return actual
+    if expected.names != actual.names:
+        _fail(
+            "wide_output.schema_mismatch",
+            "Task output columns differ from the active dataset schema.",
+            expected=expected.names,
+            actual=actual.names,
+        )
+    fields: list[pa.Field] = []
+    for expected_field, actual_field in zip(expected, actual, strict=True):
+        expected_type = expected_field.type
+        actual_type = actual_field.type
+        if pa.types.is_null(expected_type):
+            dtype = actual_type
+        elif pa.types.is_null(actual_type):
+            dtype = expected_type
+        elif expected_type == actual_type:
+            dtype = expected_type
+        else:
+            _fail(
+                "wide_output.schema_mismatch",
+                "Task output type differs from the active dataset schema.",
+                column=expected_field.name,
+                expected=str(expected_type),
+                actual=str(actual_type),
+            )
+        fields.append(
+            pa.field(
+                expected_field.name,
+                dtype,
+                nullable=expected_field.nullable or actual_field.nullable,
+            )
+        )
+    return pa.schema(fields)
+
+
+def _normalize_wide_parquet(path: Path, schema: pa.Schema) -> None:
+    actual = pq.ParquetFile(path).schema_arrow
+    if actual == schema:
+        return
+    table = pq.read_table(path)
+    columns = []
+    for field in schema:
+        column = table.column(field.name)
+        if pa.types.is_null(column.type) and not pa.types.is_null(field.type):
+            column = pa.chunked_array(
+                [pa.nulls(len(chunk), type=field.type) for chunk in column.chunks],
+                type=field.type,
+            )
+        elif column.type != field.type:
+            _fail(
+                "wide_output.schema_mismatch",
+                "Task output cannot be normalized to the active dataset schema.",
+                column=field.name,
+                expected=str(field.type),
+                actual=str(column.type),
+            )
+        columns.append(column)
+    staging = path.with_suffix(path.suffix + ".schema.tmp")
+    pq.write_table(pa.Table.from_arrays(columns, schema=schema), staging, compression="zstd")
+    staging.replace(path)
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:

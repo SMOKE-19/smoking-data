@@ -22,7 +22,6 @@ _LITERAL_PATTERN = re.compile(r"^(?P<prefix>[fr])(?P<quote>['\"])(?P<body>.*)(?P
 
 @dataclass(frozen=True, slots=True)
 class PhaseMemoryPolicy:
-    target_peak_memory_mb: int
     min_workers: int = 1
     max_workers: int = 1
 
@@ -64,7 +63,6 @@ class RuntimeConfig:
         if configured is not None:
             return configured
         return PhaseMemoryPolicy(
-            target_peak_memory_mb=self.memory_budget_mb,
             min_workers=1,
             max_workers=max(1, int(requested_workers)),
         )
@@ -249,6 +247,12 @@ def _phase_memory_policies(
         if phase not in phases:
             continue
         raw = _mapping(phases.get(phase), section=f"execution.memory.phases.{phase}")
+        unknown = sorted(set(raw) - {"workers"})
+        if unknown:
+            raise ConfigError(
+                f"execution.memory.phases.{phase} supports only workers; "
+                f"memory is derived from execution.memory.hard_limit_mb: {unknown}"
+            )
         workers = _mapping(raw.get("workers"), section=f"execution.memory.phases.{phase}.workers")
         minimum = _positive_int(
             workers.get("min", 1), path=f"execution.memory.phases.{phase}.workers.min"
@@ -260,12 +264,7 @@ def _phase_memory_policies(
             raise ConfigError(
                 f"execution.memory.phases.{phase}.workers.min must be <= workers.max."
             )
-        target = _positive_int(
-            raw.get("target_peak_memory_mb", hard_limit_mb),
-            path=f"execution.memory.phases.{phase}.target_peak_memory_mb",
-        )
         result[phase] = PhaseMemoryPolicy(
-            target_peak_memory_mb=min(target, hard_limit_mb),
             min_workers=minimum,
             max_workers=maximum,
         )

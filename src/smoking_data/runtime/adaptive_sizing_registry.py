@@ -194,7 +194,7 @@ def phase_memory_history(
     model: Mapping[str, Any] | None,
     *,
     phase_name: str,
-    target_peak_memory_mb: int,
+    admission_limit_mb: int,
 ) -> dict[str, Any]:
     details = _mapping(_mapping(_mapping(model).get("model")).get("result"))
     details = _mapping(details.get("details"))
@@ -206,14 +206,14 @@ def phase_memory_history(
         p95 = _positive_float(rss.get("max"))
     pressure = "unobserved"
     if p95 is not None:
-        ratio = p95 / max(1, int(target_peak_memory_mb))
+        ratio = p95 / max(1, int(admission_limit_mb))
         pressure = (
             "hard_limit_near"
             if ratio >= 0.95
-            else ("target_exceeded" if ratio > 0.80 else "within_target")
+            else ("safe_envelope_near" if ratio > 0.80 else "within_envelope")
         )
     return {
-        "schema_version": "smoking-data.phase-memory-history.v1",
+        "schema_version": "smoking-data.phase-memory-history.v2",
         "phase_name": phase_name,
         "peak_rss_p95_mb": p95,
         "pressure": pressure,
@@ -226,7 +226,7 @@ def load_phase_memory_history(
     project_root: Path,
     model_key: str,
     phase_name: str,
-    target_peak_memory_mb: int,
+    admission_limit_mb: int,
     limit: int = 20,
 ) -> dict[str, Any]:
     connection = _connect(project_root)
@@ -257,25 +257,25 @@ def load_phase_memory_history(
         if value is None:
             continue
         peaks.append(value)
-        ratio = value / max(1, int(target_peak_memory_mb))
+        ratio = value / max(1, int(admission_limit_mb))
         recent_pressures.append(
             "hard_limit_near"
             if ratio >= 0.95
-            else ("target_exceeded" if ratio > 0.80 else "within_target")
+            else ("safe_envelope_near" if ratio > 0.80 else "within_envelope")
         )
     consecutive_exceeds = 0
     for pressure in recent_pressures:
-        if pressure not in {"target_exceeded", "hard_limit_near"}:
+        if pressure not in {"safe_envelope_near", "hard_limit_near"}:
             break
         consecutive_exceeds += 1
     p95 = _percentile(peaks, 0.95)
     return {
-        "schema_version": "smoking-data.phase-memory-history.v1",
+        "schema_version": "smoking-data.phase-memory-history.v2",
         "phase_name": phase_name,
         "peak_rss_p95_mb": p95,
         "pressure": recent_pressures[0] if recent_pressures else "unobserved",
         "observations": len(peaks),
-        "consecutive_target_exceeds": consecutive_exceeds,
+        "consecutive_envelope_exceeds": consecutive_exceeds,
         "recalibration_required": consecutive_exceeds >= 3,
     }
 

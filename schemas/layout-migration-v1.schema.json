@@ -53,7 +53,6 @@
       "properties": {
         "mode": {"enum": ["dry_run", "in_place"]},
         "workers": {"type": "integer", "minimum": 1},
-        "memory_budget_mb": {"type": "integer", "minimum": 1},
         "batch_size": {"type": "integer", "minimum": 1},
         "max_files_per_worker": {"type": "integer", "minimum": 1}
       }

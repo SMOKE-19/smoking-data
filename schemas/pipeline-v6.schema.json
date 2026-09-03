@@ -37,7 +37,6 @@
       "properties": {
         "workers": {"type": "integer", "minimum": 1},
         "max_tasks_per_child": {"type": ["integer", "null"], "minimum": 1},
-        "memory_budget_mb": {"type": "integer", "minimum": 1},
         "target_rows_per_part": {"type": "integer", "minimum": 1},
         "target_key_groups_per_part": {"type": "integer", "minimum": 1},
         "max_source_files_per_task": {"type": "integer", "minimum": 1},

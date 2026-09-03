@@ -210,7 +210,6 @@ def _validate_internal_pipeline_document(raw: dict[str, Any]) -> None:
     for key in (
         "workers",
         "max_tasks_per_child",
-        "memory_budget_mb",
         "target_rows_per_part",
         "target_key_groups_per_part",
         "max_source_files_per_task",
@@ -238,27 +237,7 @@ def _validate_internal_pipeline_document(raw: dict[str, Any]) -> None:
     memory = execution.get("memory")
     if memory is not None:
         memory = _mapping(memory, path="execution.memory")
-        _reject_unknown(
-            memory, {"hard_limit_mb", "safety_ratio", "phases"}, path="execution.memory"
-        )
-        hard_limit = memory.get("hard_limit_mb")
-        if not isinstance(hard_limit, int) or isinstance(hard_limit, bool) or hard_limit < 1:
-            raise ValidationError(
-                "execution.memory.hard_limit_mb must be an integer >= 1.",
-                code="yaml.invalid_type",
-                context={"path": "execution.memory.hard_limit_mb", "value": hard_limit},
-            )
-        safety_ratio = memory.get("safety_ratio")
-        if (
-            not isinstance(safety_ratio, (int, float))
-            or isinstance(safety_ratio, bool)
-            or not 0 < float(safety_ratio) <= 1
-        ):
-            raise ValidationError(
-                "execution.memory.safety_ratio must be > 0 and <= 1.",
-                code="yaml.invalid_type",
-                context={"path": "execution.memory.safety_ratio", "value": safety_ratio},
-            )
+        _reject_unknown(memory, {"phases"}, path="execution.memory")
         phases = _mapping(memory.get("phases"), path="execution.memory.phases")
         _reject_unknown(
             phases,
@@ -269,19 +248,9 @@ def _validate_internal_pipeline_document(raw: dict[str, Any]) -> None:
             phase = _mapping(phase_value, path=f"execution.memory.phases.{phase_name}")
             _reject_unknown(
                 phase,
-                {"target_peak_memory_mb", "workers"},
+                {"workers"},
                 path=f"execution.memory.phases.{phase_name}",
             )
-            target = phase.get("target_peak_memory_mb")
-            if not isinstance(target, int) or isinstance(target, bool) or target < 1:
-                raise ValidationError(
-                    "Phase target_peak_memory_mb must be an integer >= 1.",
-                    code="yaml.invalid_type",
-                    context={
-                        "path": f"execution.memory.phases.{phase_name}.target_peak_memory_mb",
-                        "value": target,
-                    },
-                )
             worker_range = _mapping(
                 phase.get("workers"), path=f"execution.memory.phases.{phase_name}.workers"
             )

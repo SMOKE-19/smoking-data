@@ -24,11 +24,20 @@ use std::sync::Arc;
 use crate::expression_ir::{ExpressionIrDocument, ExpressionNode, IrExpression, WindowOrder};
 use crate::list_executor::{compact_list_rows, expand_list_rows};
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn execute_expression_ir(
-    mut batch: RecordBatch,
+    batch: RecordBatch,
     document: &ExpressionIrDocument,
 ) -> Result<RecordBatch, ArrowError> {
-    for layer in &document.layers {
+    execute_expression_ir_retaining(batch, document, &HashSet::new())
+}
+
+pub fn execute_expression_ir_retaining(
+    mut batch: RecordBatch,
+    document: &ExpressionIrDocument,
+    final_columns: &HashSet<String>,
+) -> Result<RecordBatch, ArrowError> {
+    for (layer_index, layer) in document.layers.iter().enumerate() {
         let input = batch.clone();
         let mut fields: Vec<Arc<Field>> = input.schema().fields().iter().cloned().collect();
         let mut columns = input.columns().to_vec();
@@ -54,8 +63,39 @@ pub fn execute_expression_ir(
             }
         }
         batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        if !final_columns.is_empty() {
+            let mut live = final_columns.clone();
+            for future in document.layers.iter().skip(layer_index + 1) {
+                for expression in &future.expressions {
+                    collect_node_columns_set(&expression.expr, &mut live);
+                }
+            }
+            batch = retain_batch_columns(batch, &live)?;
+        }
     }
     Ok(batch)
+}
+
+fn collect_node_columns_set(node: &ExpressionNode, columns: &mut HashSet<String>) {
+    let mut ordered = Vec::new();
+    collect_node_columns(node, &mut ordered);
+    columns.extend(ordered);
+}
+
+fn retain_batch_columns(
+    batch: RecordBatch,
+    names: &HashSet<String>,
+) -> Result<RecordBatch, ArrowError> {
+    let selected = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| names.contains(field.name()))
+        .map(|(index, field)| (field.clone(), batch.column(index).clone()))
+        .collect::<Vec<_>>();
+    let (fields, columns): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
 fn evaluate_expression(
@@ -2393,6 +2433,92 @@ fn parse_decimal_literal(value: &serde_json::Value, scale: usize) -> Result<i128
 mod tests {
     use super::*;
     use arrow_array::types::{Float64Type, Int64Type};
+
+    #[test]
+    fn drops_dead_source_and_intermediate_columns_between_layers() {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            ),
+            ("source", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+            (
+                "unused_source",
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let document: ExpressionIrDocument = serde_json::from_value(serde_json::json!({
+            "version": "spotfire-expression-ir.v1",
+            "layers": [
+                {"expressions": [
+                    {
+                        "name": "temporary",
+                        "source": "fixture",
+                        "dependencies": ["source"],
+                        "dtype": "int64",
+                        "nullable": true,
+                        "expr": {
+                            "kind": "binary",
+                            "operator": "+",
+                            "left": {"kind": "column", "name": "source"},
+                            "right": {"kind": "literal", "dtype": "int64", "value": 1}
+                        }
+                    },
+                    {
+                        "name": "dead_intermediate",
+                        "source": "fixture",
+                        "dependencies": ["unused_source"],
+                        "dtype": "int64",
+                        "nullable": true,
+                        "expr": {
+                            "kind": "binary",
+                            "operator": "+",
+                            "left": {"kind": "column", "name": "unused_source"},
+                            "right": {"kind": "literal", "dtype": "int64", "value": 1}
+                        }
+                    }
+                ]},
+                {"expressions": [{
+                    "name": "result",
+                    "source": "fixture",
+                    "dependencies": ["temporary"],
+                    "dtype": "int64",
+                    "nullable": true,
+                    "expr": {
+                        "kind": "binary",
+                        "operator": "*",
+                        "left": {"kind": "column", "name": "temporary"},
+                        "right": {"kind": "literal", "dtype": "int64", "value": 2}
+                    }
+                }]}
+            ]
+        }))
+        .unwrap();
+        let final_columns = HashSet::from(["id".to_string(), "result".to_string()]);
+
+        let output = execute_expression_ir_retaining(batch, &document, &final_columns).unwrap();
+
+        assert_eq!(
+            output
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "result"]
+        );
+        assert_eq!(
+            output
+                .column_by_name("result")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[4, 6]
+        );
+    }
 
     fn int64_lists(rows: Vec<Option<Vec<Option<i64>>>>) -> ArrayRef {
         Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(rows))

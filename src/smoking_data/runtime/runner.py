@@ -438,31 +438,37 @@ def _apply_execution_overrides(config: Any, execution: Any) -> Any:
         updates["target_key_groups_per_part"] = max(
             1, int(execution.get("target_key_groups_per_part") or 1)
         )
-    if "memory_budget_mb" in execution:
-        updates["memory_budget_mb"] = max(1, int(execution.get("memory_budget_mb") or 1))
     memory = execution.get("memory")
     if isinstance(memory, dict):
-        hard_limit_mb = max(
-            1,
-            int(
-                memory.get("hard_limit_mb")
-                or updates.get("memory_budget_mb")
-                or config.memory_budget_mb
-            ),
-        )
-        safety_ratio = float(memory.get("safety_ratio", config.memory_safety_ratio))
-        if not 0.0 < safety_ratio <= 1.0:
-            raise ValidationError("execution.memory.safety_ratio must be > 0 and <= 1.")
+        unknown = sorted(set(memory) - {"phases"})
+        if unknown:
+            raise ValidationError(
+                "Asset execution.memory may contain only phase policies; configure "
+                "hard_limit_mb and safety_ratio in .smoking-data/config.yaml.",
+                code="yaml.unknown_key",
+                context={"path": "execution.memory", "keys": unknown},
+            )
         phases = memory.get("phases") or {}
         if not isinstance(phases, dict):
             raise ValidationError("execution.memory.phases must be a mapping.")
-        phase_memory: dict[str, PhaseMemoryPolicy] = {}
+        phase_memory: dict[str, PhaseMemoryPolicy] = dict(config.phase_memory)
         for phase in ("build_sidecar", "materialize", "save_dataset"):
             raw = phases.get(phase)
             if raw is None:
                 continue
             if not isinstance(raw, dict):
                 raise ValidationError(f"execution.memory.phases.{phase} must be a mapping.")
+            unknown_phase_keys = sorted(set(raw) - {"workers"})
+            if unknown_phase_keys:
+                raise ValidationError(
+                    "Asset phase memory supports only workers; the memory envelope is "
+                    "derived from .smoking-data/config.yaml.",
+                    code="yaml.unknown_key",
+                    context={
+                        "path": f"execution.memory.phases.{phase}",
+                        "keys": unknown_phase_keys,
+                    },
+                )
             worker_range = raw.get("workers") or {}
             if not isinstance(worker_range, dict):
                 raise ValidationError(f"execution.memory.phases.{phase}.workers must be a mapping.")
@@ -473,20 +479,10 @@ def _apply_execution_overrides(config: Any, execution: Any) -> Any:
                     f"execution.memory.phases.{phase}.workers.min must be <= workers.max."
                 )
             phase_memory[phase] = PhaseMemoryPolicy(
-                target_peak_memory_mb=min(
-                    hard_limit_mb,
-                    max(1, int(raw.get("target_peak_memory_mb") or hard_limit_mb)),
-                ),
                 min_workers=minimum,
                 max_workers=maximum,
             )
-        updates.update(
-            {
-                "memory_budget_mb": hard_limit_mb,
-                "memory_safety_ratio": safety_ratio,
-                "phase_memory": phase_memory,
-            }
-        )
+        updates["phase_memory"] = phase_memory
     if "max_source_files_per_task" in execution:
         updates["max_source_files_per_task"] = max(
             1, int(execution.get("max_source_files_per_task") or 1)
@@ -2103,7 +2099,7 @@ def _main_validate(argv: list[str]) -> int:
             payload = {
                 "ok": True,
                 "kind": "asset",
-                "schema_version": "smoking-data.calculated-fact.v2",
+                "schema_version": "smoking-data.calculated-fact.v4",
                 "asset_code": "0102",
                 "job_name": spec.job_name,
                 "upstream_definition": str(spec.upstream_definition),

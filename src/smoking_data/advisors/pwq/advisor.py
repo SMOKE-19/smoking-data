@@ -102,7 +102,12 @@ def advise_pipeline(
         expected_dataset_fingerprint=dataset_fingerprint,
     )
     evidence_fingerprint = _hash_json(
-        {"physical": physical, "receipt": receipt, "execution": execution}
+        {
+            "physical": physical,
+            "receipt": receipt,
+            "execution": execution,
+            "global_memory_hard_limit_mb": config.memory_budget_mb,
+        }
     )
     existing = _read_json(recommendation_path)
     if (
@@ -126,6 +131,7 @@ def advise_pipeline(
         physical=physical,
         receipt=receipt,
         execution=execution,
+        memory_budget_mb=config.memory_budget_mb,
     )
     staging = output_root.parent / ".temp" / uuid.uuid4().hex
     ensure_dir(staging)
@@ -363,6 +369,7 @@ def _recommend(
     physical: dict[str, Any],
     receipt: dict[str, Any],
     execution: dict[str, Any],
+    memory_budget_mb: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     ratio = receipt.get("range_to_row_group_ratio")
     confidence = "medium" if ratio is not None else "low"
@@ -400,7 +407,7 @@ def _recommend(
         for name, values in candidate_values.items()
     ]
     peak_rss = receipt.get("peak_rss_mb_max")
-    memory_budget = int(execution.get("memory_budget_mb") or 4096)
+    memory_budget = int(memory_budget_mb)
     current_workers = max(1, int(execution.get("workers") or 1))
     safe_workers = current_workers
     if peak_rss:

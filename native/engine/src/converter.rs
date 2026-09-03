@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::coord::read_coord_groups;
-use crate::expression_executor::execute_expression_ir;
+use crate::expression_executor::execute_expression_ir_retaining;
 use crate::expression_ir::{validate_expression_ir, ExpressionIrDocument};
 use crate::join::{enrich_many_to_one_lookup, load_lookup_projection};
 use crate::long_fact::{to_persisted_long_fact_v1, FactColumnMetadata};
@@ -128,6 +128,8 @@ struct WriterConfig {
     projection_columns: Vec<ProjectionColumn>,
     #[serde(default)]
     output_columns: Vec<String>,
+    #[serde(default)]
+    output_projection_columns: Vec<ProjectionColumn>,
     reference_replace: Option<ReferenceReplaceConfigs>,
     expression_ir: Option<ExpressionIrDocument>,
     #[serde(default)]
@@ -194,6 +196,9 @@ struct OrderedOperation {
 struct ProjectionColumn {
     name: String,
     source: Option<String>,
+    #[serde(default)]
+    allow_missing: bool,
+    dtype: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -367,22 +372,26 @@ fn validate_writer_input_contract(writer_config: &WriterConfig) -> pyo3::PyResul
 
 fn normalize_dtype(dtype: &str) -> &str {
     match dtype {
-        "TEXT" | "Utf8" | "String" => "TEXT",
-        "DATE" | "Date" => "DATE",
-        "TIME" | "Time" => "TIME",
-        "TIMESTAMP" | "Datetime" => "TIMESTAMP",
-        "DURATION" | "Duration" => "DURATION",
-        "BOOLEAN" | "BOOL" | "Boolean" => "BOOLEAN",
-        "TINYINT" | "INT8" | "Int8" => "TINYINT",
-        "SMALLINT" | "INT16" | "Int16" => "SMALLINT",
-        "INTEGER" | "INT32" | "Int32" => "INTEGER",
-        "BIGINT" | "INT64" | "Int64" => "BIGINT",
-        "FLOAT" | "Float32" => "FLOAT",
-        "DOUBLE" | "Float64" => "DOUBLE",
+        "TEXT" | "Utf8" | "String" | "string" => "TEXT",
+        "DATE" | "Date" | "date32[day]" => "DATE",
+        "TIME" | "Time" | "time64[us]" => "TIME",
+        "TIMESTAMP" | "Datetime" | "timestamp[us]" => "TIMESTAMP",
+        "DURATION" | "Duration" | "duration[us]" => "DURATION",
+        "BOOLEAN" | "BOOL" | "Boolean" | "bool" => "BOOLEAN",
+        "TINYINT" | "INT8" | "Int8" | "int8" => "TINYINT",
+        "SMALLINT" | "INT16" | "Int16" | "int16" => "SMALLINT",
+        "INTEGER" | "INT32" | "Int32" | "int32" => "INTEGER",
+        "BIGINT" | "INT64" | "Int64" | "int64" => "BIGINT",
+        "FLOAT" | "Float32" | "float" => "FLOAT",
+        "DOUBLE" | "Float64" | "double" => "DOUBLE",
         "INTEGER[]" | "List(Int8)" | "List(Int16)" | "List(Int32)" | "List(Int64)" => "INTEGER[]",
-        "FLOAT[]" | "List(Float32)" => "FLOAT[]",
-        "DOUBLE[]" | "List(Float64)" => "DOUBLE[]",
-        "TEXT[]" | "List(Utf8)" | "List(String)" => "TEXT[]",
+        "list<int8>" => "LIST_INT8",
+        "list<int16>" => "LIST_INT16",
+        "list<int32>" => "LIST_INT32",
+        "list<int64>" => "LIST_INT64",
+        "FLOAT[]" | "List(Float32)" | "list<float>" => "FLOAT[]",
+        "DOUBLE[]" | "List(Float64)" | "list<double>" => "DOUBLE[]",
+        "TEXT[]" | "List(Utf8)" | "List(String)" | "list<string>" => "TEXT[]",
         _ => dtype,
     }
 }
@@ -468,6 +477,10 @@ fn output_dtype_for_column(
         "FLOAT[]" => DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
         "DOUBLE[]" => DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
         "INTEGER[]" => DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        "LIST_INT8" => DataType::List(Arc::new(Field::new("item", DataType::Int8, true))),
+        "LIST_INT16" => DataType::List(Arc::new(Field::new("item", DataType::Int16, true))),
+        "LIST_INT32" => DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        "LIST_INT64" => DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
         "TEXT[]" => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         _ => input_dtype.clone(),
     };
@@ -942,11 +955,26 @@ fn apply_projection(
     let mut columns = Vec::with_capacity(projection_columns.len());
     for projection in projection_columns {
         let source_name = projection.source.as_deref().unwrap_or(&projection.name);
-        let index = batch.schema().index_of(source_name).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "missing projection source column {source_name}: {err}"
-            ))
-        })?;
+        let index = match batch.schema().index_of(source_name) {
+            Ok(index) => index,
+            Err(_err) if projection.allow_missing => {
+                let dtype = projection.dtype.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "missing projection source column {source_name} requires dtype"
+                    ))
+                })?;
+                let schema = HashMap::from([(projection.name.clone(), dtype.clone())]);
+                let target = output_dtype_for_column(&schema, &projection.name, &DataType::Null)?;
+                fields.push(Arc::new(Field::new(&projection.name, target.clone(), true)));
+                columns.push(arrow_array::new_null_array(&target, batch.num_rows()));
+                continue;
+            }
+            Err(err) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "missing projection source column {source_name}: {err}"
+                )));
+            }
+        };
         let batch_schema = batch.schema();
         let source_field = batch_schema.field(index);
         fields.push(Arc::new(Field::new(
@@ -2115,12 +2143,14 @@ fn execute_and_project_writer_batch(
     context: &str,
     _fingerprint_offset: usize,
 ) -> pyo3::PyResult<RecordBatch> {
+    let final_live_columns = writer_final_live_columns(writer_config);
     let batch = match &writer_config.expression_ir {
-        Some(document) => execute_expression_ir(batch, document).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to execute expression IR for {context}: {error}"
-            ))
-        })?,
+        Some(document) => execute_expression_ir_retaining(batch, document, &final_live_columns)
+            .map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "failed to execute expression IR for {context}: {error}"
+                ))
+            })?,
         None => batch,
     };
     let batch =
@@ -2180,6 +2210,9 @@ fn execute_and_project_writer_batch(
             ))
         });
     }
+    if !writer_config.output_projection_columns.is_empty() {
+        return apply_projection(&batch, &writer_config.output_projection_columns);
+    }
     let output_columns = if writer_config.output_columns.is_empty() {
         batch
             .schema()
@@ -2196,9 +2229,35 @@ fn execute_and_project_writer_batch(
         .map(|name| ProjectionColumn {
             source: Some(name.clone()),
             name,
+            allow_missing: false,
+            dtype: None,
         })
         .collect();
     apply_projection(&batch, &output_projection)
+}
+
+fn writer_final_live_columns(writer_config: &WriterConfig) -> HashSet<String> {
+    if let Some(config) = &writer_config.long_fact {
+        return config
+            .identity_columns
+            .iter()
+            .cloned()
+            .chain(
+                config
+                    .calculated_columns
+                    .iter()
+                    .map(|item| item.name.clone()),
+            )
+            .collect();
+    }
+    if !writer_config.output_projection_columns.is_empty() {
+        return writer_config
+            .output_projection_columns
+            .iter()
+            .filter_map(|item| item.source.clone())
+            .collect();
+    }
+    HashSet::new()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2238,6 +2297,7 @@ pub fn execute_curated_task_impl(
             file_name_prefix: None,
             projection_columns: Vec::new(),
             output_columns: Vec::new(),
+            output_projection_columns: Vec::new(),
             reference_replace: None,
             expression_ir: None,
             lookup_enrich: Vec::new(),
@@ -2982,6 +3042,27 @@ mod type_contract_tests {
             output_dtype_for_column(&schema, "decimal", &DataType::Utf8).expect("DECIMAL"),
             DataType::Decimal128(12, 2)
         );
+    }
+
+    #[test]
+    fn accepts_canonical_expression_dtypes_for_missing_wide_columns() {
+        let cases = [
+            ("int64", DataType::Int64),
+            ("double", DataType::Float64),
+            ("bool", DataType::Boolean),
+            (
+                "list<int64>",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            ),
+        ];
+        for (raw, expected) in cases {
+            let schema = HashMap::from([("calculated".to_string(), raw.to_string())]);
+            assert_eq!(
+                output_dtype_for_column(&schema, "calculated", &DataType::Null).unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

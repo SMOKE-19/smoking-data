@@ -25,7 +25,7 @@ from .fingerprint import (
 from .planner import ExpressionExecutionPlan, plan_expression_execution
 from .spec import CalculatedFactSpec
 
-CALCULATED_FACT_PLAN_VERSION = "smoking-data.calculated-fact-plan.v1"
+CALCULATED_FACT_PLAN_VERSION = "smoking-data.calculated-fact-plan.v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +38,7 @@ class CalculatedFactRunPlan:
     expressions: tuple[ExpressionExecutionPlan, ...]
     fingerprints: tuple[ExpressionFingerprintSpec, ...]
     fact_source_names: dict[str, str]
+    output_mode: str
     output_root: Path
     compression: str
     output_row_group_rows: int | None
@@ -121,6 +122,13 @@ def build_calculated_fact_plan(
             reason=str(exc),
         )
     _validate_expand_list_types(spec, source_schema)
+    missing_includes = sorted(set(spec.include_columns).difference(source_schema.names))
+    if missing_includes:
+        _fail(
+            "wide_output.missing_include_column",
+            "0102 include_columns must exist in the unified upstream schema.",
+            columns=missing_includes,
+        )
     source_dtypes = {field.name: str(field.type) for field in source_schema}
     expression_ir = compile_expression_file(spec.expression_file)
     binding = build_binding_plan(
@@ -176,6 +184,15 @@ def build_calculated_fact_plan(
         )
         for item in raw_fingerprints
     )
+    if spec.output_mode == "wide_calculated_v1":
+        retained = set(spec.identity_columns).union(spec.partition_by, spec.include_columns)
+        collisions = sorted(retained.intersection(item.name for item in fingerprints))
+        if collisions:
+            _fail(
+                "wide_output.duplicate_column",
+                "Calculated wide output columns collide with retained upstream columns.",
+                columns=collisions,
+            )
     artifact = spec.output.get("artifact")
     if not isinstance(artifact, dict):
         _fail("asset.invalid_output_contract", "0102 output.artifact must be a mapping.")
@@ -250,7 +267,11 @@ def build_calculated_fact_plan(
             "root": str(resolved_output),
             "compression": compression,
             "row_group_rows": output_row_group_rows,
+            "mode": spec.output_mode,
+            "include_columns": list(spec.include_columns),
         },
+        "operation_sequence": list(spec.operation_sequence),
+        "execution_model": "task_local_row_group_streaming",
     }
     plan_hash = hashlib.sha256(
         json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
@@ -264,6 +285,7 @@ def build_calculated_fact_plan(
         expressions=expressions,
         fingerprints=fingerprints,
         fact_source_names=fact_source_names,
+        output_mode=spec.output_mode,
         output_root=resolved_output,
         compression=compression,
         output_row_group_rows=output_row_group_rows,

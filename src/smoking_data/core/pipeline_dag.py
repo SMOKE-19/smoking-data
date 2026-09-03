@@ -23,7 +23,6 @@ PUBLIC_EXECUTION_KEYS = frozenset(
     {
         "workers",
         "max_tasks_per_child",
-        "memory_budget_mb",
         "memory",
         "target_rows_per_part",
         "target_key_groups_per_part",

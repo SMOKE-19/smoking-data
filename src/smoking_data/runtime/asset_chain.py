@@ -664,7 +664,7 @@ def _validate_definition_schema(path: Path, *, asset_code: str, asset_id: str) -
     _reject_unknown(yaml_header, {"schema_version", "asset_code"}, path="yaml")
     expected = {
         "0101": "smoking-data.source.v5",
-        "0102": "smoking-data.calculated-fact.v2",
+        "0102": "smoking-data.calculated-fact.v4",
         "0103": "smoking-data.csv-source.v1",
         "0201": "smoking-data.pipeline.v7",
         "0301": "smoking-data.pipeline.v6",

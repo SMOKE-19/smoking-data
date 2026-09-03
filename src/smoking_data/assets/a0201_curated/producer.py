@@ -350,7 +350,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         project_root=config.project_root,
         model_key=str(adaptive_sizing_key["model_key"]),
         phase_name="build_sidecar.candidate",
-        target_peak_memory_mb=sidecar_memory_policy.target_peak_memory_mb,
+        admission_limit_mb=int(config.memory_budget_mb * config.memory_safety_ratio),
     )
     materialize_memory_policy = config.phase_memory_policy(
         "materialize", requested_workers=config.workers
@@ -359,7 +359,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         project_root=config.project_root,
         model_key=str(adaptive_sizing_key["model_key"]),
         phase_name="materialize.fused",
-        target_peak_memory_mb=materialize_memory_policy.target_peak_memory_mb,
+        admission_limit_mb=int(config.memory_budget_mb * config.memory_safety_ratio),
     )
     registry_history_metadata = deepcopy(
         registry_model["model"] if registry_model is not None else {}
@@ -425,10 +425,10 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         historical_worker_peak_p95_mb=sidecar_memory_history["peak_rss_p95_mb"],
         fallback_worker_peak_mb=min(
             config.sidecar_max_projected_bytes_mb,
-            max(64, sidecar_memory_policy.target_peak_memory_mb // 2),
+            max(64, int(config.memory_budget_mb * config.memory_safety_ratio) // 2),
         ),
     )
-    sidecar_phase_budget_mb = int(sidecar_memory_admission["target_peak_memory_mb"])
+    sidecar_phase_budget_mb = int(sidecar_memory_admission["safe_envelope_mb"])
     admitted_sidecar_workers = int(sidecar_memory_admission["admitted_workers"])
     sidecar_projected_limit_mb = max(
         1,
@@ -437,7 +437,9 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             int(sidecar_memory_admission["worker_pool_mb"]) // max(1, admitted_sidecar_workers),
         ),
     )
-    materialize_phase_budget_mb = int(materialize_memory_policy.target_peak_memory_mb)
+    materialize_phase_budget_mb = int(
+        config.memory_budget_mb * config.memory_safety_ratio
+    )
     active_snapshot_target = active_snapshot_path_for(
         spec,
         config=config,
@@ -1295,11 +1297,11 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                     "build_sidecar": sidecar_memory_admission,
                     "materialize": materialize_memory_admission,
                     "save_dataset": {
-                        "target_peak_memory_mb": config.phase_memory_policy(
-                            "save_dataset", requested_workers=1
-                        ).target_peak_memory_mb,
+                        "safe_envelope_mb": int(
+                            config.memory_budget_mb * config.memory_safety_ratio
+                        ),
                         "workers": 1,
-                        "enforcement": "soft_target_observation",
+                        "enforcement": "global_envelope_observation",
                     },
                 },
             },
@@ -1332,15 +1334,15 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             "phase_telemetry": _merge_phase_telemetry_profiles(
                 sidecar_telemetry_profile,
                 task_telemetry_profile,
-                memory_targets_mb={
+                admission_limits_mb={
                     "build_sidecar.candidate": sidecar_phase_budget_mb,
                     "build_sidecar.active_selection": sidecar_phase_budget_mb,
                     "build_sidecar.bucketize": sidecar_phase_budget_mb,
                     "build_sidecar.selector_bucket": sidecar_phase_budget_mb,
                     "materialize.fused": materialize_phase_budget_mb,
-                    "save_dataset.commit": config.phase_memory_policy(
-                        "save_dataset", requested_workers=1
-                    ).target_peak_memory_mb,
+                    "save_dataset.commit": int(
+                        config.memory_budget_mb * config.memory_safety_ratio
+                    ),
                 },
                 hard_limit_mb=config.memory_budget_mb,
             ),
@@ -5177,7 +5179,7 @@ def _task_memory_profile(task_results: list[TaskResult]) -> dict[str, Any]:
 
 def _merge_phase_telemetry_profiles(
     *telemetry_profiles: dict[str, Any] | None,
-    memory_targets_mb: dict[str, int] | None = None,
+    admission_limits_mb: dict[str, int] | None = None,
     hard_limit_mb: int | None = None,
 ) -> dict[str, Any]:
     profiles = [item for item in telemetry_profiles if isinstance(item, dict)]
@@ -5187,17 +5189,17 @@ def _merge_phase_telemetry_profiles(
         for phase in (profile.get("phase_profiles") or [])
         if isinstance(phase, dict)
     ]
-    targets = memory_targets_mb or {}
+    admission_limits = admission_limits_mb or {}
     phase_statistics = {
         phase_name: _phase_telemetry_statistics(
             [item for item in phase_profiles if item.get("phase_name") == phase_name],
-            target_peak_memory_mb=targets.get(phase_name),
+            admission_limit_mb=admission_limits.get(phase_name),
             hard_limit_mb=hard_limit_mb,
         )
         for phase_name in sorted({str(item.get("phase_name") or "") for item in phase_profiles})
     }
     return {
-        "schema_version": "smoking-data.phase-telemetry.v1",
+        "schema_version": "smoking-data.phase-telemetry.v2",
         "status": (
             "completed"
             if phase_profiles and all(item.get("status") == "completed" for item in phase_profiles)
@@ -5216,7 +5218,7 @@ def _merge_phase_telemetry_profiles(
 def _phase_telemetry_statistics(
     profiles: list[dict[str, Any]],
     *,
-    target_peak_memory_mb: int | None = None,
+    admission_limit_mb: int | None = None,
     hard_limit_mb: int | None = None,
 ) -> dict[str, Any]:
     metrics: dict[str, dict[str, float | int | None]] = {}
@@ -5232,18 +5234,18 @@ def _phase_telemetry_statistics(
         }
     observed_p95 = metrics["max_rss_mb"]["p95"]
     pressure = "unobserved"
-    if observed_p95 is not None and target_peak_memory_mb is not None:
+    if observed_p95 is not None and admission_limit_mb is not None:
         if hard_limit_mb is not None and observed_p95 >= hard_limit_mb * 0.95:
             pressure = "hard_limit_near"
-        elif observed_p95 > target_peak_memory_mb * 0.80:
-            pressure = "target_exceeded"
+        elif observed_p95 > admission_limit_mb * 0.80:
+            pressure = "safe_envelope_near"
         else:
-            pressure = "within_target"
+            pressure = "within_envelope"
     return {
         "instances": len(profiles),
         "completed": sum(item.get("status") == "completed" for item in profiles),
         "metrics": metrics,
-        "target_peak_memory_mb": target_peak_memory_mb,
+        "admission_limit_mb": admission_limit_mb,
         "hard_limit_mb": hard_limit_mb,
         "pressure": pressure,
     }

@@ -11,7 +11,7 @@ import yaml
 from smoking_data.core.exceptions import ValidationError
 from smoking_data.runtime.object_store.config import PublicationSpec
 
-SCHEMA_VERSION = "smoking-data.calculated-fact.v2"
+SCHEMA_VERSION = "smoking-data.calculated-fact.v4"
 SUPPORTED_UPSTREAM_CODES = frozenset({"0201", "0301"})
 SUPPORTED_EXTERNAL_SUFFIXES = frozenset({".csv", ".parquet"})
 
@@ -61,14 +61,16 @@ class CalculatedFactSpec:
     column_alias_files: tuple[ColumnAliasFileSpec, ...]
     expand_columns: tuple[ListColumnSpec, ...]
     compact_columns: tuple[ListColumnSpec, ...]
+    compact_expansion_alias: str | None
+    compact_calculation_alias: str | None
+    include_columns: tuple[str, ...]
+    output_mode: str
+    operation_sequence: tuple[str, ...]
     phase_aliases: tuple[str, ...]
     target_rows_per_part: int
     max_source_files_per_chunk: int
     materialize_workers: int
     materialize_worker_max: int
-    materialize_target_peak_memory_mb: int
-    memory_hard_limit_mb: int
-    memory_safety_ratio: float
     output: dict[str, Any]
     raw: dict[str, Any]
     canonical_hash: str
@@ -90,7 +92,6 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
             "define_upstream",
             "build_sidecar",
             "materialize",
-            "save_dataset",
             "execution",
         },
         path="$",
@@ -100,7 +101,7 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
     if header != {"schema_version": SCHEMA_VERSION, "asset_code": "0102"}:
         _fail(
             "yaml.unsupported_schema_version",
-            "0102 definition requires the calculated-fact v2 phase contract.",
+            "0102 definition requires the calculated-fact v4 operation contract.",
             expected={"schema_version": SCHEMA_VERSION, "asset_code": "0102"},
         )
     if _filename_asset_code(definition_path) not in {None, "0102"}:
@@ -130,7 +131,7 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
     build = _mapping(raw.get("build_sidecar"), path="build_sidecar")
     _unknown(
         build,
-        {"alias", "source", "operations", "execution"},
+        {"alias", "source", "identity_columns", "partition_by", "part_boundary"},
         path="build_sidecar",
     )
     build_alias = _string(build.get("alias"), path="build_sidecar.alias")
@@ -139,38 +140,27 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
             "dag.unknown_input_operation",
             "build_sidecar.source must reference define_upstream.alias.",
         )
-    build_operations = _operation_list(
-        build.get("operations"), path="build_sidecar.operations"
-    )
-    if len(build_operations) != 1 or build_operations[0].get("op") != "incremental_fact_selection":
-        _fail(
-            "build_sidecar.selector_position_invalid",
-            "0102 build_sidecar requires exactly one incremental_fact_selection operation.",
-        )
-    selector = build_operations[0]
-    _unknown(
-        selector,
-        {"op", "alias", "identity_columns"},
-        path="build_sidecar.operations[0]",
-    )
-    selector_alias = _string(
-        selector.get("alias"), path="build_sidecar.operations[0].alias"
-    )
     identity_columns = _strings(
-        selector.get("identity_columns"),
-        path="build_sidecar.operations[0].identity_columns",
+        build.get("identity_columns"),
+        path="build_sidecar.identity_columns",
     )
-    max_source_files_per_chunk = _build_execution(build.get("execution"))
+    partition_by = _strings(
+        build.get("partition_by"), path="build_sidecar.partition_by"
+    )
+    if not set(partition_by).issubset(identity_columns):
+        _fail(
+            "incremental.invalid_identity",
+            "build_sidecar.partition_by must be a subset of identity_columns.",
+        )
+    target_rows_per_part = _part_boundary(
+        build.get("part_boundary"), identity_columns=identity_columns
+    )
 
     materialize = _mapping(raw.get("materialize"), path="materialize")
     _unknown(
         materialize,
         {
             "alias",
-            "source",
-            "coordinates",
-            "partition_by",
-            "part_boundary",
             "workers",
             "max_tasks_per_child",
             "operations",
@@ -178,27 +168,6 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
         path="materialize",
     )
     materialize_alias = _string(materialize.get("alias"), path="materialize.alias")
-    if _string(materialize.get("source"), path="materialize.source") != upstream_alias:
-        _fail(
-            "dag.unknown_input_operation",
-            "materialize.source must reference define_upstream.alias.",
-        )
-    if _string(materialize.get("coordinates"), path="materialize.coordinates") != build_alias:
-        _fail(
-            "materialize.invalid_coordinate_source",
-            "materialize.coordinates must reference build_sidecar.alias.",
-        )
-    partition_by = _strings(
-        materialize.get("partition_by"), path="materialize.partition_by"
-    )
-    if not set(partition_by).issubset(identity_columns):
-        _fail(
-            "incremental.invalid_identity",
-            "materialize.partition_by must be a subset of identity_columns.",
-        )
-    target_rows_per_part = _part_boundary(
-        materialize.get("part_boundary"), identity_columns=identity_columns
-    )
     materialize_workers = _positive_int(
         materialize.get("workers", 1), path="materialize.workers"
     )
@@ -212,8 +181,10 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
     )
     operation_kinds = [str(item.get("op") or "") for item in operations]
     allowed_kinds = {
+        "include_columns",
+        "reference_replace",
         "expand_list_rows",
-        "add_calc_cols_from_file",
+        "add_calculated_cols",
         "compact_list_rows",
         "unpivot_0102",
     }
@@ -223,15 +194,17 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
             "0102 materialize contains an unsupported operation.",
             operations=operation_kinds,
         )
-    if operation_kinds.count("add_calc_cols_from_file") != 1:
+    if operation_kinds.count("add_calculated_cols") != 1:
         _fail(
             "operation.required",
-            "0102 materialize requires exactly one add_calc_cols_from_file operation.",
+            "0102 materialize requires exactly one add_calculated_cols operation.",
         )
-    if operation_kinds.count("unpivot_0102") != 1 or operation_kinds[-1] != "unpivot_0102":
+    if operation_kinds.count("unpivot_0102") > 1 or (
+        "unpivot_0102" in operation_kinds and operation_kinds[-1] != "unpivot_0102"
+    ):
         _fail(
-            "operation.required",
-            "0102 materialize requires one final unpivot_0102 operation.",
+            "operation.order_invalid",
+            "0102 unpivot_0102 must be omitted for wide output or appear once as the final operation.",
         )
     has_expand = "expand_list_rows" in operation_kinds
     has_compact = "compact_list_rows" in operation_kinds
@@ -240,82 +213,111 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
             "list.phase_pair_required",
             "expand_list_rows and compact_list_rows must occur exactly once as a pair.",
         )
-    expected_order = (
-        ["expand_list_rows", "add_calc_cols_from_file", "compact_list_rows", "unpivot_0102"]
-        if has_expand
-        else ["add_calc_cols_from_file", "unpivot_0102"]
-    )
-    if operation_kinds != expected_order:
+    core_kinds = [kind for kind in operation_kinds if kind != "unpivot_0102"]
+    canonical_order = [
+        "include_columns",
+        "reference_replace",
+        "expand_list_rows",
+        "add_calculated_cols",
+        "compact_list_rows",
+    ]
+    expected_order = [kind for kind in canonical_order if kind in core_kinds]
+    if len(core_kinds) != len(set(core_kinds)) or core_kinds != expected_order:
         _fail(
             "operation.order_invalid",
-            "0102 materialize operations must follow the calculated-fact phase order.",
+            "0102 materialize operations must follow include, reference_replace, expand, calculate, compact order.",
             expected=expected_order,
-            actual=operation_kinds,
+            actual=core_kinds,
         )
 
-    phase_aliases = [upstream_alias, build_alias, selector_alias, materialize_alias]
+    phase_aliases = [upstream_alias, build_alias, materialize_alias]
     expand_columns: tuple[ListColumnSpec, ...] = ()
     compact_columns: tuple[ListColumnSpec, ...] = ()
     expand_alias: str | None = None
+    calculate_alias: str | None = None
+    compact_expansion_alias: str | None = None
+    compact_calculation_alias: str | None = None
     operation_aliases: list[str] = []
     expression_file: ExpressionFileSpec | None = None
     lookup_files: tuple[LookupFileSpec, ...] = ()
     alias_files: tuple[ColumnAliasFileSpec, ...] = ()
+    include_columns: tuple[str, ...] = ()
     for index, operation in enumerate(operations):
         path = f"materialize.operations[{index}]"
         kind = str(operation["op"])
-        if kind == "expand_list_rows":
-            expand_alias, expand_columns = _expand_operation(operation, path=path)
-            operation_aliases.append(expand_alias)
-        elif kind == "add_calc_cols_from_file":
-            calculate_alias, expression_file, lookup_files, alias_files = _calculate_operation(
+        if kind == "include_columns":
+            include_alias, include_columns = _include_operation(operation, path=path)
+            operation_aliases.append(include_alias)
+        elif kind == "reference_replace":
+            replace_alias, alias_files = _reference_replace_operation(
                 operation, owner=definition_path, path=path
             )
+            operation_aliases.append(replace_alias)
+        elif kind == "expand_list_rows":
+            expand_alias, expand_columns = _expand_operation(operation, path=path)
+            operation_aliases.append(expand_alias)
+        elif kind == "add_calculated_cols":
+            (
+                calculate_alias,
+                expression_file,
+                lookup_files,
+            ) = _calculate_operation(operation, owner=definition_path, path=path)
             operation_aliases.append(calculate_alias)
         elif kind == "compact_list_rows":
-            compact_alias, compact_columns = _compact_operation(operation, path=path)
-            if operation.get("expansion") != expand_alias:
+            (
+                compact_alias,
+                compact_columns,
+                compact_expansion_alias,
+                compact_calculation_alias,
+            ) = _compact_operation(operation, path=path)
+            if compact_expansion_alias != expand_alias:
                 _fail(
                     "list.invalid_expansion_reference",
-                    "compact_list_rows.expansion must reference expand_list_rows.alias.",
+                    "compact_list_rows.expansion_alias_list[0] must reference expand_list_rows.alias.",
+                )
+            if compact_calculation_alias != calculate_alias:
+                _fail(
+                    "list.invalid_calculation_reference",
+                    "compact_list_rows.expansion_alias_list[1] must reference add_calculated_cols.alias.",
                 )
             operation_aliases.append(compact_alias)
         else:
             operation_aliases.append(_unpivot_operation(operation, path=path))
     assert expression_file is not None
+    output_mode = "long_fact_v1" if "unpivot_0102" in operation_kinds else "wide_calculated_v1"
+    if output_mode == "long_fact_v1" and include_columns:
+        _fail(
+            "long_fact.include_columns_unsupported",
+            "include_columns is available only when unpivot_0102 is omitted.",
+        )
     phase_aliases.extend(operation_aliases)
 
-    save = _mapping(raw.get("save_dataset"), path="save_dataset")
-    _unknown(save, {"alias", "input", "partition_by", "operations"}, path="save_dataset")
-    save_alias = _string(save.get("alias"), path="save_dataset.alias")
-    if _string(save.get("input"), path="save_dataset.input") != materialize_alias:
-        _fail("save_dataset.invalid_input", "save_dataset.input must reference materialize.alias.")
-    if _strings(save.get("partition_by"), path="save_dataset.partition_by") != partition_by:
-        _fail("incremental.partition_mismatch", "save_dataset.partition_by must match incremental.partition_by.")
-    if save.get("operations") not in (None, []):
-        _fail(
-            "operation.unsupported",
-            "0102 save_dataset.operations must be empty.",
-        )
-    phase_aliases.append(save_alias)
     if len(set(phase_aliases)) != len(phase_aliases):
         _fail("dag.duplicate_operation_alias", "0102 phase aliases must be unique.")
 
-    (
-        execution_max_files,
-        memory_hard_limit_mb,
-        memory_safety_ratio,
-        materialize_target_peak_memory_mb,
-        materialize_worker_max,
-    ) = _execution(
+    execution_max_files, materialize_worker_max = _execution(
         raw.get("execution"), requested_materialize_workers=materialize_workers
     )
-    max_source_files_per_chunk = min(
-        max_source_files_per_chunk, execution_max_files
-    )
+    max_source_files_per_chunk = execution_max_files
 
     output = _mapping(raw.get("output"), path="output")
+    _unknown(output, {"artifact", "logging"}, path="output")
     artifact = _mapping(output.get("artifact"), path="output.artifact")
+    _unknown(
+        artifact,
+        {"type", "root_dir", "format", "compression", "physical_layout", "publication"},
+        path="output.artifact",
+    )
+    if artifact.get("type") != "calculated_fact_dataset":
+        _fail("output.invalid_type", "output.artifact.type must be calculated_fact_dataset.")
+    _string(artifact.get("root_dir"), path="output.artifact.root_dir")
+    if artifact.get("format") != "parquet":
+        _fail("output.invalid_format", "output.artifact.format must be parquet.")
+    if str(artifact.get("compression") or "").lower() not in {"snappy", "zstd", "uncompressed"}:
+        _fail("output.invalid_compression", "output.artifact.compression is unsupported.")
+    logging = _mapping(output.get("logging"), path="output.logging")
+    _unknown(logging, {"root_dir"}, path="output.logging")
+    _string(logging.get("root_dir"), path="output.logging.root_dir")
     PublicationSpec.from_mapping(artifact.get("publication"))
     canonical_hash = _canonical_hash(
         raw,
@@ -333,14 +335,16 @@ def load_calculated_fact_spec(path: str | Path) -> CalculatedFactSpec:
         column_alias_files=alias_files,
         expand_columns=expand_columns,
         compact_columns=compact_columns,
+        compact_expansion_alias=compact_expansion_alias,
+        compact_calculation_alias=compact_calculation_alias,
+        include_columns=include_columns,
+        output_mode=output_mode,
+        operation_sequence=tuple(operation_kinds),
         phase_aliases=tuple(phase_aliases),
         target_rows_per_part=target_rows_per_part,
         max_source_files_per_chunk=max_source_files_per_chunk,
         materialize_workers=materialize_workers,
         materialize_worker_max=materialize_worker_max,
-        materialize_target_peak_memory_mb=materialize_target_peak_memory_mb,
-        memory_hard_limit_mb=memory_hard_limit_mb,
-        memory_safety_ratio=memory_safety_ratio,
         output=dict(output),
         raw=raw,
         canonical_hash=canonical_hash,
@@ -388,30 +392,33 @@ def _lookup_files(value: Any, *, owner: Path) -> tuple[LookupFileSpec, ...]:
     return tuple(result)
 
 
-def _column_alias_files(value: Any, *, owner: Path) -> tuple[ColumnAliasFileSpec, ...]:
+def _column_alias_files(
+    value: Any, *, owner: Path, path: str = "column_alias_files"
+) -> tuple[ColumnAliasFileSpec, ...]:
     if not isinstance(value, list):
-        _fail("yaml.invalid_type", "column_alias_files must be a list.")
+        _fail("yaml.invalid_type", f"{path} must be a list.")
     result: list[ColumnAliasFileSpec] = []
     for index, raw in enumerate(value):
-        item = _mapping(raw, path=f"column_alias_files[{index}]")
+        item_path = f"{path}[{index}]"
+        item = _mapping(raw, path=item_path)
         _unknown(
             item,
             {"alias", "path", "source_column_field", "alias_column_field"},
-            path=f"column_alias_files[{index}]",
+            path=item_path,
         )
         file_path = _supported_external_path(item.get("path"), owner)
         result.append(
             ColumnAliasFileSpec(
-                alias=_string(item.get("alias"), path=f"column_alias_files[{index}].alias"),
+                alias=_string(item.get("alias"), path=f"{item_path}.alias"),
                 path=file_path,
                 checksum=_sha256(file_path),
                 source_column_field=_string(
                     item.get("source_column_field"),
-                    path="column_alias_files.source_column_field",
+                    path=f"{item_path}.source_column_field",
                 ),
                 alias_column_field=_string(
                     item.get("alias_column_field"),
-                    path="column_alias_files.alias_column_field",
+                    path=f"{item_path}.alias_column_field",
                 ),
             )
         )
@@ -425,55 +432,31 @@ def _operation_list(value: Any, *, path: str) -> list[dict[str, Any]]:
     return [_mapping(item, path=f"{path}[{index}]") for index, item in enumerate(value)]
 
 
-def _build_execution(value: Any) -> int:
-    execution = _mapping(value or {}, path="build_sidecar.execution")
-    _unknown(execution, {"workers", "worker_recycle"}, path="build_sidecar.execution")
-    _one(execution.get("workers", 1), path="build_sidecar.execution.workers")
-    recycle = _mapping(
-        execution.get("worker_recycle") or {},
-        path="build_sidecar.execution.worker_recycle",
-    )
-    _unknown(
-        recycle,
-        {"max_source_files", "max_projected_bytes_mb"},
-        path="build_sidecar.execution.worker_recycle",
-    )
-    max_source_files = _positive_int(
-        recycle.get("max_source_files", 16),
-        path="build_sidecar.execution.worker_recycle.max_source_files",
-    )
-    _positive_int(
-        recycle.get("max_projected_bytes_mb", 512),
-        path="build_sidecar.execution.worker_recycle.max_projected_bytes_mb",
-    )
-    return max_source_files
-
-
 def _part_boundary(value: Any, *, identity_columns: tuple[str, ...]) -> int:
-    boundary = _mapping(value, path="materialize.part_boundary")
+    boundary = _mapping(value, path="build_sidecar.part_boundary")
     _unknown(
         boundary,
         {"target_rows", "preserve_groups"},
-        path="materialize.part_boundary",
+        path="build_sidecar.part_boundary",
     )
     target_rows = _positive_int(
-        boundary.get("target_rows"), path="materialize.part_boundary.target_rows"
+        boundary.get("target_rows"), path="build_sidecar.part_boundary.target_rows"
     )
     preserve_groups = _strings(
         boundary.get("preserve_groups"),
-        path="materialize.part_boundary.preserve_groups",
+        path="build_sidecar.part_boundary.preserve_groups",
     )
     if not set(identity_columns).issubset(preserve_groups):
         _fail(
             "materialize.invalid_part_boundary",
-            "materialize.part_boundary.preserve_groups must contain all identity columns.",
+            "build_sidecar.part_boundary.preserve_groups must contain all identity columns.",
         )
     return target_rows
 
 
 def _execution(
     value: Any, *, requested_materialize_workers: int
-) -> tuple[int, int, float, int, int]:
+) -> tuple[int, int]:
     execution = _mapping(value or {}, path="execution")
     _unknown(
         execution,
@@ -483,38 +466,20 @@ def _execution(
     if execution.get("reset_before_run", False) is not False:
         _fail(
             "execution.unsupported_reset",
-            "0102 append-generation execution requires reset_before_run=false.",
+            "0102 incremental execution requires reset_before_run=false.",
         )
     maximum_files = _positive_int(
         execution.get("max_source_files_per_task", 40),
         path="execution.max_source_files_per_task",
     )
     memory = _mapping(execution.get("memory") or {}, path="execution.memory")
-    _unknown(
-        memory,
-        {"hard_limit_mb", "safety_ratio", "phases"},
-        path="execution.memory",
-    )
-    hard_limit = _positive_int(
-        memory.get("hard_limit_mb", 4096), path="execution.memory.hard_limit_mb"
-    )
-    safety_ratio = memory.get("safety_ratio", 0.8)
-    if (
-        not isinstance(safety_ratio, (int, float))
-        or isinstance(safety_ratio, bool)
-        or not 0 < float(safety_ratio) <= 1
-    ):
-        _fail(
-            "yaml.invalid_type",
-            "execution.memory.safety_ratio must be > 0 and <= 1.",
-        )
+    _unknown(memory, {"phases"}, path="execution.memory")
     phases = _mapping(memory.get("phases") or {}, path="execution.memory.phases")
     _unknown(
         phases,
-        {"build_sidecar", "materialize", "save_dataset"},
+        {"build_sidecar", "materialize"},
         path="execution.memory.phases",
     )
-    materialize_target = hard_limit
     materialize_worker_max = requested_materialize_workers
     for phase_name, phase_value in phases.items():
         phase = _mapping(
@@ -522,19 +487,9 @@ def _execution(
         )
         _unknown(
             phase,
-            {"target_peak_memory_mb", "workers"},
+            {"workers"},
             path=f"execution.memory.phases.{phase_name}",
         )
-        target = _positive_int(
-            phase.get("target_peak_memory_mb"),
-            path=f"execution.memory.phases.{phase_name}.target_peak_memory_mb",
-        )
-        if target > hard_limit:
-            _fail(
-                "execution.invalid_memory_budget",
-                "Phase target_peak_memory_mb cannot exceed hard_limit_mb.",
-                phase=phase_name,
-            )
         workers = _mapping(
             phase.get("workers"),
             path=f"execution.memory.phases.{phase_name}.workers",
@@ -559,15 +514,8 @@ def _execution(
                 phase=phase_name,
             )
         if phase_name == "materialize":
-            materialize_target = target
             materialize_worker_max = maximum
-    return (
-        maximum_files,
-        hard_limit,
-        float(safety_ratio),
-        materialize_target,
-        materialize_worker_max,
-    )
+    return maximum_files, materialize_worker_max
 
 
 def _expand_operation(
@@ -575,12 +523,33 @@ def _expand_operation(
 ) -> tuple[str, tuple[ListColumnSpec, ...]]:
     _unknown(operation, {"op", "alias", "columns"}, path=path)
     alias = _string(operation.get("alias"), path=f"{path}.alias")
-    return alias, _list_columns(
-        operation.get("columns"),
-        source_key="source",
-        target_key="element_alias",
-        path=f"{path}.columns",
+    return alias, _in_place_list_columns(operation.get("columns"), path=f"{path}.columns")
+
+
+def _include_operation(
+    operation: dict[str, Any], *, path: str
+) -> tuple[str, tuple[str, ...]]:
+    _unknown(operation, {"op", "alias", "columns"}, path=path)
+    return (
+        _string(operation.get("alias"), path=f"{path}.alias"),
+        _strings(operation.get("columns"), path=f"{path}.columns"),
     )
+
+
+def _reference_replace_operation(
+    operation: dict[str, Any], *, owner: Path, path: str
+) -> tuple[str, tuple[ColumnAliasFileSpec, ...]]:
+    _unknown(operation, {"op", "alias", "files"}, path=path)
+    files = _column_alias_files(
+        operation.get("files") or [], owner=owner, path=f"{path}.files"
+    )
+    if not files:
+        _fail(
+            "yaml.invalid_type",
+            "0102 reference_replace.files must be a non-empty list.",
+            path=f"{path}.files",
+        )
+    return _string(operation.get("alias"), path=f"{path}.alias"), files
 
 
 def _calculate_operation(
@@ -589,31 +558,43 @@ def _calculate_operation(
     str,
     ExpressionFileSpec,
     tuple[LookupFileSpec, ...],
-    tuple[ColumnAliasFileSpec, ...],
 ]:
     _unknown(
         operation,
-        {"op", "alias", "expression_file", "lookup_files", "column_alias_files"},
+        {
+            "op",
+            "alias",
+            "expression_file",
+            "lookup_files",
+        },
         path=path,
     )
     return (
         _string(operation.get("alias"), path=f"{path}.alias"),
         _expression_file(operation.get("expression_file"), owner=owner),
         _lookup_files(operation.get("lookup_files") or [], owner=owner),
-        _column_alias_files(operation.get("column_alias_files") or [], owner=owner),
     )
 
 
 def _compact_operation(
     operation: dict[str, Any], *, path: str
-) -> tuple[str, tuple[ListColumnSpec, ...]]:
-    _unknown(operation, {"op", "alias", "expansion", "columns"}, path=path)
+) -> tuple[str, tuple[ListColumnSpec, ...], str, str]:
+    _unknown(operation, {"op", "alias", "expansion_alias_list", "columns"}, path=path)
     alias = _string(operation.get("alias"), path=f"{path}.alias")
-    return alias, _list_columns(
-        operation.get("columns"),
-        source_key="source",
-        target_key="output",
-        path=f"{path}.columns",
+    expansion_aliases = _strings(
+        operation.get("expansion_alias_list"),
+        path=f"{path}.expansion_alias_list",
+    )
+    if len(expansion_aliases) != 2:
+        _fail(
+            "list.invalid_expansion_alias_list",
+            "compact_list_rows.expansion_alias_list must contain exactly [expand_alias, calculate_alias].",
+        )
+    return (
+        alias,
+        _in_place_list_columns(operation.get("columns"), path=f"{path}.columns"),
+        expansion_aliases[0],
+        expansion_aliases[1],
     )
 
 
@@ -644,22 +625,11 @@ def _positive_int(value: Any, *, path: str) -> int:
     return value
 
 
-def _list_columns(value: Any, *, source_key: str, target_key: str, path: str) -> tuple[ListColumnSpec, ...]:
-    if not isinstance(value, list) or not value:
-        _fail("yaml.invalid_type", f"{path} must be a non-empty list.")
-    result: list[ListColumnSpec] = []
-    for index, raw in enumerate(value):
-        item = _mapping(raw, path=f"{path}[{index}]")
-        _unknown(item, {source_key, target_key}, path=f"{path}[{index}]")
-        result.append(
-            ListColumnSpec(
-                _string(item.get(source_key), path=f"{path}[{index}].{source_key}"),
-                _string(item.get(target_key), path=f"{path}[{index}].{target_key}"),
-            )
-        )
-    if len({item.source for item in result}) != len(result) or len({item.target for item in result}) != len(result):
-        _fail("list.duplicate_binding", f"{path} source and target names must be unique.")
-    return tuple(result)
+def _in_place_list_columns(value: Any, *, path: str) -> tuple[ListColumnSpec, ...]:
+    names = _strings(value, path=path)
+    if len(set(names)) != len(names):
+        _fail("list.duplicate_binding", f"{path} column names must be unique.")
+    return tuple(ListColumnSpec(name, name) for name in names)
 
 
 def _supported_external_path(value: Any, owner: Path) -> Path:
@@ -754,7 +724,11 @@ def _unique_aliases(files: list[LookupFileSpec] | list[ColumnAliasFileSpec], kin
 
 def _filename_asset_code(path: Path) -> str | None:
     parts = path.name.split(".")
-    return parts[-2] if len(parts) >= 3 and parts[-1].lower() in {"yaml", "yml"} else None
+    if len(parts) < 3 or parts[-1].lower() not in {"yaml", "yml"}:
+        return None
+    if len(parts[0]) == 4 and parts[0].isdigit():
+        return parts[0]
+    return parts[-2]
 
 
 def _sha256(path: Path) -> str:

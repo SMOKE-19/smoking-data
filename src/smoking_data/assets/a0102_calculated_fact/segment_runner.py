@@ -156,13 +156,17 @@ def _execute_materialize_task(
         return execute_curated_task(request)
 
 
-def _materialize_admission(plan: CalculatedFactRunPlan) -> dict[str, Any]:
+def _materialize_admission(
+    plan: CalculatedFactRunPlan,
+    *,
+    config: Any,
+) -> dict[str, Any]:
     requested = plan.spec.materialize_workers
-    worker_cap = plan.spec.materialize_worker_max
-    budget_mb = min(
-        float(plan.spec.materialize_target_peak_memory_mb),
-        float(plan.spec.memory_hard_limit_mb) * plan.spec.memory_safety_ratio,
+    global_policy = config.phase_memory_policy(
+        "materialize", requested_workers=requested
     )
+    worker_cap = min(plan.spec.materialize_worker_max, global_policy.max_workers)
+    budget_mb = float(config.memory_budget_mb) * config.memory_safety_ratio
     estimate_mb = _DEFAULT_TASK_PEAK_MEMORY_MB
     estimate_source = "conservative_default"
     metadata_path = plan.output_root / "_smoking_data" / "metadata.json"
@@ -260,6 +264,7 @@ class _ListShapeAccumulator:
         for expression in plan.expressions:
             strategies[expression.strategy.value] += 1
         return {
+            "observation_mode": "rust_streaming_without_python_payload_rescan",
             "strategy_counts": dict(sorted(strategies.items())),
             "list_columns": list(self.columns),
             "parent_rows_observed": self.rows,
@@ -422,6 +427,11 @@ def _write_run_metadata(
         "upstream_snapshot": upstream_snapshot or {},
         "upstream_delta": upstream_delta or {"mode": "unavailable"},
         "schema_change_handling": schema_change_handling or {},
+        "operation_execution": {
+            "sequence": list(plan.spec.operation_sequence),
+            "model": "task_local_row_group_streaming",
+            "worker_scope": "materialize_task",
+        },
         "planning_memory": {
             "mode": planning_mode,
             "coordinate_passes": coordinate_passes,

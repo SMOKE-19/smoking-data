@@ -12,7 +12,9 @@ import yaml
 
 LEGACY_SOURCE_SCHEMA = "smoking-data.source.v4"
 CURRENT_SOURCE_SCHEMA = "smoking-data.source.v5"
-CURRENT_CALCULATED_FACT_SCHEMA = "smoking-data.calculated-fact.v2"
+LEGACY_CALCULATED_FACT_PHASE_SCHEMA = "smoking-data.calculated-fact.v2"
+LEGACY_CALCULATED_FACT_OPERATION_SCHEMA = "smoking-data.calculated-fact.v3"
+CURRENT_CALCULATED_FACT_SCHEMA = "smoking-data.calculated-fact.v4"
 CURRENT_CSV_SOURCE_SCHEMA = "smoking-data.csv-source.v1"
 CURRENT_PIPELINE_SCHEMA = "smoking-data.pipeline.v6"
 CURRENT_CURATED_SCHEMA = "smoking-data.pipeline.v7"
@@ -55,6 +57,8 @@ def migrate_definition_yaml(
             changes = []
             warnings = [f"입력 YAML이 이미 {_schema_name(payload)}입니다."]
     elif _schema_name(payload) in {
+        LEGACY_CALCULATED_FACT_PHASE_SCHEMA,
+        LEGACY_CALCULATED_FACT_OPERATION_SCHEMA,
         CURRENT_PIPELINE_SCHEMA,
         CURRENT_CURATED_SCHEMA,
         CURRENT_SNAPSHOT_SCHEMA,
@@ -70,6 +74,9 @@ def migrate_definition_yaml(
             asset_code=str((converted.get("yaml") or {}).get("asset_code") or ""),
             changes=changes,
         )
+        _normalize_calculated_fact_phase_contract(converted, changes=changes)
+        _normalize_calculated_fact_operation_contract(converted, changes=changes)
+        _normalize_calculated_fact_in_place_list_contract(converted, changes=changes)
         _normalize_curated_phase_contract(converted, changes=changes)
         _normalize_join_upstream_contract(converted, changes=changes)
         _normalize_snapshot_phase_contract(converted, changes=changes)
@@ -82,6 +89,8 @@ def migrate_definition_yaml(
         converted, changes, warnings = _convert_legacy_publication(payload)
     else:
         converted, changes, warnings = _convert_legacy_source(payload)
+
+    _normalize_definition_global_memory(converted, changes=changes)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = target_path.with_suffix(target_path.suffix + ".tmp")
@@ -100,6 +109,54 @@ def migrate_definition_yaml(
         "warnings": warnings,
         "validation": {"status": "written"},
     }
+
+
+def _normalize_definition_global_memory(
+    payload: dict[str, Any],
+    *,
+    changes: list[dict[str, str]],
+) -> None:
+    """Remove process-wide memory limits from Asset Definitions."""
+
+    execution = payload.get("execution")
+    if not isinstance(execution, dict):
+        return
+    if execution.pop("memory_budget_mb", None) is not None:
+        changes.append(
+            _change(
+                "execution.memory_budget_mb",
+                ".smoking-data/config.yaml execution.memory.hard_limit_mb",
+            )
+        )
+    memory = execution.get("memory")
+    if not isinstance(memory, dict):
+        return
+    for key in ("hard_limit_mb", "safety_ratio"):
+        if memory.pop(key, None) is not None:
+            changes.append(
+                _change(
+                    f"execution.memory.{key}",
+                    f".smoking-data/config.yaml execution.memory.{key}",
+                )
+            )
+    phases = memory.get("phases")
+    if isinstance(phases, dict):
+        for phase_name, phase in list(phases.items()):
+            if not isinstance(phase, dict):
+                continue
+            if phase.pop("target_peak_memory_mb", None) is not None:
+                changes.append(
+                    _change(
+                        f"execution.memory.phases.{phase_name}.target_peak_memory_mb",
+                        ".smoking-data/config.yaml execution.memory hard envelope",
+                    )
+                )
+            if not phase:
+                phases.pop(phase_name, None)
+        if not phases:
+            memory.pop("phases", None)
+    if not memory:
+        execution.pop("memory", None)
 
 
 def generate_parquet_migration_yaml(
@@ -231,6 +288,386 @@ def _mark_expression_text(value: Any, *, key: str | None = None) -> Any:
 def _schema_name(payload: dict[str, Any]) -> str:
     header = payload.get("yaml")
     return str(header.get("schema_version") if isinstance(header, dict) else "unknown")
+
+
+def _normalize_calculated_fact_phase_contract(
+    payload: dict[str, Any],
+    *,
+    changes: list[dict[str, str]],
+) -> None:
+    """Normalize 0102 v2's exposed selector/save phases into the v3 contract."""
+
+    if _schema_name(payload) != LEGACY_CALCULATED_FACT_PHASE_SCHEMA:
+        return
+    header = payload.get("yaml")
+    build = payload.get("build_sidecar")
+    materialize = payload.get("materialize")
+    if not isinstance(header, dict) or str(header.get("asset_code") or "") != "0102":
+        raise ValueError("calculated-fact v2 YAML의 asset_code는 0102여야 합니다.")
+    if not isinstance(build, dict) or not isinstance(materialize, dict):
+        raise ValueError("0102 v2 YAML에는 build_sidecar와 materialize object가 필요합니다.")
+
+    operations = build.pop("operations", None)
+    if (
+        not isinstance(operations, list)
+        or len(operations) != 1
+        or not isinstance(operations[0], dict)
+        or operations[0].get("op") != "incremental_fact_selection"
+    ):
+        raise ValueError(
+            "0102 v2 build_sidecar.operations는 하나의 incremental_fact_selection이어야 합니다."
+        )
+    identity_columns = operations[0].get("identity_columns")
+    if not isinstance(identity_columns, list) or not identity_columns:
+        raise ValueError("incremental_fact_selection.identity_columns가 필요합니다.")
+    build["identity_columns"] = deepcopy(identity_columns)
+    changes.append(
+        _change(
+            "build_sidecar.operations[0].identity_columns",
+            "build_sidecar.identity_columns",
+        )
+    )
+
+    upstream_alias = str(build.get("source") or "").strip()
+    sidecar_alias = str(build.get("alias") or "").strip()
+    for field, expected in (("source", upstream_alias), ("coordinates", sidecar_alias)):
+        value = str(materialize.pop(field, "") or "").strip()
+        if not expected or value != expected:
+            raise ValueError(
+                f"0102 v2 materialize.{field}는 build_sidecar 연결과 일치해야 합니다. "
+                f"value={value!r}, expected={expected!r}"
+            )
+        changes.append(_change(f"materialize.{field}", "implicit build_sidecar link"))
+
+    partition_by = materialize.pop("partition_by", None)
+    if not isinstance(partition_by, list) or not partition_by:
+        raise ValueError("0102 v2 materialize.partition_by가 필요합니다.")
+    build["partition_by"] = deepcopy(partition_by)
+    changes.append(_change("materialize.partition_by", "build_sidecar.partition_by"))
+
+    part_boundary = materialize.pop("part_boundary", None)
+    if not isinstance(part_boundary, dict):
+        raise ValueError("0102 v2 materialize.part_boundary가 필요합니다.")
+    build["part_boundary"] = deepcopy(part_boundary)
+    changes.append(_change("materialize.part_boundary", "build_sidecar.part_boundary"))
+
+    build_execution = build.pop("execution", None)
+    if build_execution is not None:
+        if not isinstance(build_execution, dict):
+            raise ValueError("0102 v2 build_sidecar.execution은 object여야 합니다.")
+        recycle = build_execution.get("worker_recycle")
+        build_max_files = (
+            recycle.get("max_source_files") if isinstance(recycle, dict) else None
+        )
+        if build_max_files is not None:
+            execution = payload.setdefault("execution", {})
+            if not isinstance(execution, dict):
+                raise ValueError("0102 execution은 object여야 합니다.")
+            root_max_files = execution.get("max_source_files_per_task")
+            execution["max_source_files_per_task"] = min(
+                int(build_max_files), int(root_max_files or build_max_files)
+            )
+        changes.append(
+            _change("build_sidecar.execution", "execution.max_source_files_per_task")
+        )
+
+    save = payload.pop("save_dataset", None)
+    if not isinstance(save, dict):
+        raise ValueError("0102 v2 save_dataset object가 필요합니다.")
+    if str(save.get("input") or "").strip() != str(materialize.get("alias") or "").strip():
+        raise ValueError("0102 v2 save_dataset.input은 materialize.alias와 일치해야 합니다.")
+    if save.get("partition_by") != partition_by:
+        raise ValueError("0102 v2 save_dataset.partition_by는 materialize.partition_by와 일치해야 합니다.")
+    if save.get("operations") not in (None, []):
+        raise ValueError("0102 v2 save_dataset.operations는 비어 있어야 합니다.")
+    changes.append(_change("save_dataset", "implicit terminal dataset commit"))
+
+    execution = payload.get("execution")
+    memory = execution.get("memory") if isinstance(execution, dict) else None
+    phases = memory.get("phases") if isinstance(memory, dict) else None
+    if isinstance(phases, dict) and phases.pop("save_dataset", None) is not None:
+        changes.append(
+            _change(
+                "execution.memory.phases.save_dataset",
+                "removed (internal commit phase)",
+            )
+        )
+
+    header["schema_version"] = LEGACY_CALCULATED_FACT_OPERATION_SCHEMA
+    changes.append(
+        _change(
+            LEGACY_CALCULATED_FACT_PHASE_SCHEMA,
+            LEGACY_CALCULATED_FACT_OPERATION_SCHEMA,
+        )
+    )
+
+
+def _normalize_calculated_fact_operation_contract(
+    payload: dict[str, Any],
+    *,
+    changes: list[dict[str, str]],
+) -> None:
+    """Split 0102 v3's compound calculation operation into ordered v4 operations."""
+
+    if _schema_name(payload) != LEGACY_CALCULATED_FACT_OPERATION_SCHEMA:
+        return
+    header = payload.get("yaml")
+    materialize = payload.get("materialize")
+    if not isinstance(header, dict) or str(header.get("asset_code") or "") != "0102":
+        raise ValueError("calculated-fact v3 YAML의 asset_code는 0102여야 합니다.")
+    if not isinstance(materialize, dict):
+        raise ValueError("0102 v3 YAML에는 materialize object가 필요합니다.")
+    operations = materialize.get("operations")
+    if not isinstance(operations, list):
+        raise ValueError("0102 v3 materialize.operations는 list여야 합니다.")
+    compound = [
+        item
+        for item in operations
+        if isinstance(item, dict) and item.get("op") == "add_calc_cols_from_file"
+    ]
+    if len(compound) != 1:
+        raise ValueError(
+            "0102 v3 materialize.operations에는 add_calc_cols_from_file이 정확히 하나 필요합니다."
+        )
+    calculate = deepcopy(compound[0])
+    calculate_alias = str(calculate.get("alias") or "calculate").strip() or "calculate"
+    used_aliases = {
+        str(item.get("alias") or "").strip()
+        for item in operations
+        if isinstance(item, dict)
+    }
+    used_aliases.update(
+        str(section.get("alias") or "").strip()
+        for name in ("build_sidecar", "materialize")
+        if isinstance((section := payload.get(name)), dict)
+    )
+    upstreams = payload.get("define_upstream")
+    if isinstance(upstreams, list):
+        used_aliases.update(
+            str(item.get("alias") or "").strip()
+            for item in upstreams
+            if isinstance(item, dict)
+        )
+    used_aliases.discard("")
+
+    include_columns = calculate.pop("include_columns", None)
+    alias_files = calculate.pop("column_alias_files", None)
+    inline_expand = calculate.pop("expand_list_rows", None)
+    inline_compact = calculate.pop("compact_list_rows", None)
+    calculate["op"] = "add_calculated_cols"
+    if calculate.get("lookup_files") == []:
+        calculate.pop("lookup_files")
+
+    standalone_expand = next(
+        (
+            deepcopy(item)
+            for item in operations
+            if isinstance(item, dict) and item.get("op") == "expand_list_rows"
+        ),
+        None,
+    )
+    standalone_compact = next(
+        (
+            deepcopy(item)
+            for item in operations
+            if isinstance(item, dict) and item.get("op") == "compact_list_rows"
+        ),
+        None,
+    )
+    if (inline_expand is not None or inline_compact is not None) and (
+        standalone_expand is not None or standalone_compact is not None
+    ):
+        raise ValueError("0102 v3 List 단계가 inline과 standalone에 중복 선언되었습니다.")
+    if (inline_expand is None) != (inline_compact is None):
+        raise ValueError("0102 v3 inline expand/compact는 함께 선언해야 합니다.")
+
+    normalized: list[dict[str, Any]] = []
+    if include_columns is not None:
+        normalized.append(
+            {
+                "op": "include_columns",
+                "alias": _next_migration_alias(f"{calculate_alias}_include", used_aliases),
+                "columns": deepcopy(include_columns),
+            }
+        )
+    if alias_files not in (None, []):
+        normalized.append(
+            {
+                "op": "reference_replace",
+                "alias": _next_migration_alias(
+                    f"{calculate_alias}_reference_replace", used_aliases
+                ),
+                "files": deepcopy(alias_files),
+            }
+        )
+
+    if standalone_expand is not None:
+        normalized.append(standalone_expand)
+        expand_alias = str(standalone_expand.get("alias") or "").strip()
+    elif inline_expand is not None:
+        expand_alias = _next_migration_alias(f"{calculate_alias}_expand", used_aliases)
+        normalized.append(
+            {
+                "op": "expand_list_rows",
+                "alias": expand_alias,
+                "columns": deepcopy(inline_expand.get("columns")),
+            }
+        )
+    else:
+        expand_alias = ""
+
+    normalized.append(calculate)
+    if standalone_compact is not None:
+        normalized.append(standalone_compact)
+    elif inline_compact is not None:
+        normalized.append(
+            {
+                "op": "compact_list_rows",
+                "alias": _next_migration_alias(f"{calculate_alias}_compact", used_aliases),
+                "expansion_alias_list": [expand_alias, calculate_alias],
+                "columns": deepcopy(inline_compact.get("columns")),
+            }
+        )
+    normalized.extend(
+        deepcopy(item)
+        for item in operations
+        if isinstance(item, dict) and item.get("op") == "unpivot_0102"
+    )
+    materialize["operations"] = normalized
+    header["schema_version"] = CURRENT_CALCULATED_FACT_SCHEMA
+    if include_columns is not None:
+        changes.append(
+            _change("add_calc_cols_from_file.include_columns", "include_columns operation")
+        )
+    if alias_files not in (None, []):
+        changes.append(
+            _change(
+                "add_calc_cols_from_file.column_alias_files",
+                "reference_replace operation",
+            )
+        )
+    if inline_expand is not None:
+        changes.append(
+            _change(
+                "add_calc_cols_from_file.expand_list_rows/compact_list_rows",
+                "expand_list_rows/compact_list_rows operations",
+            )
+        )
+    changes.extend(
+        [
+            _change("add_calc_cols_from_file", "add_calculated_cols operation"),
+            _change(
+                LEGACY_CALCULATED_FACT_OPERATION_SCHEMA,
+                CURRENT_CALCULATED_FACT_SCHEMA,
+            ),
+        ]
+    )
+
+
+def _normalize_calculated_fact_in_place_list_contract(
+    payload: dict[str, Any],
+    *,
+    changes: list[dict[str, str]],
+) -> None:
+    """Normalize pre-release v4 List bindings to in-place column-name lists."""
+
+    if _schema_name(payload) != CURRENT_CALCULATED_FACT_SCHEMA:
+        return
+    header = payload.get("yaml")
+    materialize = payload.get("materialize")
+    if not isinstance(header, dict) or str(header.get("asset_code") or "") != "0102":
+        return
+    if not isinstance(materialize, dict):
+        return
+    operations = materialize.get("operations")
+    if not isinstance(operations, list):
+        raise ValueError("0102 v4 materialize.operations는 list여야 합니다.")
+
+    expand_alias = next(
+        (
+            str(item.get("alias") or "").strip()
+            for item in operations
+            if isinstance(item, dict) and item.get("op") == "expand_list_rows"
+        ),
+        "",
+    )
+    calculate_alias = next(
+        (
+            str(item.get("alias") or "").strip()
+            for item in operations
+            if isinstance(item, dict) and item.get("op") == "add_calculated_cols"
+        ),
+        "",
+    )
+
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        kind = operation.get("op")
+        if kind not in {"expand_list_rows", "compact_list_rows"}:
+            continue
+        columns = operation.get("columns")
+        if not isinstance(columns, list) or not columns:
+            continue
+        if kind == "compact_list_rows":
+            expansion_aliases = operation.get("expansion_alias_list")
+            if not isinstance(expansion_aliases, list):
+                expansion = operation.pop("expansion", None)
+                if isinstance(expansion, dict):
+                    legacy_expand_alias = str(expansion.get("expand") or expand_alias).strip()
+                    legacy_calculate_alias = str(
+                        expansion.get("calculate") or calculate_alias
+                    ).strip()
+                else:
+                    legacy_expand_alias = str(expansion or expand_alias).strip()
+                    legacy_calculate_alias = calculate_alias
+                operation["expansion_alias_list"] = [
+                    legacy_expand_alias,
+                    legacy_calculate_alias,
+                ]
+                changes.append(
+                    _change(
+                        "compact_list_rows.expansion",
+                        "compact_list_rows.expansion_alias_list",
+                    )
+                )
+        if all(isinstance(item, str) for item in columns):
+            continue
+        source_key, target_key = (
+            ("source", "element_alias")
+            if kind == "expand_list_rows"
+            else ("source", "output")
+        )
+        names: list[str] = []
+        for item in columns:
+            if not isinstance(item, dict):
+                raise ValueError(f"0102 {kind}.columns는 문자열 list여야 합니다.")
+            source = str(item.get(source_key) or "").strip()
+            target = str(item.get(target_key) or "").strip()
+            if not source or source != target:
+                raise ValueError(
+                    f"0102 {kind}의 기존 {source_key}/{target_key} 이름이 다릅니다. "
+                    "in-place columns 계약으로 자동 변환할 수 없으므로 계산식과 칼럼명을 "
+                    "같게 정리한 뒤 다시 마이그레이션하십시오."
+                )
+            names.append(source)
+        operation["columns"] = names
+        changes.append(
+            _change(
+                f"{kind}.columns.{source_key}/{target_key}",
+                f"{kind}.columns[] (in-place)",
+            )
+        )
+
+
+def _next_migration_alias(base: str, used: set[str]) -> str:
+    candidate = base
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
 
 
 def _normalize_curated_phase_contract(

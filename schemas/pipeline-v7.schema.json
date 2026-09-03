@@ -37,9 +37,8 @@
     "phaseMemory": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["target_peak_memory_mb", "workers"],
+      "required": ["workers"],
       "properties": {
-        "target_peak_memory_mb": {"type": "integer", "minimum": 1},
         "workers": {
           "type": "object",
           "additionalProperties": false,
@@ -214,14 +213,11 @@
       "properties": {
         "workers": {"type": "integer", "minimum": 1},
         "max_tasks_per_child": {"type": ["integer", "null"], "minimum": 1},
-        "memory_budget_mb": {"type": "integer", "minimum": 1},
         "memory": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["hard_limit_mb", "safety_ratio", "phases"],
+          "required": ["phases"],
           "properties": {
-            "hard_limit_mb": {"type": "integer", "minimum": 1},
-            "safety_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
             "phases": {
               "type": "object",
               "additionalProperties": false,

@@ -4,7 +4,7 @@
 Asset 지향 데이터 처리 엔진이다. Python 실행 계층과 Rust/PyO3 커널을 하나의 패키지로 제공하며,
 YAML Definition을 검증하고 실행 계획과 재현 가능한 데이터셋 산출물을 생성한다.
 
-현재 엔진/API 버전은 `0.1.16`이며 Python 3.10 이상 3.14 미만을 지원한다.
+현재 엔진/API 버전은 `0.1.17`이며 Python 3.10 이상 3.14 미만을 지원한다.
 
 ## 주요 기능
 
@@ -54,7 +54,7 @@ metadata와 필요한 coordinate를 수집하고, 후속 materialize 단계는 �
 릴리스 wheel을 받은 경우 해당 파일을 직접 설치한다.
 
 ```bash
-python -m pip install ./smoking_data-0.1.16-cp313-cp313-linux_x86_64.whl \
+python -m pip install ./smoking_data-0.1.17-cp313-cp313-linux_x86_64.whl \
   --find-links https://github.com/SMOKE-19/smoking-sbdf/releases/expanded_assets/v0.1.6
 ```
 

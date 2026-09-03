@@ -59,7 +59,7 @@ def ensure_complete_group_within_budget(
             "spill_supported": policy.spill_supported,
             "suggested_next": [
                 "use the automatic spill path when the pivot aggregation is mergeable",
-                "increase execution.memory_budget_mb",
+                "increase .smoking-data/config.yaml execution.memory.hard_limit_mb",
                 "reduce upstream payload width",
                 "partition the complete group earlier",
             ],

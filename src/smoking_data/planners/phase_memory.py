@@ -16,8 +16,8 @@ def build_phase_memory_admission(
     historical_worker_peak_p95_mb: float | None,
     fallback_worker_peak_mb: float,
 ) -> dict[str, Any]:
-    target_mb = min(int(hard_limit_mb), int(policy.target_peak_memory_mb))
-    safe_envelope_mb = max(1.0, target_mb * float(safety_ratio))
+    hard_limit_mb = int(hard_limit_mb)
+    safe_envelope_mb = max(1.0, hard_limit_mb * float(safety_ratio))
     parent_reserve_mb = min(512.0, max(128.0, safe_envelope_mb * 0.10))
     worker_pool_mb = max(1.0, safe_envelope_mb - parent_reserve_mb)
     worker_peak_mb = max(
@@ -28,18 +28,17 @@ def build_phase_memory_admission(
     requested = min(max(1, int(requested_workers)), int(policy.max_workers))
     admitted = max(int(policy.min_workers), min(requested, capacity))
     admitted = min(admitted, requested)
-    ratio = worker_peak_mb * admitted / max(1.0, target_mb)
-    if ratio >= 0.95:
+    admitted_peak_mb = worker_peak_mb * admitted
+    if admitted_peak_mb >= hard_limit_mb * 0.95:
         pressure = "hard_limit_near"
-    elif ratio > 0.80:
-        pressure = "target_exceeded"
+    elif admitted_peak_mb > safe_envelope_mb * 0.80:
+        pressure = "safe_envelope_near"
     else:
-        pressure = "within_target"
+        pressure = "within_envelope"
     return {
-        "schema_version": "smoking-data.phase-memory-admission.v1",
+        "schema_version": "smoking-data.phase-memory-admission.v2",
         "phase": phase,
-        "hard_limit_mb": int(hard_limit_mb),
-        "target_peak_memory_mb": target_mb,
+        "hard_limit_mb": hard_limit_mb,
         "safety_ratio": float(safety_ratio),
         "safe_envelope_mb": safe_envelope_mb,
         "parent_reserve_mb": parent_reserve_mb,

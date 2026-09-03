@@ -9,14 +9,16 @@ paths:
   log_root: logs
   schedule_root: schedules
 
-  custom_yaml_root: templates_new
+  custom_yaml_root: templates
 
 execution:
   workers: 1
   max_tasks_per_child: 1
   target_rows_per_part: 20000
   target_key_groups_per_part: 500
-  memory_budget_mb: 4096
+  memory:
+    hard_limit_mb: 4096
+    safety_ratio: 0.80
   max_source_files_per_task: 40
   max_source_row_groups_per_task: 512
   sidecar_target_bytes_mb: 128

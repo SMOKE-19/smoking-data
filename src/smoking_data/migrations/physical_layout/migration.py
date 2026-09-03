@@ -155,7 +155,6 @@ def migrate_layout_yaml(
     allowed_execution = {
         "mode",
         "workers",
-        "memory_budget_mb",
         "batch_size",
         "max_files_per_worker",
     }
@@ -176,12 +175,13 @@ def migrate_layout_yaml(
             "execution.mode must be dry_run or in_place.",
             code="layout_migration.invalid_definition",
         )
+    runtime_config = load_config(project_root=root, asset_code="0101")
     return migrate_0101_dataset(
         upstream["path"],
         migration["recommendation"],
         in_place=mode == "in_place",
         project_root=root,
-        memory_budget_mb=int(execution.get("memory_budget_mb") or 4_096),
+        memory_budget_mb=runtime_config.memory_budget_mb,
         batch_size=int(execution.get("batch_size") or 4_096),
         max_files_per_worker=int(execution.get("max_files_per_worker") or 8),
         workers=int(execution.get("workers") or 1),

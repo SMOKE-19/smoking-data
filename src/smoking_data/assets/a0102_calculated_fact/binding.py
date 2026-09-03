@@ -54,6 +54,8 @@ def build_binding_plan(
 ) -> BindingPlan:
     alias_registry = load_column_alias_registry(spec.column_alias_files)
     for item in spec.expand_columns:
+        if item.target == item.source:
+            continue
         existing = alias_registry.get(item.target)
         if existing is not None and existing != item.source:
             _fail(
@@ -174,7 +176,11 @@ def build_binding_plan(
         active_names.add(expression_name)
         available_outputs.add(str(expression.get("name") or ""))
 
-    source_projection = list(dict.fromkeys((*spec.identity_columns, *spec.partition_by)))
+    source_projection = list(
+        dict.fromkeys(
+            (*spec.identity_columns, *spec.partition_by, *spec.include_columns)
+        )
+    )
     for binding in bindings:
         if binding.kind in {"source", "virtual_alias"}:
             source_projection.append(binding.physical_name)
@@ -193,7 +199,10 @@ def build_binding_plan(
         name
         for name in source_projection
         if name not in source_dtypes
-        and name in set(spec.identity_columns).union(spec.partition_by)
+        and name
+        in set(spec.identity_columns)
+        .union(spec.partition_by)
+        .union(spec.include_columns)
     ]
     if missing_source:
         _fail(

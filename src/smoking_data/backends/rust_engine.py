@@ -46,6 +46,7 @@ class CuratedTaskRequest:
     lookup_enrich: list[dict[str, Any]] | None = None
     long_fact: dict[str, Any] | None = None
     output_columns: list[str] | None = None
+    output_projection_columns: list[dict[str, Any]] | None = None
     partition_columns: list[str] | None = None
     lookup_path: Path | None = None
     restore_config: dict[str, Any] | None = None
@@ -135,6 +136,7 @@ def execute_curated_task(request: CuratedTaskRequest) -> dict[str, float]:
             "lookup_enrich": request.lookup_enrich or [],
             "long_fact": request.long_fact,
             "output_columns": request.output_columns or [],
+            "output_projection_columns": request.output_projection_columns or [],
             "partition_columns": request.partition_columns or [],
             "reference_replace": request.reference_replace or None,
             "pivot": request.pivot or None,

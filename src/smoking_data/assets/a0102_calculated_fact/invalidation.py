@@ -26,10 +26,11 @@ def group_all_coordinate_expressions(
     coordinate: CoordinateBatch,
     *,
     expression_order: Sequence[str],
+    allow_empty: bool = False,
 ) -> InvalidationTaskGroup:
     names = tuple(expression_order)
-    row_count = coordinate.projected_batch.num_rows
-    if not names:
+    row_count = coordinate.selected_row_count
+    if not names and not allow_empty:
         _fail(
             "incremental.state_mismatch",
             "Coordinate states do not match row × expression cardinality.",
@@ -70,6 +71,11 @@ def select_projected_rows(
     coordinate: CoordinateBatch,
     group: InvalidationTaskGroup,
 ) -> pa.RecordBatch:
+    if coordinate.projected_batch is None:
+        _fail(
+            "sidecar.payload_not_loaded",
+            "Projected rows are unavailable for a metadata-only coordinate batch.",
+        )
     selected = pc.take(
         coordinate.projected_batch,
         pa.array(group.row_indices, type=pa.int64()),

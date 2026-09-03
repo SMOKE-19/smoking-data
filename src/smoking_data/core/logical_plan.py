@@ -876,7 +876,6 @@ def _validate_common_sections(raw: dict[str, Any]) -> None:
             "max_tasks_per_child",
             "target_rows_per_part",
             "target_key_groups_per_part",
-            "memory_budget_mb",
             "memory",
             "max_source_files_per_task",
             "max_source_row_groups_per_task",

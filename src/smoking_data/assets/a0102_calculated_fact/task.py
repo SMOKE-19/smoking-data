@@ -87,14 +87,20 @@ def build_calculated_fact_task_request(
     batch_size: int | None,
     source_fingerprint: str,
     calculated_at: datetime | None = None,
+    available_columns: Sequence[str] | None = None,
 ) -> CuratedTaskRequest:
+    wide_output = plan.output_mode == "wide_calculated_v1"
     return CuratedTaskRequest(
         coordinate_path=coordinate_path,
         output_dir=output_dir,
         output_file_name=f"part-{task_index:06d}.parquet",
         single_partition_guaranteed=False,
         writer_input_contract=None,
-        projection_columns=_projection_columns(plan, group.expression_names),
+        projection_columns=_projection_columns(
+            plan,
+            group.expression_names,
+            available_columns=available_columns,
+        ),
         schema={},
         expression_ir=subset_expression_ir(
             plan.expression_ir,
@@ -104,14 +110,27 @@ def build_calculated_fact_task_request(
             ),
         ),
         lookup_enrich=_lookup_enrich_configs(plan, lookup_cache_dir),
-        long_fact=build_long_fact_writer_config(
-            plan,
-            generation_seq=generation_seq,
-            source_fingerprint=source_fingerprint,
-            calculated_at=calculated_at,
-            expression_names=group.expression_names,
+        long_fact=(
+            None
+            if wide_output
+            else build_long_fact_writer_config(
+                plan,
+                generation_seq=generation_seq,
+                source_fingerprint=source_fingerprint,
+                calculated_at=calculated_at,
+                expression_names=group.expression_names,
+            )
         ),
         output_columns=[],
+        output_projection_columns=(
+            _wide_output_projection(
+                plan,
+                group.expression_names,
+                available_columns=available_columns,
+            )
+            if wide_output
+            else []
+        ),
         partition_columns=list(plan.spec.partition_by),
         compression=plan.compression,
         output_row_group_rows=plan.output_row_group_rows,
@@ -122,17 +141,24 @@ def build_calculated_fact_task_request(
 def _projection_columns(
     plan: CalculatedFactRunPlan,
     expression_names: Sequence[str],
+    *,
+    available_columns: Sequence[str] | None = None,
 ) -> list[dict[str, str]]:
     fingerprints = {
         item.name: item for item in plan.fingerprints if item.name in set(expression_names)
     }
-    required_physical = set(plan.spec.identity_columns).union(plan.spec.partition_by)
+    required_physical = (
+        set(plan.spec.identity_columns)
+        .union(plan.spec.partition_by)
+        .union(getattr(plan.spec, "include_columns", ()))
+    )
     for item in fingerprints.values():
         required_physical.update(item.source_columns)
+    available = set(available_columns) if available_columns is not None else None
     result = [
         {"name": name, "source": name}
         for name in plan.binding.source_projection
-        if name in required_physical
+        if name in required_physical and (available is None or name in available)
     ]
     emitted = {item["name"] for item in result}
     alias_registry = load_column_alias_registry(plan.spec.column_alias_files)
@@ -146,10 +172,68 @@ def _projection_columns(
             if source_key in alias_registry:
                 logical_aliases[source_key] = alias_registry[source_key]
     for logical, physical in logical_aliases.items():
-        if physical in required_physical and logical not in emitted:
+        if (
+            physical in required_physical
+            and logical not in emitted
+            and (available is None or physical in available)
+        ):
             result.append({"name": logical, "source": physical})
             emitted.add(logical)
     return result
+
+
+def _wide_output_projection(
+    plan: CalculatedFactRunPlan,
+    expression_names: Sequence[str],
+    *,
+    available_columns: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    selected = set(expression_names)
+    available = (
+        set(available_columns)
+        if available_columns is not None
+        else set(plan.source_schema.names)
+    )
+    source_dtypes = {field.name: str(field.type) for field in plan.source_schema}
+    result: list[dict[str, Any]] = []
+    emitted: set[str] = set()
+    for name in (
+        *plan.spec.identity_columns,
+        *plan.spec.partition_by,
+        *plan.spec.include_columns,
+    ):
+        if name not in emitted:
+            result.append(
+                {
+                    "name": name,
+                    "source": name,
+                    "allow_missing": name not in available,
+                    "dtype": source_dtypes[name],
+                }
+            )
+            emitted.add(name)
+    dtypes = {item.name: item.output_dtype for item in plan.expressions}
+    for fingerprint in plan.fingerprints:
+        published = fingerprint.name
+        source = plan.fact_source_names.get(published, published)
+        result.append(
+            {
+                "name": published,
+                "source": source,
+                "allow_missing": published not in selected,
+                "dtype": dtypes[source],
+            }
+        )
+    return result
+
+
+def wide_output_column_names(plan: CalculatedFactRunPlan) -> tuple[str, ...]:
+    return tuple(
+        item["name"]
+        for item in _wide_output_projection(
+            plan, tuple(item.name for item in plan.fingerprints)
+        )
+    )
 
 
 def _lookup_enrich_configs(

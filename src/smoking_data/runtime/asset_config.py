@@ -220,6 +220,22 @@ def _read_config_text(
         value = payload.get(key)
         if value is not None and not isinstance(value, dict):
             raise ValueError(f"Asset config {key}는 mapping이어야 합니다: {source}")
+    if expected_scope != "common":
+        execution = payload.get("execution") or {}
+        memory = execution.get("memory") or {}
+        forbidden = []
+        if "memory_budget_mb" in execution:
+            forbidden.append("execution.memory_budget_mb")
+        forbidden.extend(
+            f"execution.memory.{key}"
+            for key in ("hard_limit_mb", "safety_ratio")
+            if key in memory
+        )
+        if forbidden:
+            raise ValueError(
+                "전역 메모리 상한은 common config에서만 설정할 수 있습니다: "
+                f"{forbidden} ({source})"
+            )
     contract = payload.get("contract") or {}
     contract_unknown = sorted(set(contract) - {"partition_grid"})
     if contract_unknown:

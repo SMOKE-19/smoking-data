@@ -17,8 +17,9 @@ from .planning import CalculatedFactRunPlan
 
 @dataclass(frozen=True, slots=True)
 class CoordinateBatch:
-    projected_batch: pa.RecordBatch
+    projected_batch: pa.RecordBatch | None
     coordinates: tuple[SourceCoordinate, ...]
+    selected_row_count: int
     source_file_count: int
     row_group_count: int
     source_schema_hash: str
@@ -35,6 +36,8 @@ class SourceCoordinate:
 def load_coordinate_batch(
     coordinate_path: str | Path,
     plan: CalculatedFactRunPlan,
+    *,
+    load_payload: bool = True,
 ) -> CoordinateBatch:
     path = Path(coordinate_path).expanduser().resolve()
     if not path.is_file():
@@ -140,26 +143,30 @@ def load_coordinate_batch(
                 row_offset=ordered_offsets[-1],
                 row_group_rows=row_count,
             )
-        table = parquet.read_row_group(row_group, columns=projection)
-        selected = pc.take(table, pa.array(ordered_offsets, type=pa.int64()))
-        batches.extend(selected.to_batches(max_chunksize=max(1, len(ordered_offsets))))
+        if load_payload:
+            table = parquet.read_row_group(row_group, columns=projection)
+            selected = pc.take(table, pa.array(ordered_offsets, type=pa.int64()))
+            batches.extend(selected.to_batches(max_chunksize=max(1, len(ordered_offsets))))
         execution_coordinates.extend(
             SourceCoordinate(str(source_path), row_group, offset)
             for offset in ordered_offsets
         )
-    if not batches:
+    if not execution_coordinates:
         _fail("sidecar.empty_coordinate", "Coordinate IPC selects no source rows.")
-    try:
-        projected = pa.concat_batches(batches)
-    except pa.ArrowInvalid as exc:
-        _fail(
-            "upstream.schema_mismatch",
-            "Projected coordinate batches have incompatible schemas.",
-            reason=str(exc),
-        )
+    projected: pa.RecordBatch | None = None
+    if load_payload:
+        try:
+            projected = pa.concat_batches(batches)
+        except pa.ArrowInvalid as exc:
+            _fail(
+                "upstream.schema_mismatch",
+                "Projected coordinate batches have incompatible schemas.",
+                reason=str(exc),
+            )
     return CoordinateBatch(
         projected_batch=projected,
         coordinates=tuple(execution_coordinates),
+        selected_row_count=len(execution_coordinates),
         source_file_count=len({item[0] for item in groups}),
         row_group_count=len(groups),
         source_schema_hash=hashlib.sha256(str(source_schema).encode()).hexdigest(),

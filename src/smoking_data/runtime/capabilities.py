@@ -41,7 +41,7 @@ def get_capabilities() -> dict[str, Any]:
         "engine": engine_metadata(),
         "asset_schemas": {
             "0101": "smoking-data.source.v5",
-            "0102": "smoking-data.calculated-fact.v2",
+            "0102": "smoking-data.calculated-fact.v4",
             "0103": "smoking-data.csv-source.v1",
             "0201": CURATED_PIPELINE_SCHEMA_VERSION,
             "0301": PIPELINE_SCHEMA_VERSION,

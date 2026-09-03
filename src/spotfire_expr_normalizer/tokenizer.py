@@ -65,10 +65,19 @@ def tokenize_expression(expression: str) -> list[Token]:
 
 
 def _read_bracket_identifier(expression: str, start: int) -> tuple[str, int]:
-    end = expression.find("]", start + 1)
-    if end < 0:
-        raise ValueError(f"Unclosed bracket column at position {start}.")
-    return expression[start + 1 : end], end + 1
+    chars: list[str] = []
+    index = start + 1
+    while index < len(expression):
+        char = expression[index]
+        if char == "]":
+            if index + 1 < len(expression) and expression[index + 1] == "]":
+                chars.append("]")
+                index += 2
+                continue
+            return "".join(chars), index + 1
+        chars.append(char)
+        index += 1
+    raise ValueError(f"Unclosed bracket column at position {start}.")
 
 
 def _read_string_literal(expression: str, start: int) -> tuple[str, int]:

@@ -183,7 +183,7 @@ def generate_parquet_migration_yaml(
     if not fields:
         raise ValueError(f"Parquet input has no columns: {source}")
     partition_column = fields[0]
-    group_keys = [{"name": name, "column": name} for name in fields]
+    group_keys = list(fields)
     root = output_root or f"DATA/0201/{job_name}"
     payload: dict[str, Any] = {
         "yaml": {"schema_version": CURRENT_CURATED_SCHEMA, "asset_code": "0201"},
@@ -683,6 +683,85 @@ def _normalize_curated_phase_contract(
     materialize = payload.get("materialize")
     if not isinstance(build_sidecar, dict) or not isinstance(materialize, dict):
         return
+
+    sidecar_operations = build_sidecar.get("operations")
+    if isinstance(sidecar_operations, list):
+        for selector_index, selector in enumerate(sidecar_operations):
+            if not isinstance(selector, dict) or selector.get("op") != "active_row_selection":
+                continue
+            raw_group_keys = selector.get("group_keys")
+            if not isinstance(raw_group_keys, list) or not raw_group_keys:
+                continue
+            if all(isinstance(item, str) for item in raw_group_keys):
+                continue
+            names: list[str] = []
+            calculated: list[dict[str, str]] = []
+            for index, item in enumerate(raw_group_keys):
+                if isinstance(item, str):
+                    name = item.strip()
+                    if not name:
+                        raise ValueError(
+                            f"build_sidecar.operations[{selector_index}].group_keys[{index}]가 비어 있습니다."
+                        )
+                    names.append(name)
+                    continue
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"build_sidecar.operations[{selector_index}].group_keys[{index}]는 문자열 또는 객체여야 합니다."
+                    )
+                name = str(item.get("name") or "").strip()
+                sources = {
+                    key: str(item.get(key) or "").strip()
+                    for key in ("column", "sql", "spotfire_expression")
+                    if str(item.get(key) or "").strip()
+                }
+                if not name or len(sources) > 1:
+                    raise ValueError(
+                        f"build_sidecar.operations[{selector_index}].group_keys[{index}]를 "
+                        "단일 add_calc와 문자열 키로 변환할 수 없습니다."
+                    )
+                names.append(name)
+                if not sources:
+                    continue
+                source_kind, source = next(iter(sources.items()))
+                if source_kind == "column" and source == name:
+                    continue
+                calculated.append(
+                    {
+                        "name": name,
+                        (
+                            "sql" if source_kind == "column" else source_kind
+                        ): (
+                            '"' + source.replace('"', '""') + '"'
+                            if source_kind == "column"
+                            else source
+                        ),
+                    }
+                )
+            if len(set(names)) != len(names):
+                raise ValueError("active_row_selection.group_keys에는 중복 이름을 사용할 수 없습니다.")
+            selector["group_keys"] = names
+            if calculated:
+                used_aliases = {
+                    str(operation.get("alias") or "")
+                    for operation in sidecar_operations
+                    if isinstance(operation, dict)
+                }
+                sidecar_operations.insert(
+                    selector_index,
+                    {
+                        "op": "add_calc",
+                        "alias": _next_migration_alias("calculate_group_keys", used_aliases),
+                        "expressions": calculated,
+                    },
+                )
+            changes.append(
+                _change(
+                    "build_sidecar.operations[].active_row_selection.group_keys objects",
+                    "preceding add_calc plus group_keys string list",
+                )
+            )
+            break
 
     expected = {
         "source": str(build_sidecar.get("source") or "").strip(),
@@ -1575,7 +1654,7 @@ def _convert_legacy_pipeline(
 def _current_pipeline(job_name: str, asset_code: str, schema: str, output: dict[str, Any], operations: list[dict[str, Any]], keys: list[str] | None = None) -> dict[str, Any]:
     if keys is not None:
         partition = keys[0]
-        return {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "define_upstream": [{**operations[0]}], "build_sidecar": {"alias": "select_rows", "source": operations[0]["alias"], "partition_by": [partition], "part_boundary": {"target_rows": 20000, "preserve_groups": keys}, "columns": "auto", "operations": [{"op": "active_row_selection", "method": "sort_first", "group_keys": [{"name": key, "column": key} for key in keys], "sort": [{"column": partition, "direction": "asc", "nulls": "last"}]}]}, "materialize": {"alias": "materialize_rows", "workers": 1, "max_tasks_per_child": 1, "operations": []}, "execution": {"reset_before_run": False}}
+        return {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "define_upstream": [{**operations[0]}], "build_sidecar": {"alias": "select_rows", "source": operations[0]["alias"], "partition_by": [partition], "part_boundary": {"target_rows": 20000, "preserve_groups": keys}, "columns": "auto", "operations": [{"op": "active_row_selection", "method": "sort_first", "group_keys": list(keys), "sort": [{"column": partition, "direction": "asc", "nulls": "last"}]}]}, "materialize": {"alias": "materialize_rows", "workers": 1, "max_tasks_per_child": 1, "operations": []}, "execution": {"reset_before_run": False}}
     if asset_code == "0301":
         result = {"yaml": {"schema_version": schema, "asset_code": asset_code}, "job": {"name": job_name}, "output": output, "operations": operations, "execution": {"reset_before_run": False}}
         _normalize_join_upstream_contract(result, changes=[])

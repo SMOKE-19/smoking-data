@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from smoking_data.core.engine_contract import normalize_list_restore_type
 from smoking_data.core.exceptions import ValidationError
 from smoking_data.core.logical_plan import (
     LogicalOperationPlan,
@@ -649,60 +650,18 @@ def _compile_operation(
                     "expression_ir": None,
                 },
             )
-        group_key_items = _mapping_list(config.get("group_keys"), path=f"{path}.group_keys")
-        canonical_group_keys: list[dict[str, str]] = []
-        names: set[str] = set()
-        direct_inputs: list[str] = []
-        for index, item in enumerate(group_key_items):
-            item_path = f"{path}.group_keys[{index}]"
-            _keys(
-                item,
-                {"name", "column", "sql", "spotfire_expression"},
-                path=item_path,
-            )
-            name = _required_string(item.get("name"), path=f"{item_path}.name")
-            if name in names:
-                raise ValidationError(
-                    "active_row_selection group key names must be unique.",
-                    code="active_row_selection.duplicate_group_key",
-                    context={"path": f"{item_path}.name", "name": name},
-                )
-            names.add(name)
-            sources = {
-                key: str(item.get(key) or "").strip()
-                for key in ("column", "sql", "spotfire_expression")
-                if str(item.get(key) or "").strip()
-            }
-            # A group key that only declares its logical name refers to the
-            # input column with the same name.  Keep the expanded form in the
-            # canonical plan so downstream lineage and execution do not need
-            # to distinguish the shorthand.
-            if not sources:
-                sources = {"column": name}
-            if len(sources) != 1:
-                raise ValidationError(
-                    "active_row_selection group key requires exactly one of column, sql or spotfire_expression.",
-                    code="expression.source_ambiguous",
-                    context={"path": item_path},
-                )
-            source_kind, source = next(iter(sources.items()))
-            canonical_group_keys.append({"name": name, source_kind: source})
-            if source_kind == "column":
-                direct_inputs.append(source)
-        computed_names = {item["name"] for item in canonical_group_keys if "column" not in item}
-        if computed_names and expression_ir is None:
+        group_keys = _string_list(config.get("group_keys"), path=f"{path}.group_keys")
+        if not group_keys:
             raise ValidationError(
-                "active_row_selection expressions must compile to typed expression IR.",
-                code="expression.ir_required",
-                context={"path": path, "operation_id": operation_id},
+                "active_row_selection group_keys must be a non-empty string list.",
+                code="yaml.invalid_type",
+                context={"path": f"{path}.group_keys"},
             )
-        if expression_ir is not None and _selector_ir_is_stateful_or_nondeterministic(
-            expression_ir
-        ):
+        if len(set(group_keys)) != len(group_keys):
             raise ValidationError(
-                "active_row_selection group key expressions must be row-local.",
-                code="active_row_selection.non_row_local_expression",
-                context={"path": f"{path}.group_keys", "operation_id": operation_id},
+                "active_row_selection group keys must be unique.",
+                code="active_row_selection.duplicate_group_key",
+                context={"path": f"{path}.group_keys", "group_keys": group_keys},
             )
         sort_items = _mapping_list(config.get("sort"), path=f"{path}.sort")
         for index, item in enumerate(sort_items):
@@ -714,29 +673,22 @@ def _compile_operation(
                     context={"path": f"{path}.sort[{index}].nulls"},
                 )
         ordering = _ordering(sort_items, path=f"{path}.sort")
-        expression_inputs = _ir_input_columns(expression_ir).difference(computed_names)
         inputs = tuple(
-            dict.fromkeys(
-                [*direct_inputs, *sorted(expression_inputs), *(name for name, _ in ordering)]
-            )
+            dict.fromkeys([*group_keys, *(name for name, _ in ordering)])
         )
-        lineage = _ir_expression_lineage(expression_ir)
-        for item in canonical_group_keys:
-            if "column" in item:
-                lineage[item["name"]] = (item["column"],)
+        lineage = {name: (name,) for name in group_keys}
         return _operation(
             operation_id,
             kind,
             {
                 "method": method,
                 "sidecar": str(config.get("sidecar") or "").strip() or None,
-                "group_keys": canonical_group_keys,
+                "group_keys": group_keys,
                 "sort": list(config.get("sort") or []),
-                "expression_ir": expression_ir,
             },
             input_columns=inputs,
             alias_lineage=lineage,
-            group_keys=tuple(item["name"] for item in canonical_group_keys),
+            group_keys=tuple(group_keys),
             ordering=ordering,
         )
     if kind is OperationKind.MATERIALIZE:
@@ -1170,6 +1122,19 @@ def _compile_operation(
             schema: dict[str, Any] = {}
         else:
             schema = _mapping(raw_schema, path=f"{path}.schema")
+            for column, dtype in schema.items():
+                try:
+                    normalize_list_restore_type(str(dtype))
+                except ValidationError as error:
+                    raise ValidationError(
+                        "list_restore schema contains an unsupported List type.",
+                        code=error.code,
+                        context={
+                            **error.context,
+                            "path": f"{path}.schema.{column}",
+                            "column": str(column),
+                        },
+                    ) from error
         restore_config = _mapping(config.get("config"), path=f"{path}.config")
         _keys(
             restore_config,
@@ -1266,33 +1231,6 @@ def _advance_known_columns(columns: set[str], operation: Any) -> None:
             columns.add(binding["output"])
     else:
         columns.update(column.name for column in operation.output_columns)
-
-
-def _selector_ir_is_stateful_or_nondeterministic(document: dict[str, Any]) -> bool:
-    forbidden_functions = {
-        "current_date",
-        "current_timestamp",
-        "now",
-        "rand",
-        "random",
-        "uuid",
-    }
-
-    def visit(value: Any) -> bool:
-        if isinstance(value, dict):
-            if value.get("kind") in {"window", "aggregate"}:
-                return True
-            if (
-                value.get("kind") == "call"
-                and str(value.get("function") or "").lower() in forbidden_functions
-            ):
-                return True
-            return any(visit(child) for child in value.values())
-        if isinstance(value, list):
-            return any(visit(child) for child in value)
-        return False
-
-    return visit(document)
 
 
 def _advance_known_dtypes(dtypes: dict[str, str], operation: Any) -> None:
@@ -1910,13 +1848,17 @@ def _mapping_list(value: Any, *, path: str) -> list[dict[str, Any]]:
 
 
 def _string_list(value: Any, *, path: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value or not all(str(item).strip() for item in value):
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item.strip() for item in value)
+    ):
         raise ValidationError(
             f"{path} must be a non-empty string list.",
             code="yaml.invalid_type",
             context={"path": path},
         )
-    return tuple(str(item) for item in value)
+    return tuple(item.strip() for item in value)
 
 
 def _required_string(value: Any, *, path: str) -> str:

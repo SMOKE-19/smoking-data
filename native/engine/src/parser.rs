@@ -94,6 +94,18 @@ fn parse_i32_token(raw: &str) -> pyo3::PyResult<i32> {
     })
 }
 
+fn parse_i64_token(raw: &str) -> pyo3::PyResult<i64> {
+    raw.parse::<i64>().map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid signed integer '{raw}': {err}"))
+    })
+}
+
+fn parse_u64_token(raw: &str) -> pyo3::PyResult<u64> {
+    raw.parse::<u64>().map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid unsigned integer '{raw}': {err}"))
+    })
+}
+
 fn parse_f64_token(raw: &str) -> pyo3::PyResult<f64> {
     raw.parse::<f64>().map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid float '{raw}': {err}"))
@@ -171,6 +183,34 @@ fn parse_i32_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::P
     parse_i32_token(&raw_token)
 }
 
+fn integer_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::PyResult<String> {
+    let (start, end) = trim_ascii_ws(bytes, start, end);
+    if start >= end {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "empty integer token",
+        ));
+    }
+    if bytes[start] == b'"' {
+        parse_string_token(bytes, start, end)
+    } else {
+        std::str::from_utf8(&bytes[start..end])
+            .map(str::to_string)
+            .map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid utf-8 in integer list: {err}"
+                ))
+            })
+    }
+}
+
+fn parse_i64_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::PyResult<i64> {
+    parse_i64_token(&integer_token_from_bytes(bytes, start, end)?)
+}
+
+fn parse_u64_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::PyResult<u64> {
+    parse_u64_token(&integer_token_from_bytes(bytes, start, end)?)
+}
+
 fn parse_f64_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::PyResult<f64> {
     let (start, end) = trim_ascii_ws(bytes, start, end);
     if start >= end {
@@ -208,6 +248,14 @@ fn parse_string_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3
 
 pub fn parse_json_i32_array(raw: &str) -> pyo3::PyResult<Vec<i32>> {
     parse_json_array_tokens(raw, "int", parse_i32_token_from_bytes)
+}
+
+pub fn parse_json_i64_array(raw: &str) -> pyo3::PyResult<Vec<i64>> {
+    parse_json_array_tokens(raw, "signed integer", parse_i64_token_from_bytes)
+}
+
+pub fn parse_json_u64_array(raw: &str) -> pyo3::PyResult<Vec<u64>> {
+    parse_json_array_tokens(raw, "unsigned integer", parse_u64_token_from_bytes)
 }
 
 pub fn parse_json_f64_array(raw: &str) -> pyo3::PyResult<Vec<f64>> {

@@ -4,7 +4,7 @@
 Asset 지향 데이터 처리 엔진이다. Python 실행 계층과 Rust/PyO3 커널을 하나의 패키지로 제공하며,
 YAML Definition을 검증하고 실행 계획과 재현 가능한 데이터셋 산출물을 생성한다.
 
-현재 엔진/API 버전은 `0.1.17`이며 Python 3.10 이상 3.14 미만을 지원한다.
+현재 엔진/API 버전은 `0.1.18`이며 Python 3.10 이상 3.14 미만을 지원한다.
 
 ## 주요 기능
 
@@ -54,7 +54,7 @@ metadata와 필요한 coordinate를 수집하고, 후속 materialize 단계는 �
 릴리스 wheel을 받은 경우 해당 파일을 직접 설치한다.
 
 ```bash
-python -m pip install ./smoking_data-0.1.17-cp313-cp313-linux_x86_64.whl \
+python -m pip install ./smoking_data-0.1.18-cp313-cp313-linux_x86_64.whl \
   --find-links https://github.com/SMOKE-19/smoking-sbdf/releases/expanded_assets/v0.1.6
 ```
 
@@ -80,10 +80,19 @@ smoking-data run definitions/job.0201.yaml --project-root . --json
 smoking-data capabilities --json
 ```
 
+`run`과 `chain run`의 일반 텍스트 출력은 실행 환경에 맞춰 자동 전환된다. 대화형 터미널에서는
+현재 phase와 추정 진행률, 처리 중인 task·PID·RSS를 한 화면에서 갱신한다. 로그 리다이렉션·파이프
+환경에서는 같은 정보를 줄 단위 이벤트로 남기며, `--json`에서는 기계 판독 결과를 오염시키지 않도록
+진행 출력을 끄고 최종 JSON만 출력한다. 전체 진행률은 phase별 완료율을 합산한 추정치다.
+
+에셋별 진행 단위는 실제 처리 경계에 맞춘다. 0101은 API task, 0102는 coordinate 계산 task,
+0103은 입력 파일, 0201은 candidate 파일·bucketize row group·materialize task, 0301은 join task를
+기준으로 표시한다. 0401은 하향된 0201 또는 0301 실행 경로의 같은 phase 계약을 사용한다.
+
 주요 보조 명령은 다음과 같다.
 
 ```text
-inspect       dataset, failure, missing dependency, profile 조회
+inspect       dataset, Parquet payload preview, failure, missing dependency, profile 조회
 migrate       기존 Definition·Parquet 입력·Chain 마이그레이션
 smoke         일부 task만 실행하는 bounded smoke test
 layout        물리 레이아웃 분석과 마이그레이션
@@ -92,6 +101,15 @@ chain         Asset Chain 검증과 실행
 parquet-schema
               Parquet footer schema 조회
 pwq           pipeline write quality 권고
+```
+
+wide Parquet의 실제 값을 터미널에서 확인할 때는 파일 또는 dataset 디렉터리를 전달한다. 디렉터리는
+재귀 탐색한 파일을 정렬한 뒤 첫 번째 Parquet의 첫 10행을 읽으며, 모든 칼럼을 터미널 폭에 맞는
+블록으로 나눠 출력한다.
+
+```bash
+smoking-data inspect DATA/0201/job \
+  --repeat-columns bucket,text_ro,int_wa
 ```
 
 각 명령의 세부 계약은 CLI help에서 확인한다.

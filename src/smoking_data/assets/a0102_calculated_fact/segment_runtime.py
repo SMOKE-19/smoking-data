@@ -11,7 +11,7 @@ from typing import Any
 from smoking_data.core.results import StageResult
 from smoking_data.runtime.dataset_artifacts import describe_dataset_artifacts
 from smoking_data.runtime.events import append_stage_event
-from smoking_data.runtime.task_telemetry import task_telemetry_phase
+from smoking_data.runtime.task_telemetry import emit_task_telemetry_event, task_telemetry_phase
 from smoking_data_engine_rs import plan_coordinates
 
 from .calculation_manifest import (
@@ -104,6 +104,12 @@ def execute_segment_plan(
     ) as temporary:
         work_root = Path(temporary)
         coordinate_root = work_root / "coordinates"
+        emit_task_telemetry_event(
+            telemetry.endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": "0102.plan_coordinates", "total": 1, "unit": "plan"},
+        )
         with task_telemetry_phase(telemetry.endpoint, "0102.plan_coordinates"):
             if selected:
                 planner_stats = plan_coordinates(
@@ -135,6 +141,23 @@ def execute_segment_plan(
         )
 
         if not coordinate_paths:
+            for phase_name, unit in (
+                ("0102.calculate_unpivot_write", "tasks"),
+                ("0102.adopt_task_outputs", "tasks"),
+                ("0102.transaction_setup", "transaction"),
+                ("0102.commit", "generation"),
+            ):
+                emit_task_telemetry_event(
+                    telemetry.endpoint,
+                    "phase_planned",
+                    task_id=None,
+                    details={
+                        "phase_name": phase_name,
+                        "total": 0,
+                        "unit": unit,
+                        "skipped": True,
+                    },
+                )
             active = _next_active_segments(
                 previous=previous,
                 delta=upstream_delta,
@@ -196,6 +219,12 @@ def execute_segment_plan(
         materialize_admission = _materialize_admission(plan, config=config)
         task_count = 0
         calculated_fact_count = 0
+        emit_task_telemetry_event(
+            telemetry.endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": "0102.transaction_setup", "total": 1, "unit": "transaction"},
+        )
         with task_telemetry_phase(telemetry.endpoint, "0102.transaction_setup"):
             transaction_context = SegmentAppendTransaction(
                 plan.output_root,
@@ -282,6 +311,16 @@ def execute_segment_plan(
                         calculated_at=calculated_at,
                         available_columns=coordinate.source_columns,
                     )
+                    for phase_name in (
+                        "0102.calculate_unpivot_write",
+                        "0102.adopt_task_outputs",
+                    ):
+                        emit_task_telemetry_event(
+                            telemetry.endpoint,
+                            "phase_planned",
+                            task_id=None,
+                            details={"phase_name": phase_name, "total": 1, "unit": "tasks"},
+                        )
                     materializer.submit(
                         request,
                         task_id=f"0102-{task_count:06d}",
@@ -290,10 +329,32 @@ def execute_segment_plan(
                     )
                     task_count += 1
                 task_stats = materializer.finish()
+                if task_count == 0:
+                    for phase_name in (
+                        "0102.calculate_unpivot_write",
+                        "0102.adopt_task_outputs",
+                    ):
+                        emit_task_telemetry_event(
+                            telemetry.endpoint,
+                            "phase_planned",
+                            task_id=None,
+                            details={
+                                "phase_name": phase_name,
+                                "total": 0,
+                                "unit": "tasks",
+                                "skipped": True,
+                            },
+                        )
             except BaseException:
                 materializer.abort()
                 raise
             if task_count:
+                emit_task_telemetry_event(
+                    telemetry.endpoint,
+                    "phase_planned",
+                    task_id=None,
+                    details={"phase_name": "0102.commit", "total": 1, "unit": "generation"},
+                )
                 with task_telemetry_phase(telemetry.endpoint, "0102.commit"):
                     appended = transaction.commit(
                         metadata={
@@ -305,6 +366,17 @@ def execute_segment_plan(
                         }
                     )
             else:
+                emit_task_telemetry_event(
+                    telemetry.endpoint,
+                    "phase_planned",
+                    task_id=None,
+                    details={
+                        "phase_name": "0102.commit",
+                        "total": 0,
+                        "unit": "generation",
+                        "skipped": True,
+                    },
+                )
                 transaction.rollback()
                 appended = None
 

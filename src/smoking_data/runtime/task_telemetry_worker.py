@@ -16,6 +16,8 @@ def main() -> int:
     parser.add_argument("--ready-path", type=Path, required=True)
     parser.add_argument("--summary-path", type=Path, required=True)
     parser.add_argument("--sample-interval-sec", type=float, required=True)
+    parser.add_argument("--console-progress", choices=("off", "plain", "tty"), default="off")
+    parser.add_argument("--progress-title", default="smoking-data")
     args = parser.parse_args()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
@@ -31,6 +33,8 @@ def main() -> int:
                 token=args.token,
                 log_path=args.log_path,
                 sample_interval_sec=args.sample_interval_sec,
+                console_progress=args.console_progress,
+                progress_title=args.progress_title,
             )
         _write_json_atomic(args.summary_path, profile)
         return 0

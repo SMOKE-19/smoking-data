@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+from smoking_data.runtime.console_progress import ConsoleProgressRenderer, configured_progress_mode
 from smoking_data.runtime.paths import ensure_dir
 from smoking_data.runtime.process_metrics import read_process_metrics
 
@@ -66,8 +67,10 @@ def start_task_telemetry_supervisor(
     *,
     log_path: Path,
     sample_interval_sec: float = DEFAULT_SAMPLE_INTERVAL_SEC,
+    progress_title: str = "smoking-data",
 ) -> TaskTelemetryHandle:
     sample_interval = min(5.0, max(0.05, float(sample_interval_sec)))
+    progress_mode = configured_progress_mode()
     try:
         ensure_dir(log_path.parent)
         token = secrets.token_hex(16)
@@ -89,10 +92,14 @@ def start_task_telemetry_supervisor(
                 str(summary_path),
                 "--sample-interval-sec",
                 str(sample_interval),
+                "--console-progress",
+                progress_mode,
+                "--progress-title",
+                progress_title,
             ],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=None if progress_mode != "off" else subprocess.DEVNULL,
+            stderr=None if progress_mode != "off" else subprocess.DEVNULL,
             text=True,
         )
         deadline = time.monotonic() + 10.0
@@ -164,10 +171,15 @@ def task_telemetry_phase(
     *,
     task_id: str | None = None,
     phase_id: str | None = None,
+    counts_completion: bool = True,
 ):
     """Emit a real execution boundary without making telemetry an ETL dependency."""
     resolved_phase_id = phase_id or f"{phase_name}:{task_id or os.getpid()}:{time.time_ns()}"
-    details = {"phase_name": phase_name, "phase_id": resolved_phase_id}
+    details = {
+        "phase_name": phase_name,
+        "phase_id": resolved_phase_id,
+        "counts_completion": counts_completion,
+    }
     emit_task_telemetry_event(endpoint, "phase_started", task_id=task_id, details=details)
     try:
         yield
@@ -194,6 +206,8 @@ def _supervisor_loop(
     token: str,
     log_path: Path,
     sample_interval_sec: float,
+    console_progress: str = "off",
+    progress_title: str = "smoking-data",
 ) -> dict[str, Any]:
     event_counts: Counter[str] = Counter()
     workers: dict[tuple[int, str], dict[str, Any]] = {}
@@ -208,6 +222,7 @@ def _supervisor_loop(
     started_ns = time.time_ns()
     next_sample_at = time.monotonic() + sample_interval_sec
     log_stream = _open_jsonl(log_path)
+    progress = ConsoleProgressRenderer(mode=console_progress, title=progress_title)
     while not stopped:
         receiver.settimeout(
             0.02 if stop_requested else max(0.001, next_sample_at - time.monotonic())
@@ -227,6 +242,7 @@ def _supervisor_loop(
             if event_name == "supervisor_stop":
                 stop_requested = True
             else:
+                progress.handle(event)
                 metrics_available = (
                     _apply_task_event(event, workers, pid_identities, tasks, phases, log_stream)
                     or metrics_available
@@ -242,11 +258,13 @@ def _supervisor_loop(
                 tasks,
                 phases,
                 log_stream,
+                progress=progress,
             )
             samples_written += sample_count
             event_counts["worker_exited"] += exited_count
             metrics_available = metrics_available or sample_available
             next_sample_at = time.monotonic() + sample_interval_sec
+            progress.render()
 
     sample_count, sample_available, exited_count = _sample_workers(
         workers,
@@ -254,6 +272,7 @@ def _supervisor_loop(
         tasks,
         phases,
         log_stream,
+        progress=progress,
     )
     samples_written += sample_count
     event_counts["worker_exited"] += exited_count
@@ -279,6 +298,7 @@ def _supervisor_loop(
             log_stream.close()
         except OSError:
             pass
+    progress.finish()
     return _build_summary(
         log_path=log_path,
         sample_interval_sec=sample_interval_sec,
@@ -302,6 +322,13 @@ def _apply_task_event(
     phases: dict[str, dict[str, Any]],
     log_stream: TextIO | None,
 ) -> bool:
+    event_name = str(event.get("event") or "unknown")
+    if event_name in {"phase_planned", "phase_progress"}:
+        _write_jsonl(
+            log_stream,
+            {key: value for key, value in event.items() if key != "token"},
+        )
+        return False
     pid = int(event.get("pid") or 0)
     task_id = str(event.get("task_id") or "")
     metrics = read_process_metrics(pid)
@@ -320,7 +347,6 @@ def _apply_task_event(
     if metrics is not None:
         worker["last"] = metrics
         _update_worker_peaks(worker, metrics)
-    event_name = str(event.get("event") or "unknown")
     timestamp_ns = int(event.get("timestamp_ns") or time.time_ns())
     details = event.get("details") or {}
     if event_name in {"phase_started", "phase_finished"}:
@@ -395,6 +421,8 @@ def _sample_workers(
     tasks: dict[str, dict[str, Any]],
     phases: dict[str, dict[str, Any]],
     log_stream: TextIO | None,
+    *,
+    progress: ConsoleProgressRenderer | None = None,
 ) -> tuple[int, bool, int]:
     count = 0
     available = False
@@ -440,19 +468,19 @@ def _sample_workers(
             phase["last_metrics"] = metrics
             _update_task_peaks(phase, metrics)
             active_phase_ids.append(phase_id)
-        _write_jsonl(
-            log_stream,
-            {
-                "schema_version": TASK_TELEMETRY_EVENT_VERSION,
-                "event": "process_sample",
-                "timestamp_ns": time.time_ns(),
-                "pid": identity[0],
-                "process_creation_time": identity[1],
-                "task_ids": active_task_ids,
-                "phase_ids": active_phase_ids,
-                "metrics": metrics,
-            },
-        )
+        sample_event = {
+            "schema_version": TASK_TELEMETRY_EVENT_VERSION,
+            "event": "process_sample",
+            "timestamp_ns": time.time_ns(),
+            "pid": identity[0],
+            "process_creation_time": identity[1],
+            "task_ids": active_task_ids,
+            "phase_ids": active_phase_ids,
+            "metrics": metrics,
+        }
+        _write_jsonl(log_stream, sample_event)
+        if progress is not None:
+            progress.handle(sample_event)
         count += 1
     return count, available, exited
 

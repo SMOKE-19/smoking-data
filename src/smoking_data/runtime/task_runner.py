@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from smoking_data.core.tasks import TaskResult, TaskSpec
+from smoking_data.runtime.console_progress import worker_console_enabled
 from smoking_data.runtime.memory import current_rss_mb, peak_rss_mb, process_io_bytes
 from smoking_data.runtime.task_telemetry import (
     emit_task_telemetry_event,
@@ -74,6 +75,18 @@ def run_tasks_in_subprocesses(
     effective_telemetry_endpoint = (
         telemetry_handle.endpoint if telemetry_handle is not None else telemetry_endpoint
     )
+    phase_names = {
+        str(task.payload.get("__telemetry_phase_name") or "").strip() for task in tasks
+    } - {""}
+    if len(phase_names) == 1 and not any(
+        bool(task.payload.get("__progress_internal")) for task in tasks
+    ):
+        emit_task_telemetry_event(
+            effective_telemetry_endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": next(iter(phase_names)), "total": len(tasks), "unit": "tasks"},
+        )
     indexed_tasks = [
         replace(
             task,
@@ -372,6 +385,7 @@ def _run_task_guarded(
         "task_ordinal": int(task.payload.get("__task_ordinal") or 0),
         "generation_index": int(task.payload.get("__generation_index") or 0),
         "batch_index": int(task.payload.get("__batch_index") or 0),
+        "phase_name": str(task.payload.get("__telemetry_phase_name") or ""),
     }
     if not telemetry_phase_only:
         emit_task_telemetry_event(
@@ -386,7 +400,8 @@ def _run_task_guarded(
             task_id=task.task_id,
             details=telemetry_details,
         )
-    print(f"[task pid={pid}] start task={task.task_id}", flush=True)
+    if worker_console_enabled():
+        print(f"[task pid={pid}] start task={task.task_id}", flush=True)
     submitted_at_ns = int(task.payload.get("__submitted_at_ns") or 0)
     child_start_latency_sec = None
     queue_wait_sec = None
@@ -404,6 +419,7 @@ def _run_task_guarded(
                 telemetry_endpoint,
                 phase_name,
                 task_id=task.task_id,
+                counts_completion=telemetry_phase_only,
             ):
                 result = worker(task)
         else:
@@ -442,10 +458,12 @@ def _run_task_guarded(
                 task_id=task.task_id,
                 details={**telemetry_details, "ok": result.ok},
             )
-        print(f"[task pid={pid}] finish task={task.task_id} ok={result.ok}", flush=True)
+        if worker_console_enabled():
+            print(f"[task pid={pid}] finish task={task.task_id} ok={result.ok}", flush=True)
         return result
     except Exception as exc:  # pragma: no cover - exercised through subprocess boundary.
-        print(f"[task pid={pid}] finish task={task.task_id} ok=False", flush=True)
+        if worker_console_enabled():
+            print(f"[task pid={pid}] finish task={task.task_id} ok=False", flush=True)
         counters: dict[str, int | float] = {
             "task_ordinal": int(task.payload.get("__task_ordinal") or 0),
             "elapsed_sec": time.perf_counter() - started,

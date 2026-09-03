@@ -88,14 +88,18 @@ pub fn pivot_record_batch(
         });
 
         if !config.value_keys.is_empty() {
-            let column_value = composite_key(&column_arrays, row_index, true, config)?;
-            let next_column = column_value_index.len();
-            let column_index = *column_value_index
-                .entry(column_value.clone())
-                .or_insert_with(|| {
-                    column_values.push(column_value);
-                    next_column
-                });
+            let column_index = if column_arrays.is_empty() {
+                0
+            } else {
+                let column_value = composite_key(&column_arrays, row_index, true, config)?;
+                let next_column = column_value_index.len();
+                *column_value_index
+                    .entry(column_value.clone())
+                    .or_insert_with(|| {
+                        column_values.push(column_value);
+                        next_column
+                    })
+            };
             for value_index in 0..config.value_keys.len() {
                 cells
                     .entry((group_index, column_index, value_index))
@@ -137,8 +141,17 @@ pub fn pivot_record_batch(
     let mut duplicate_first_cells = 0usize;
     for (value_index, value_spec) in config.value_keys.iter().enumerate() {
         let source = value_source(batch, value_spec)?;
-        for (column_index, column_value) in column_values.iter().enumerate() {
-            let output_name = render_column_name(value_spec, Some(column_value))?;
+        let output_columns = if config.column_keys.is_empty() {
+            vec![(0, None)]
+        } else {
+            column_values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index, Some(value.as_str())))
+                .collect::<Vec<_>>()
+        };
+        for (column_index, column_value) in output_columns {
+            let output_name = render_column_name(value_spec, column_value)?;
             ensure_unique_name(&mut output_names, &output_name)?;
             let groups = (0..row_first_indices.len())
                 .map(|group_index| {
@@ -204,11 +217,6 @@ fn validate_config(batch: &RecordBatch, config: &PivotConfig) -> Result<(), Stri
     }
     if config.value_keys.is_empty() && config.value_keys_without_column.is_empty() {
         return Err("pivot requires value_keys or value_keys_without_column".to_string());
-    }
-    if !config.value_keys.is_empty() && config.column_keys.is_empty() {
-        return Err(
-            "pivot.column_keys must not be empty when value_keys are configured".to_string(),
-        );
     }
     if !matches!(config.null_column_key_policy.as_str(), "error" | "label") {
         return Err("pivot.null_column_key_policy must be error or label".to_string());
@@ -563,6 +571,36 @@ mod tests {
 
         assert_eq!(result.batch.schema().field(1).name(), "value.max");
         assert!(result.batch.column_by_name("value.max").is_some());
+    }
+
+    #[test]
+    fn aggregates_value_keys_without_column_keys() {
+        let config: PivotConfig = serde_json::from_str(
+            r#"{
+                "enabled":true,
+                "row_keys":["row"],
+                "column_keys":[],
+                "value_keys":[{
+                    "name":"total",
+                    "source_column":"value",
+                    "aggregation":"sum"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let result = pivot_record_batch(&input_batch(), &config).unwrap();
+        let values = result
+            .batch
+            .column_by_name("total__sum")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(result.batch.num_rows(), 2);
+        assert_eq!(result.enumerated_column_values, 0);
+        assert_eq!(values.values(), &[3.0, 3.0]);
     }
 
     #[test]

@@ -377,7 +377,8 @@ def _execute_plan(
                 config.log_root
                 / "task-telemetry"
                 / f"0102_{plan.spec.job_name}_{time.time_ns()}.jsonl"
-            )
+            ),
+            progress_title=f"smoking-data 0102 · {plan.spec.job_name}",
         )
     with _TelemetrySession(handle) as telemetry:
         return execute_segment_plan(

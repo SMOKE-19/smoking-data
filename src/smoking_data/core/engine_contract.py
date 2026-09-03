@@ -39,6 +39,63 @@ RUST_DIRECT_CAST_TYPES = frozenset(
     }
 )
 
+LIST_RESTORE_TYPE_ALIASES = {
+    "TINYINT[]": "INT8[]",
+    "INT8[]": "INT8[]",
+    "SMALLINT[]": "INT16[]",
+    "INT16[]": "INT16[]",
+    "INTEGER[]": "INT32[]",
+    "INT32[]": "INT32[]",
+    "BIGINT[]": "INT64[]",
+    "INT64[]": "INT64[]",
+    "UINT8[]": "UINT8[]",
+    "UINT16[]": "UINT16[]",
+    "UINT32[]": "UINT32[]",
+    "UINT64[]": "UINT64[]",
+    "FLOAT[]": "FLOAT32[]",
+    "REAL[]": "FLOAT32[]",
+    "FLOAT32[]": "FLOAT32[]",
+    "DOUBLE[]": "FLOAT64[]",
+    "FLOAT64[]": "FLOAT64[]",
+    "TEXT[]": "STRING[]",
+    "UTF8[]": "STRING[]",
+    "STRING[]": "STRING[]",
+}
+for _list_element_type in (
+    "INT8",
+    "INT16",
+    "INT32",
+    "INT64",
+    "UINT8",
+    "UINT16",
+    "UINT32",
+    "UINT64",
+    "FLOAT32",
+    "FLOAT64",
+    "STRING",
+    "UTF8",
+):
+    _canonical_element = "STRING" if _list_element_type == "UTF8" else _list_element_type
+    LIST_RESTORE_TYPE_ALIASES[f"LIST({_list_element_type})"] = f"{_canonical_element}[]"
+    LIST_RESTORE_TYPE_ALIASES[f"LIST<{_list_element_type}>"] = f"{_canonical_element}[]"
+
+LIST_RESTORE_TYPES = frozenset(LIST_RESTORE_TYPE_ALIASES.values())
+
+
+def normalize_list_restore_type(value: str) -> str:
+    normalized = str(value).strip().upper().replace(" ", "")
+    try:
+        return LIST_RESTORE_TYPE_ALIASES[normalized]
+    except KeyError as error:
+        raise ValidationError(
+            "list_restore schema type is not supported.",
+            code="list_restore.unsupported_schema_type",
+            context={
+                "value": value,
+                "supported": sorted(LIST_RESTORE_TYPES),
+            },
+        ) from error
+
 
 def rust_package_version() -> str:
     try:

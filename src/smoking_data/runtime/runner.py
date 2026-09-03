@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 import time
 from dataclasses import replace
@@ -677,6 +678,12 @@ def main(argv: list[str] | None = None) -> int:
         return _main_publication_gc(argv[2:])
     if argv[:2] == ["publication", "read-key"]:
         return _main_publication_read_key(argv[2:])
+    if argv[:2] == ["inspect", "parquet"]:
+        print(
+            "[smoking-data] 'inspect parquet' was replaced by 'inspect PATH'.",
+            file=sys.stderr,
+        )
+        return 2
     if argv[:2] == ["chain", "validate"]:
         return _main_chain_validate(argv[2:])
     if argv[:2] == ["chain", "run"]:
@@ -696,6 +703,8 @@ def main(argv: list[str] | None = None) -> int:
         "profile",
     }:
         return _main_inspect(argv[1], argv[2:])
+    if argv and argv[0] == "inspect":
+        return _main_parquet_preview(argv[1:])
 
     if argv and not _looks_like_definition_path(argv[0]):
         print(
@@ -761,56 +770,57 @@ def _definition_kind(yaml_path: str | Path) -> str:
 
 def _run_definition_cli(args: argparse.Namespace) -> int:
     try:
-        effective_project_root = args.project_root or infer_project_root(args.yaml_path)
-        if _definition_kind(args.yaml_path) == "chain":
-            from smoking_data.runtime.asset_chain import run_asset_chain
+        with _console_progress_environment(json_output=args.json):
+            effective_project_root = args.project_root or infer_project_root(args.yaml_path)
+            if _definition_kind(args.yaml_path) == "chain":
+                from smoking_data.runtime.asset_chain import run_asset_chain
 
-            chain_result = run_asset_chain(
-                args.yaml_path,
-                config_path=args.config_path,
-                project_root=effective_project_root,
-            )
-            payload = chain_result.to_dict()
-            ok = chain_result.ok
-        else:
-            asset_code = asset_code_from_definition_path(args.yaml_path)
-            if asset_code == "0101":
-                from smoking_data.assets.a0101_source import execute_yaml
-
-                source_result = execute_yaml(args.yaml_path, project_root=effective_project_root)
-                payload = source_result.to_dict()
-                ok = source_result.ok
-            elif asset_code == "0102":
-                from smoking_data.assets.a0102_calculated_fact import run_yaml
-
-                result = run_yaml(
+                chain_result = run_asset_chain(
                     args.yaml_path,
                     config_path=args.config_path,
                     project_root=effective_project_root,
-                    trigger_type=args.trigger_type,
                 )
-                payload = result.to_dict()
-                ok = result.ok
-            elif asset_code == "0103":
-                from smoking_data.assets.a0103_csv_source import run_yaml
-
-                result = run_yaml(
-                    args.yaml_path,
-                    config_path=args.config_path,
-                    project_root=effective_project_root,
-                    trigger_type=args.trigger_type,
-                )
-                payload = result.to_dict()
-                ok = result.ok
+                payload = chain_result.to_dict()
+                ok = chain_result.ok
             else:
-                result = run_pipeline_yaml(
-                    args.yaml_path,
-                    config_path=args.config_path,
-                    project_root=effective_project_root,
-                    trigger_type=args.trigger_type,
-                )
-                payload = result.to_dict()
-                ok = result.ok
+                asset_code = asset_code_from_definition_path(args.yaml_path)
+                if asset_code == "0101":
+                    from smoking_data.assets.a0101_source import execute_yaml
+
+                    source_result = execute_yaml(args.yaml_path, project_root=effective_project_root)
+                    payload = source_result.to_dict()
+                    ok = source_result.ok
+                elif asset_code == "0102":
+                    from smoking_data.assets.a0102_calculated_fact import run_yaml
+
+                    result = run_yaml(
+                        args.yaml_path,
+                        config_path=args.config_path,
+                        project_root=effective_project_root,
+                        trigger_type=args.trigger_type,
+                    )
+                    payload = result.to_dict()
+                    ok = result.ok
+                elif asset_code == "0103":
+                    from smoking_data.assets.a0103_csv_source import run_yaml
+
+                    result = run_yaml(
+                        args.yaml_path,
+                        config_path=args.config_path,
+                        project_root=effective_project_root,
+                        trigger_type=args.trigger_type,
+                    )
+                    payload = result.to_dict()
+                    ok = result.ok
+                else:
+                    result = run_pipeline_yaml(
+                        args.yaml_path,
+                        config_path=args.config_path,
+                        project_root=effective_project_root,
+                        trigger_type=args.trigger_type,
+                    )
+                    payload = result.to_dict()
+                    ok = result.ok
     except SmokingDataError as exc:
         payload = {
             "ok": False,
@@ -838,6 +848,20 @@ def _run_definition_cli(args: argparse.Namespace) -> int:
     else:
         print(f"[smoking-data] run failed: {payload.get('error_message', 'execution failed')}")
     return 0 if ok else 1
+
+
+@contextlib.contextmanager
+def _console_progress_environment(*, json_output: bool):
+    variable = "SMOKING_DATA_CONSOLE_PROGRESS"
+    previous = os.environ.get(variable)
+    os.environ[variable] = "off" if json_output else "tty" if sys.stdout.isatty() else "plain"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(variable, None)
+        else:
+            os.environ[variable] = previous
 
 
 def _main_run(argv: list[str]) -> int:
@@ -871,7 +895,7 @@ _CLI_COMMANDS: dict[str, tuple[str, ...]] = {
     "chain": ("Validate or run an Asset Chain",),
     "registry": ("Inspect authoring registry",),
     "schedule": ("Validate or tick schedules",),
-    "inspect": ("Inspect datasets and metadata",),
+    "inspect": ("Preview Parquet rows or inspect datasets and metadata",),
     "pwq": ("Advise pipeline write quality",),
 }
 
@@ -898,6 +922,7 @@ _CLI_GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
     ),
     "pwq": ("pwq advise PIPELINE.yaml",),
     "inspect": (
+        "inspect PATH [--rows 10] [--repeat-columns COL,...]",
         "inspect dataset PATH",
         "inspect failure PATH",
         "inspect missing PATH",
@@ -915,8 +940,16 @@ def _print_cli_help(group: str | None = None) -> None:
             print(f"  {command:<15} {description[0]}")
         print("\nRun 'smoking-data COMMAND --help' for command-specific options.")
         return
-    print(f"usage: smoking-data {group} SUBCOMMAND [OPTIONS]")
-    print(f"\n{group} commands:")
+    if group == "inspect":
+        print("usage: smoking-data inspect PATH [--rows ROWS] [--repeat-columns COL,...]")
+        print("       smoking-data inspect SUBCOMMAND [OPTIONS]")
+        print("\nDefault: recursively select the sorted first Parquet file and print 10 rows.")
+        print("All columns are always wrapped into terminal-width blocks.")
+        print("Options: --rows ROWS (default: 10), --repeat-columns COL,..., --project-root ROOT, --json")
+        print("\ninspect forms:")
+    else:
+        print(f"usage: smoking-data {group} SUBCOMMAND [OPTIONS]")
+        print(f"\n{group} commands:")
     for command in _CLI_GROUP_COMMANDS.get(group, ()):
         print(f"  {command}")
     print(f"\nRun 'smoking-data {group} SUBCOMMAND --help' for command-specific options.")
@@ -1808,11 +1841,12 @@ def _main_chain_run(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     effective_project_root = args.project_root or infer_project_root(args.yaml_path)
     try:
-        result = run_asset_chain(
-            args.yaml_path,
-            config_path=args.config_path,
-            project_root=effective_project_root,
-        )
+        with _console_progress_environment(json_output=args.json):
+            result = run_asset_chain(
+                args.yaml_path,
+                config_path=args.config_path,
+                project_root=effective_project_root,
+            )
         payload = result.to_dict()
         exit_code = 0 if result.ok else 1
     except SmokingDataError as exc:
@@ -1884,6 +1918,72 @@ def _main_parquet_schema(argv: list[str]) -> int:
     else:
         print(f"[smoking-data] parquet schema fields={len(schema)} source={files[0].path}")
     return 0
+
+
+def _main_parquet_preview(argv: list[str]) -> int:
+    from smoking_data.runtime.parquet_preview import preview_parquet, render_parquet_preview
+
+    parser = argparse.ArgumentParser(
+        prog="smoking-data inspect",
+        description=(
+            "Print the first rows of the lexicographically first Parquet file. "
+            "Wide columns are always wrapped into terminal-width blocks."
+        ),
+    )
+    parser.add_argument("path", help="Parquet file or recursively searched dataset directory.")
+    parser.add_argument(
+        "--rows",
+        type=_positive_cli_int,
+        default=10,
+        help="Number of rows to read from the first file (default: 10).",
+    )
+    parser.add_argument(
+        "--repeat-columns",
+        action="append",
+        default=[],
+        metavar="COL,...",
+        help="Comma-separated identifier columns to repeat in every column block.",
+    )
+    parser.add_argument("--project-root", default=None)
+    parser.add_argument("--json", action="store_true", help="Print the preview payload as JSON.")
+    args = parser.parse_args(argv)
+    try:
+        payload = preview_parquet(
+            args.path,
+            project_root=args.project_root,
+            row_limit=args.rows,
+            repeat_columns=args.repeat_columns,
+        )
+        exit_code = 0
+    except SmokingDataError as exc:
+        payload = {"ok": False, **exc.to_dict()}
+        exit_code = 1
+    except Exception as exc:  # noqa: BLE001 - CLI converts reader failures to stable output.
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_code": "preview.read_failed",
+            "error_message": str(exc),
+        }
+        exit_code = 1
+
+    if args.json:
+        print(json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2))
+    elif payload["ok"]:
+        print(render_parquet_preview(payload))
+    else:
+        print(
+            "[smoking-data] parquet preview failed "
+            f"code={payload['error_code']} message={payload['error_message']}"
+        )
+    return exit_code
+
+
+def _positive_cli_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _main_inspect(mode: str, argv: list[str]) -> int:

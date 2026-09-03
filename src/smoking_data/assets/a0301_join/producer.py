@@ -53,6 +53,11 @@ from smoking_data.runtime.output_physical_layout import (
 )
 from smoking_data.runtime.paths import ensure_dir, reset_path, resolve_project_path
 from smoking_data.runtime.task_runner import run_tasks_in_subprocesses
+from smoking_data.runtime.task_telemetry import (
+    emit_task_telemetry_event,
+    start_task_telemetry_supervisor,
+    task_telemetry_phase,
+)
 from smoking_data.runtime.test_run import final_task_limit, select_final_tasks
 from smoking_data.runtime.transactions import (
     DatasetTransaction,
@@ -512,6 +517,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 **task.payload,
                 "physical_plan_hash": physical_plan.plan_hash,
                 "output_dir": str(transaction.staging_root),
+                "__telemetry_phase_name": "materialize.join",
             },
         )
         for task in dirty_tasks
@@ -521,6 +527,27 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         dirty_tasks=dirty_tasks,
     )
     phase_elapsed_sec["transaction_prepare_sec"] = time.perf_counter() - transaction_prepare_started
+    telemetry_handle = start_task_telemetry_supervisor(
+        log_path=(
+            config.log_root
+            / "task-telemetry"
+            / f"{asset_code}_{spec.job_name}_{time.time_ns()}.jsonl"
+        ),
+        progress_title=f"smoking-data {asset_code} · {spec.job_name}",
+    )
+    telemetry_profile: dict[str, Any] | None = None
+    if not dirty_tasks:
+        emit_task_telemetry_event(
+            telemetry_handle.endpoint,
+            "phase_planned",
+            task_id=None,
+            details={
+                "phase_name": "materialize.join",
+                "total": 0,
+                "unit": "tasks",
+                "skipped": True,
+            },
+        )
     try:
         spawn_join_started = time.perf_counter()
         task_results, subprocess_runner_profile = run_tasks_in_subprocesses(
@@ -537,6 +564,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 else None
             ),
             return_profile=True,
+            telemetry_endpoint=telemetry_handle.endpoint,
         )
         phase_elapsed_sec["spawn_and_join_sec"] = time.perf_counter() - spawn_join_started
         failed = [item for item in task_results if not item.ok]
@@ -554,11 +582,20 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             )
         task_results = [*staged_results, *task_results]
         transaction_commit_started = time.perf_counter()
-        output_files, transaction_profile = transaction.commit()
+        emit_task_telemetry_event(
+            telemetry_handle.endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": "save_dataset.commit", "total": 1, "unit": "generation"},
+        )
+        with task_telemetry_phase(telemetry_handle.endpoint, "save_dataset.commit"):
+            output_files, transaction_profile = transaction.commit()
         phase_elapsed_sec["transaction_commit_sec"] = (
             time.perf_counter() - transaction_commit_started
         )
+        telemetry_profile = telemetry_handle.stop()
     except BaseException:
+        telemetry_handle.stop()
         transaction.abort()
         raise
     task_results = _remap_transaction_task_outputs(
@@ -672,6 +709,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             "polars_boundary_profile": polars_boundary_profile,
             "bounded_join_profile": _summarize_bounded_join(task_results),
             "subprocess_runner_profile": subprocess_runner_profile,
+            "task_telemetry": telemetry_profile,
             "task_process_profile": task_process_profile,
             "right_key_index": right_index_profile,
             "left_key_index": left_index_profile,

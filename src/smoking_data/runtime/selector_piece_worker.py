@@ -16,7 +16,7 @@ from smoking_data.runtime.intermediate import write_sorted_intermediate
 from smoking_data.runtime.memory import current_rss_mb, peak_rss_mb, process_io_bytes
 from smoking_data.runtime.naming import partition_dir_name
 from smoking_data.runtime.selector_piece import REQUEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION
-from smoking_data.runtime.task_telemetry import task_telemetry_phase
+from smoking_data.runtime.task_telemetry import emit_task_telemetry_event, task_telemetry_phase
 
 GROUP_SIZE_COLUMN = "__smoking_data_selector_group_size"
 
@@ -110,19 +110,28 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
     memory_budget_bytes = int(request["memory_budget_bytes"])
     endpoint = request.get("telemetry_endpoint")
     bucket_started = time.perf_counter()
-    with task_telemetry_phase(endpoint, "build_sidecar.bucketize"):
+    with task_telemetry_phase(
+        endpoint,
+        "build_sidecar.bucketize",
+        task_id="selector-bucketize",
+    ):
         buckets, piece_count = _bucketize(
             candidate_paths,
             staging=staging,
             partition_column=partition_column,
             group_keys=group_keys,
             bucket_count=bucket_count,
+            telemetry_endpoint=endpoint,
         )
     bucket_elapsed = time.perf_counter() - bucket_started
     selector_started = time.perf_counter()
     active_entries: list[dict[str, Any]] = []
     total_rows = total_groups = max_group_rows = 0
-    with task_telemetry_phase(endpoint, "build_sidecar.selector_bucket"):
+    with task_telemetry_phase(
+        endpoint,
+        "build_sidecar.selector_bucket",
+        task_id="selector-buckets",
+    ):
         for partition_value, bucket_id in sorted(buckets):
             paths = buckets[(partition_value, bucket_id)]
             output_path = paths[0].parent / "active.parquet"
@@ -196,37 +205,69 @@ def _bucketize(
     partition_column: str,
     group_keys: list[str],
     bucket_count: int,
+    telemetry_endpoint: dict[str, Any] | None,
 ) -> tuple[dict[tuple[str, int], list[Path]], int]:
     buckets: dict[tuple[str, int], list[Path]] = {}
     piece_index = 0
+    total_row_groups = sum(
+        pq.ParquetFile(candidate_path).metadata.num_row_groups
+        for candidate_path in candidate_paths
+    )
+    completed_row_groups = 0
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_planned",
+        task_id="selector-bucketize",
+        details={
+            "phase_name": "build_sidecar.bucketize",
+            "total": total_row_groups,
+            "unit": "row_groups",
+            "replace_total": True,
+        },
+    )
     for candidate_path in candidate_paths:
         parquet = pq.ParquetFile(candidate_path)
-        for batch in parquet.iter_batches(batch_size=65_536):
-            frame = pl.from_arrow(batch)
-            if frame.is_empty():
-                continue
-            frame = frame.with_columns(
-                (frame.select(group_keys).hash_rows(seed=0) % bucket_count)
-                .cast(pl.UInt32)
-                .alias("__selector_bucket")
-            )
-            for key, piece in frame.partition_by(
-                [partition_column, "__selector_bucket"],
-                as_dict=True,
-                maintain_order=False,
-            ).items():
-                partition_value, bucket_value = key
-                bucket_key = (str(partition_value), int(bucket_value))
-                bucket_dir = (
-                    staging
-                    / partition_dir_name(partition_value)
-                    / f"bucket-{int(bucket_value):05d}"
+        for row_group in range(parquet.metadata.num_row_groups):
+            for batch in parquet.iter_batches(batch_size=65_536, row_groups=[row_group]):
+                frame = pl.from_arrow(batch)
+                if frame.is_empty():
+                    continue
+                frame = frame.with_columns(
+                    (frame.select(group_keys).hash_rows(seed=0) % bucket_count)
+                    .cast(pl.UInt32)
+                    .alias("__selector_bucket")
                 )
-                bucket_dir.mkdir(parents=True, exist_ok=True)
-                path = bucket_dir / f"candidate-{piece_index:08d}.parquet"
-                piece.drop("__selector_bucket").write_parquet(path, compression="uncompressed")
-                buckets.setdefault(bucket_key, []).append(path)
-                piece_index += 1
+                for key, piece in frame.partition_by(
+                    [partition_column, "__selector_bucket"],
+                    as_dict=True,
+                    maintain_order=False,
+                ).items():
+                    partition_value, bucket_value = key
+                    bucket_key = (str(partition_value), int(bucket_value))
+                    bucket_dir = (
+                        staging
+                        / partition_dir_name(partition_value)
+                        / f"bucket-{int(bucket_value):05d}"
+                    )
+                    bucket_dir.mkdir(parents=True, exist_ok=True)
+                    path = bucket_dir / f"candidate-{piece_index:08d}.parquet"
+                    piece.drop("__selector_bucket").write_parquet(
+                        path, compression="uncompressed"
+                    )
+                    buckets.setdefault(bucket_key, []).append(path)
+                    piece_index += 1
+            completed_row_groups += 1
+            emit_task_telemetry_event(
+                telemetry_endpoint,
+                "phase_progress",
+                task_id="selector-bucketize",
+                details={
+                    "phase_name": "build_sidecar.bucketize",
+                    "completed": completed_row_groups,
+                    "total": total_row_groups,
+                    "unit": "row_groups",
+                },
+            )
     return buckets, piece_index
 
 

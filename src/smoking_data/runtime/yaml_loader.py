@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,11 @@ def load_pipeline_spec(yaml_path: str | Path, *, config: RuntimeConfig) -> Pipel
         # Asset config also contains engine-only tuning values. Only fields that
         # belong to the public Definition contract participate in this merge.
         configured_execution = asset_defaults.get("execution")
-        contract_defaults: dict[str, Any] = dict(asset_contract.definition)
+        contract_defaults = _definition_defaults(
+            asset_contract.definition,
+            payload=payload,
+            asset_code=asset_code,
+        )
         if isinstance(configured_execution, dict):
             contract_defaults["execution"] = {
                 key: value
@@ -196,7 +201,14 @@ def _resolve_asset_source(
             )
         asset_defaults = load_effective_asset_config(config.project_root, asset_code).payload
         asset_contract = load_effective_asset_contract(config.project_root, asset_code)
-        effective = deep_merge(asset_contract.definition, asset_defaults)
+        definition_defaults = _definition_defaults(
+            asset_contract.definition,
+            payload=payload,
+            asset_code=asset_code,
+        )
+        effective = deep_merge(definition_defaults, asset_defaults)
+        if asset_code == "0201" and _publication_override(payload) is None:
+            _remove_publication_default(effective)
         effective = deep_merge(effective, payload)
         job = effective.get("job")
         job_name = str(job.get("name") or "") if isinstance(job, dict) else ""
@@ -242,6 +254,46 @@ def _resolve_asset_source(
         "asset_definition_hash": file_sha256(definition_path),
         "asset_code": asset_code,
     }
+
+
+def _definition_defaults(
+    definition: dict[str, Any],
+    *,
+    payload: dict[str, Any],
+    asset_code: str,
+) -> dict[str, Any]:
+    defaults = deepcopy(definition)
+    if asset_code != "0201":
+        return defaults
+    publication = _publication_override(payload)
+    if publication is None:
+        _remove_publication_default(defaults)
+        return defaults
+    unknown = sorted(set(publication) - {"target"})
+    if unknown:
+        raise ValidationError(
+            "Asset 0201 Definition publication supports only target; shared publication policy belongs in .smoking-data/assets/0201/config.yaml.",
+            code="output.publication_override_invalid",
+            context={
+                "path": "output.artifact.publication",
+                "unsupported_keys": unknown,
+            },
+        )
+    return defaults
+
+
+def _publication_override(payload: dict[str, Any]) -> dict[str, Any] | None:
+    output = payload.get("output")
+    artifact = output.get("artifact") if isinstance(output, dict) else None
+    publication = artifact.get("publication") if isinstance(artifact, dict) else None
+    return publication if isinstance(publication, dict) else None
+
+
+def _remove_publication_default(payload: dict[str, Any]) -> None:
+    output = payload.get("output")
+    artifact = output.get("artifact") if isinstance(output, dict) else None
+    if isinstance(artifact, dict):
+        artifact.pop("publication", None)
 
 
 def _select_asset_dataset_paths(
@@ -367,18 +419,11 @@ def _compile_pipeline_expression_irs(operations: Any) -> dict[str, dict[str, Any
 
     result: dict[str, dict[str, Any]] = {}
     for operation in operations:
-        if not isinstance(operation, dict) or operation.get("op") not in {
-            "add_calc",
-            "active_row_selection",
-        }:
+        if not isinstance(operation, dict) or operation.get("op") != "add_calc":
             continue
         operation_id = str(operation.get("alias") or operation.get("id") or "")
         operation_kind = str(operation.get("op") or "")
-        expressions = (
-            operation.get("expressions")
-            if operation_kind == "add_calc"
-            else operation.get("group_keys")
-        ) or []
+        expressions = operation.get("expressions") or []
         if not isinstance(expressions, list) or not expressions:
             continue
         items: list[tuple[str, str]] = []
@@ -390,32 +435,6 @@ def _compile_pipeline_expression_irs(operations: Any) -> dict[str, dict[str, Any
                     context={"operation_id": operation_id, "index": index},
                 )
             name = str(expression.get("name") or "").strip()
-            column = str(expression.get("column") or "").strip()
-            if operation_kind == "active_row_selection" and not column:
-                has_expression = any(
-                    str(expression.get(key) or "").strip()
-                    for key in ("sql", "spotfire_expression")
-                )
-                if not has_expression and name:
-                    # The public shorthand `{name: key}` means the input
-                    # column named `key`; it is not an expression to compile.
-                    continue
-            if operation_kind == "active_row_selection" and column:
-                if any(
-                    str(expression.get(key) or "").strip() for key in ("sql", "spotfire_expression")
-                ):
-                    raise ValidationError(
-                        "active_row_selection column key cannot also define an expression.",
-                        code="expression.source_ambiguous",
-                        context={"operation_id": operation_id, "index": index},
-                    )
-                if not name:
-                    raise ValidationError(
-                        "active_row_selection group key name is required.",
-                        code="yaml.required_key",
-                        context={"operation_id": operation_id, "index": index},
-                    )
-                continue
             try:
                 _, source = resolve_add_calc_expression(expression, index=index)
             except ValueError as error:

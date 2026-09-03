@@ -1,10 +1,11 @@
 use arrow_array::builder::{BooleanBuilder, ListBuilder, PrimitiveBuilder, StringBuilder};
-use arrow_array::types::{Float32Type, Float64Type, Int32Type};
+use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
     LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+    UInt64Array,
 };
-use arrow_cast::cast;
+use arrow_cast::{cast, cast_with_options, CastOptions};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
@@ -37,7 +38,10 @@ use crate::expression_executor::execute_expression_ir_retaining;
 use crate::expression_ir::{validate_expression_ir, ExpressionIrDocument};
 use crate::join::{enrich_many_to_one_lookup, load_lookup_projection};
 use crate::long_fact::{to_persisted_long_fact_v1, FactColumnMetadata};
-use crate::parser::{parse_json_f64_array, parse_json_i32_array, parse_json_string_array};
+use crate::parser::{
+    parse_json_f64_array, parse_json_i32_array, parse_json_i64_array, parse_json_string_array,
+    parse_json_u64_array,
+};
 use crate::pivot::{pivot_record_batch, PivotConfig};
 use crate::post_operations::{execute_post_operations, requires_complete_input, PostOperation};
 use crate::reference::{build_dense_index, load_reference_map, DenseReferenceMap};
@@ -252,14 +256,16 @@ impl ReferenceReplaceConfigs {
 enum ValueColumnKind {
     Float32,
     Float64,
-    Integer,
+    SignedInteger,
+    UnsignedInteger,
     Text,
 }
 
 enum ValueColumnBuilder {
     Float32(ListBuilder<PrimitiveBuilder<Float32Type>>),
     Float64(ListBuilder<PrimitiveBuilder<Float64Type>>),
-    Integer(ListBuilder<PrimitiveBuilder<Int32Type>>),
+    SignedInteger(ListBuilder<PrimitiveBuilder<Int64Type>>),
+    UnsignedInteger(ListBuilder<PrimitiveBuilder<UInt64Type>>),
     Text(ListBuilder<StringBuilder>),
 }
 
@@ -370,29 +376,38 @@ fn validate_writer_input_contract(writer_config: &WriterConfig) -> pyo3::PyResul
     Ok(())
 }
 
-fn normalize_dtype(dtype: &str) -> &str {
-    match dtype {
-        "TEXT" | "Utf8" | "String" | "string" => "TEXT",
-        "DATE" | "Date" | "date32[day]" => "DATE",
-        "TIME" | "Time" | "time64[us]" => "TIME",
-        "TIMESTAMP" | "Datetime" | "timestamp[us]" => "TIMESTAMP",
-        "DURATION" | "Duration" | "duration[us]" => "DURATION",
-        "BOOLEAN" | "BOOL" | "Boolean" | "bool" => "BOOLEAN",
-        "TINYINT" | "INT8" | "Int8" | "int8" => "TINYINT",
-        "SMALLINT" | "INT16" | "Int16" | "int16" => "SMALLINT",
-        "INTEGER" | "INT32" | "Int32" | "int32" => "INTEGER",
-        "BIGINT" | "INT64" | "Int64" | "int64" => "BIGINT",
-        "FLOAT" | "Float32" | "float" => "FLOAT",
-        "DOUBLE" | "Float64" | "double" => "DOUBLE",
-        "INTEGER[]" | "List(Int8)" | "List(Int16)" | "List(Int32)" | "List(Int64)" => "INTEGER[]",
-        "list<int8>" => "LIST_INT8",
-        "list<int16>" => "LIST_INT16",
-        "list<int32>" => "LIST_INT32",
-        "list<int64>" => "LIST_INT64",
-        "FLOAT[]" | "List(Float32)" | "list<float>" => "FLOAT[]",
-        "DOUBLE[]" | "List(Float64)" | "list<double>" => "DOUBLE[]",
-        "TEXT[]" | "List(Utf8)" | "List(String)" | "list<string>" => "TEXT[]",
-        _ => dtype,
+fn normalize_dtype(dtype: &str) -> String {
+    let normalized = dtype.trim().to_ascii_uppercase().replace(' ', "");
+    match normalized.as_str() {
+        "TEXT" | "UTF8" | "STRING" => "TEXT".to_string(),
+        "DATE" | "DATE32[DAY]" => "DATE".to_string(),
+        "TIME" | "TIME64[US]" => "TIME".to_string(),
+        "TIMESTAMP" | "DATETIME" | "TIMESTAMP[US]" => "TIMESTAMP".to_string(),
+        "DURATION" | "DURATION[US]" => "DURATION".to_string(),
+        "BOOLEAN" | "BOOL" => "BOOLEAN".to_string(),
+        "TINYINT" | "INT8" => "TINYINT".to_string(),
+        "SMALLINT" | "INT16" => "SMALLINT".to_string(),
+        "INTEGER" | "INT32" => "INTEGER".to_string(),
+        "BIGINT" | "INT64" => "BIGINT".to_string(),
+        "FLOAT" | "FLOAT32" => "FLOAT".to_string(),
+        "DOUBLE" | "FLOAT64" => "DOUBLE".to_string(),
+        "TINYINT[]" | "INT8[]" | "LIST(INT8)" | "LIST<INT8>" => "LIST_INT8".to_string(),
+        "SMALLINT[]" | "INT16[]" | "LIST(INT16)" | "LIST<INT16>" => "LIST_INT16".to_string(),
+        "INTEGER[]" | "INT32[]" | "LIST(INT32)" | "LIST<INT32>" => "LIST_INT32".to_string(),
+        "BIGINT[]" | "INT64[]" | "LIST(INT64)" | "LIST<INT64>" => "LIST_INT64".to_string(),
+        "UINT8[]" | "LIST(UINT8)" | "LIST<UINT8>" => "LIST_UINT8".to_string(),
+        "UINT16[]" | "LIST(UINT16)" | "LIST<UINT16>" => "LIST_UINT16".to_string(),
+        "UINT32[]" | "LIST(UINT32)" | "LIST<UINT32>" => "LIST_UINT32".to_string(),
+        "UINT64[]" | "LIST(UINT64)" | "LIST<UINT64>" => "LIST_UINT64".to_string(),
+        "FLOAT[]" | "FLOAT32[]" | "LIST(FLOAT32)" | "LIST<FLOAT>" | "LIST<FLOAT32>" => {
+            "FLOAT[]".to_string()
+        }
+        "DOUBLE[]" | "FLOAT64[]" | "LIST(FLOAT64)" | "LIST<DOUBLE>" | "LIST<FLOAT64>" => {
+            "DOUBLE[]".to_string()
+        }
+        "TEXT[]" | "STRING[]" | "UTF8[]" | "LIST(UTF8)" | "LIST(STRING)" | "LIST<STRING>"
+        | "LIST<UTF8>" => "TEXT[]".to_string(),
+        _ => normalized,
     }
 }
 
@@ -461,7 +476,7 @@ fn output_dtype_for_column(
         return Ok(DataType::Decimal128(precision, scale));
     }
     let normalized = normalize_dtype(raw_dtype);
-    let output = match normalized {
+    let output = match normalized.as_str() {
         "TEXT" => DataType::Utf8,
         "DATE" => DataType::Date32,
         "TIME" => DataType::Time64(TimeUnit::Microsecond),
@@ -476,11 +491,14 @@ fn output_dtype_for_column(
         "DOUBLE" => DataType::Float64,
         "FLOAT[]" => DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
         "DOUBLE[]" => DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
-        "INTEGER[]" => DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
         "LIST_INT8" => DataType::List(Arc::new(Field::new("item", DataType::Int8, true))),
         "LIST_INT16" => DataType::List(Arc::new(Field::new("item", DataType::Int16, true))),
         "LIST_INT32" => DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
         "LIST_INT64" => DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        "LIST_UINT8" => DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+        "LIST_UINT16" => DataType::List(Arc::new(Field::new("item", DataType::UInt16, true))),
+        "LIST_UINT32" => DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+        "LIST_UINT64" => DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
         "TEXT[]" => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         _ => input_dtype.clone(),
     };
@@ -505,13 +523,18 @@ fn value_column_kind(
             "missing schema for restore value column {column_name}"
         )));
     };
-    match normalize_dtype(raw_dtype) {
+    match normalize_dtype(raw_dtype).as_str() {
         "FLOAT[]" => Ok(ValueColumnKind::Float32),
         "DOUBLE[]" => Ok(ValueColumnKind::Float64),
-        "INTEGER[]" => Ok(ValueColumnKind::Integer),
+        "LIST_INT8" | "LIST_INT16" | "LIST_INT32" | "LIST_INT64" => {
+            Ok(ValueColumnKind::SignedInteger)
+        }
+        "LIST_UINT8" | "LIST_UINT16" | "LIST_UINT32" | "LIST_UINT64" => {
+            Ok(ValueColumnKind::UnsignedInteger)
+        }
         "TEXT[]" => Ok(ValueColumnKind::Text),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "restore value column {column_name} must be INTEGER[]/DOUBLE[]/TEXT[], got {other}"
+            "restore value column {column_name} must be a supported integer, floating-point, or string List type, got {other}"
         ))),
     }
 }
@@ -531,9 +554,15 @@ fn build_value_column_builders(
                 ValueColumnKind::Float64 => ValueColumnBuilder::Float64(ListBuilder::new(
                     PrimitiveBuilder::<Float64Type>::new(),
                 )),
-                ValueColumnKind::Integer => ValueColumnBuilder::Integer(ListBuilder::new(
-                    PrimitiveBuilder::<Int32Type>::new(),
-                )),
+                ValueColumnKind::SignedInteger => ValueColumnBuilder::SignedInteger(
+                    ListBuilder::new(PrimitiveBuilder::<Int64Type>::new()),
+                ),
+                ValueColumnKind::UnsignedInteger => {
+                    ValueColumnBuilder::UnsignedInteger(ListBuilder::new(PrimitiveBuilder::<
+                        UInt64Type,
+                    >::new(
+                    )))
+                }
                 ValueColumnKind::Text => {
                     ValueColumnBuilder::Text(ListBuilder::new(StringBuilder::new()))
                 }
@@ -606,9 +635,22 @@ fn append_float32_dense(
     builder.append(true);
 }
 
-fn append_int_dense(
-    builder: &mut ListBuilder<PrimitiveBuilder<Int32Type>>,
-    dense_value: Vec<Option<i32>>,
+fn append_signed_int_dense(
+    builder: &mut ListBuilder<PrimitiveBuilder<Int64Type>>,
+    dense_value: Vec<Option<i64>>,
+) {
+    for item in dense_value {
+        match item {
+            Some(value) => builder.values().append_value(value),
+            None => builder.values().append_null(),
+        }
+    }
+    builder.append(true);
+}
+
+fn append_unsigned_int_dense(
+    builder: &mut ListBuilder<PrimitiveBuilder<UInt64Type>>,
+    dense_value: Vec<Option<u64>>,
 ) {
     for item in dense_value {
         match item {
@@ -633,7 +675,8 @@ fn finish_value_column_builder(builder: ValueColumnBuilder) -> ArrayRef {
     match builder {
         ValueColumnBuilder::Float32(mut inner) => Arc::new(inner.finish()) as ArrayRef,
         ValueColumnBuilder::Float64(mut inner) => Arc::new(inner.finish()) as ArrayRef,
-        ValueColumnBuilder::Integer(mut inner) => Arc::new(inner.finish()) as ArrayRef,
+        ValueColumnBuilder::SignedInteger(mut inner) => Arc::new(inner.finish()) as ArrayRef,
+        ValueColumnBuilder::UnsignedInteger(mut inner) => Arc::new(inner.finish()) as ArrayRef,
         ValueColumnBuilder::Text(mut inner) => Arc::new(inner.finish()) as ArrayRef,
     }
 }
@@ -699,6 +742,48 @@ fn sparse_i32_row(input: &SparseListInput, row_index: usize) -> pyo3::PyResult<V
             let values = row.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "normalized integer list row has unsupported type: {:?}",
+                    row.data_type()
+                ))
+            })?;
+            Ok((0..values.len())
+                .map(|index| (!values.is_null(index)).then(|| values.value(index)))
+                .collect())
+        }
+    }
+}
+
+fn sparse_i64_row(input: &SparseListInput, row_index: usize) -> pyo3::PyResult<Vec<Option<i64>>> {
+    match input {
+        SparseListInput::Json(rows) => parse_json_i64_array(&rows[row_index])
+            .map(|values| values.into_iter().map(Some).collect()),
+        SparseListInput::Native(array) => {
+            let Some(row) = native_list_row(array, row_index)? else {
+                return Ok(Vec::new());
+            };
+            let values = row.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "normalized signed integer list row has unsupported type: {:?}",
+                    row.data_type()
+                ))
+            })?;
+            Ok((0..values.len())
+                .map(|index| (!values.is_null(index)).then(|| values.value(index)))
+                .collect())
+        }
+    }
+}
+
+fn sparse_u64_row(input: &SparseListInput, row_index: usize) -> pyo3::PyResult<Vec<Option<u64>>> {
+    match input {
+        SparseListInput::Json(rows) => parse_json_u64_array(&rows[row_index])
+            .map(|values| values.into_iter().map(Some).collect()),
+        SparseListInput::Native(array) => {
+            let Some(row) = native_list_row(array, row_index)? else {
+                return Ok(Vec::new());
+            };
+            let values = row.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "normalized unsigned integer list row has unsupported type: {:?}",
                     row.data_type()
                 ))
             })?;
@@ -939,6 +1024,30 @@ fn cast_array_for_output(
     cast(array.as_ref(), field.data_type()).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "failed to cast {context} to {:?}: {err}",
+            field.data_type()
+        ))
+    })
+}
+
+fn cast_array_for_output_strict(
+    array: ArrayRef,
+    field: &Field,
+    context: &str,
+) -> pyo3::PyResult<ArrayRef> {
+    if array.data_type() == field.data_type() {
+        return Ok(array);
+    }
+    cast_with_options(
+        array.as_ref(),
+        field.data_type(),
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to strictly cast restored {context} to {:?}: {err}",
             field.data_type()
         ))
     })
@@ -1489,7 +1598,8 @@ fn restore_batch_columns(
             let item_type = match kind {
                 ValueColumnKind::Float32 => DataType::Float32,
                 ValueColumnKind::Float64 => DataType::Float64,
-                ValueColumnKind::Integer => DataType::Int32,
+                ValueColumnKind::SignedInteger => DataType::Int64,
+                ValueColumnKind::UnsignedInteger => DataType::UInt64,
                 ValueColumnKind::Text => DataType::Utf8,
             };
             sparse_list_input(batch, column_name, input_path, item_type)
@@ -1591,8 +1701,8 @@ fn restore_batch_columns(
                         append_float_dense(inner, dense_value);
                     }
                 }
-                ValueColumnKind::Integer => {
-                    let value_sparse = sparse_i32_row(value_sparse_input, row_index)?;
+                ValueColumnKind::SignedInteger => {
+                    let value_sparse = sparse_i64_row(value_sparse_input, row_index)?;
                     validate_sparse_row_lengths(
                         column_name,
                         value_sparse.len(),
@@ -1608,8 +1718,29 @@ fn restore_batch_columns(
                         dense_index,
                         dense_coord_a.len(),
                     );
-                    if let ValueColumnBuilder::Integer(inner) = builder {
-                        append_int_dense(inner, dense_value);
+                    if let ValueColumnBuilder::SignedInteger(inner) = builder {
+                        append_signed_int_dense(inner, dense_value);
+                    }
+                }
+                ValueColumnKind::UnsignedInteger => {
+                    let value_sparse = sparse_u64_row(value_sparse_input, row_index)?;
+                    validate_sparse_row_lengths(
+                        column_name,
+                        value_sparse.len(),
+                        coord_a_values.len(),
+                        coord_b_values.len(),
+                        input_path,
+                        row_index,
+                    )?;
+                    let dense_value = restore_dense_values(
+                        &value_sparse,
+                        &coord_a_values,
+                        &coord_b_values,
+                        dense_index,
+                        dense_coord_a.len(),
+                    );
+                    if let ValueColumnBuilder::UnsignedInteger(inner) = builder {
+                        append_unsigned_int_dense(inner, dense_value);
                     }
                 }
                 ValueColumnKind::Text => {
@@ -1666,19 +1797,19 @@ fn restore_batch_columns(
         let output_field = output_schema.field(index);
         let column_name = field.name();
         if let Some(restored_array) = finished_value_columns.get(column_name.as_str()) {
-            output_columns.push(cast_array_for_output(
+            output_columns.push(cast_array_for_output_strict(
                 restored_array.clone(),
                 output_field,
                 column_name,
             )?);
         } else if column_name == &config.source_coord_columns[0] {
-            output_columns.push(cast_array_for_output(
+            output_columns.push(cast_array_for_output_strict(
                 Arc::new(coord_a_builder.finish()) as ArrayRef,
                 output_field,
                 column_name,
             )?);
         } else if column_name == &config.source_coord_columns[1] {
-            output_columns.push(cast_array_for_output(
+            output_columns.push(cast_array_for_output_strict(
                 Arc::new(coord_b_builder.finish()) as ArrayRef,
                 output_field,
                 column_name,
@@ -3042,6 +3173,31 @@ mod type_contract_tests {
             output_dtype_for_column(&schema, "decimal", &DataType::Utf8).expect("DECIMAL"),
             DataType::Decimal128(12, 2)
         );
+    }
+
+    #[test]
+    fn preserves_explicit_list_element_width_and_signedness() {
+        let cases = [
+            ("int8[]", DataType::Int8),
+            ("INT16[]", DataType::Int16),
+            ("INT32[]", DataType::Int32),
+            ("INT64[]", DataType::Int64),
+            ("UINT8[]", DataType::UInt8),
+            ("UINT16[]", DataType::UInt16),
+            ("UINT32[]", DataType::UInt32),
+            ("UINT64[]", DataType::UInt64),
+            ("FLOAT32[]", DataType::Float32),
+            ("FLOAT64[]", DataType::Float64),
+            ("STRING[]", DataType::Utf8),
+        ];
+        for (raw, element_type) in cases {
+            let schema = HashMap::from([("value".to_string(), raw.to_string())]);
+            assert_eq!(
+                output_dtype_for_column(&schema, "value", &DataType::Utf8).unwrap(),
+                DataType::List(Arc::new(Field::new("item", element_type, true))),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

@@ -8,7 +8,6 @@ from typing import Any
 import yaml
 
 from smoking_data.core.exceptions import SmokingDataError
-from smoking_data.core.pipeline import validate_pipeline_document
 from smoking_data.runtime.asset_chain import load_asset_chain
 from smoking_data.runtime.asset_config import asset_code_from_definition_path
 from smoking_data.runtime.config import load_config
@@ -152,7 +151,6 @@ def validate_definition(
             )
 
         spec = load_pipeline_spec(path, config=config)
-        validate_pipeline_document(raw)
         return ValidationResult(
             ok=True,
             definition_path=path,

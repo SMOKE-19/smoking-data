@@ -31,6 +31,7 @@ from smoking_data.core.engine_contract import (
     PAYLOAD_ENGINE,
     TASK_CONTRACT_VERSION,
     engine_metadata,
+    normalize_list_restore_type,
     validate_rust_payload_contract,
 )
 from smoking_data.core.exceptions import SmokingDataError, TaskExecutionError, ValidationError
@@ -110,6 +111,7 @@ from smoking_data.runtime.artifacts import (
     candidate_sidecar_root_for,
 )
 from smoking_data.runtime.config import RuntimeConfig
+from smoking_data.runtime.console_progress import worker_console_enabled
 from smoking_data.runtime.intermediate import write_sorted_intermediate
 from smoking_data.runtime.memory import current_rss_mb, peak_rss_mb
 from smoking_data.runtime.metadata import metadata_path_for, read_metadata, write_metadata
@@ -143,6 +145,7 @@ from smoking_data.runtime.selector_piece import (
 from smoking_data.runtime.selector_piece import run_selector_piece_subprocess
 from smoking_data.runtime.task_runner import run_tasks_in_subprocesses
 from smoking_data.runtime.task_telemetry import (
+    emit_task_telemetry_event,
     start_task_telemetry_supervisor,
     task_telemetry_phase,
 )
@@ -196,6 +199,7 @@ def can_run(preset: str) -> bool:
 
 def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     raw = spec.raw
+    asset_code = str((raw.get("__pipeline") or {}).get("asset_code") or "0201")
     execution = _mapping(raw.get("execution"), section="execution", allow_missing=True)
     test_run_limit = final_task_limit(execution)
     if "payload_engine" in execution or "writer_engine" in execution:
@@ -307,12 +311,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     )
     sort_first_enabled = bool(sort_first.get("enabled", False))
     selector_operation_id = str(sort_first.get("operation_id") or "active_row_selection")
-    selector_group_key_configs = list(sort_first.get("group_keys") or [])
-    selector_group_keys = [
-        str(item.get("name") if isinstance(item, dict) else item)
-        for item in selector_group_key_configs
-    ]
-    selector_expression_ir = sort_first.get("expression_ir")
+    selector_group_keys = [str(item) for item in (sort_first.get("group_keys") or [])]
     selector_payload_configured = "payload" in sort_first
     selector_payload = _mapping(
         sort_first.get("payload"),
@@ -437,9 +436,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             int(sidecar_memory_admission["worker_pool_mb"]) // max(1, admitted_sidecar_workers),
         ),
     )
-    materialize_phase_budget_mb = int(
-        config.memory_budget_mb * config.memory_safety_ratio
-    )
+    materialize_phase_budget_mb = int(config.memory_budget_mb * config.memory_safety_ratio)
     active_snapshot_target = active_snapshot_path_for(
         spec,
         config=config,
@@ -455,7 +452,8 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 config.log_root
                 / "task-telemetry"
                 / f"0201_{partition_dir_name(spec.job_name)}_sidecar_{time.time_ns()}.jsonl"
-            )
+            ),
+            progress_title=f"smoking-data {asset_code} · {spec.job_name} · build_sidecar",
         )
     sidecar_telemetry_endpoint = (
         sidecar_telemetry_handle.endpoint if sidecar_telemetry_handle is not None else None
@@ -474,8 +472,6 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 project_root=config.project_root,
                 partition_column=partition_column,
                 group_keys=selector_group_keys if sort_first_enabled else [partition_column],
-                selector_group_key_configs=selector_group_key_configs,
-                selector_expression_ir=selector_expression_ir,
                 selector_operation_id=selector_operation_id,
                 sort=list(sort_first.get("sort") or []),
                 rows_per_part=rows_per_part,
@@ -661,13 +657,10 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         target_rows_per_part=rows_per_part,
     )
     physical_by_id = {task.task_id: task for task in physical_plan.tasks}
-    asset_code = str((raw.get("__pipeline") or {}).get("asset_code") or "0201")
     task_row_group_recommendations = {
         task.task_id: choose_output_row_group_rows(
             physical_by_id[task.task_id],
-            minimum_rows=(
-                1 if bool((task.payload.get("pivot") or {}).get("enabled")) else 1_000
-            ),
+            minimum_rows=(1 if bool((task.payload.get("pivot") or {}).get("enabled")) else 1_000),
         )
         for task in tasks
     }
@@ -705,9 +698,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                         pivot=base_payload.get("pivot") or {},
                     ),
                     "output_row_group_rows": task_row_group_rows[task.task_id],
-                    "output_physical_layout_profile_hash": output_physical_layout[
-                        "profile_hash"
-                    ],
+                    "output_physical_layout_profile_hash": output_physical_layout["profile_hash"],
                     "spill_required": (physical_by_id[task.task_id].risk == "spill_required"),
                     "spill_merge_aggregation": _pivot_spill_aggregation(
                         base_payload.get("pivot") or {},
@@ -862,17 +853,19 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     sidecar_profile.setdefault("parent_memory_boundaries", []).append(
         _parent_memory_boundary("before_materialize")
     )
-    print(
-        (
-            f"[0201] active_row_selection done job={spec.job_name} "
-            f"active_rows={active_snapshot_stats['rows']} "
-            f"partitions={active_snapshot_stats['partitions']} "
-            f"tasks={len(tasks)} dirty_tasks={len(dirty_tasks)} reused_tasks={len(staged_results)} "
-            f"selector_elapsed={phase_profile['active_row_selection_sec']:.3f}s "
-            f"planning_elapsed={phase_profile['task_planning_and_staging_sec']:.3f}s"
-        ),
-        flush=True,
-    )
+    if worker_console_enabled():
+        print(
+            (
+                f"[0201] active_row_selection done job={spec.job_name} "
+                f"active_rows={active_snapshot_stats['rows']} "
+                f"partitions={active_snapshot_stats['partitions']} "
+                f"tasks={len(tasks)} dirty_tasks={len(dirty_tasks)} "
+                f"reused_tasks={len(staged_results)} "
+                f"selector_elapsed={phase_profile['active_row_selection_sec']:.3f}s "
+                f"planning_elapsed={phase_profile['task_planning_and_staging_sec']:.3f}s"
+            ),
+            flush=True,
+        )
     shared_telemetry_handle = None
     try:
         materialize_started = time.perf_counter()
@@ -883,7 +876,10 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 / "task-telemetry"
                 / f"0201_{partition_dir_name(spec.job_name)}_{time.time_ns()}.jsonl"
             )
-            shared_telemetry_handle = start_task_telemetry_supervisor(log_path=telemetry_log_path)
+            shared_telemetry_handle = start_task_telemetry_supervisor(
+                log_path=telemetry_log_path,
+                progress_title=f"smoking-data {asset_code} · {spec.job_name} · materialize",
+            )
         shared_telemetry_endpoint = (
             shared_telemetry_handle.endpoint if shared_telemetry_handle is not None else None
         )
@@ -922,9 +918,12 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             history_compression_ratio=history_compression_ratio,
         )
         recommended_row_group_rows = None
-        if resolve_configured_row_group_rows(
-            output.get("physical_layout"), fallback=config.output_row_group_rows
-        ) is None:
+        if (
+            resolve_configured_row_group_rows(
+                output.get("physical_layout"), fallback=config.output_row_group_rows
+            )
+            is None
+        ):
             recommended_row_group_rows = (
                 calibration_writer_decision.get("recommendation") or {}
             ).get("bounded_output_row_group_rows")
@@ -998,9 +997,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 for task_id, task in effective_dirty_tasks.items()
             }
         )
-        output_physical_layout["task_output_row_group_rows"] = dict(
-            applied_output_row_group_rows
-        )
+        output_physical_layout["task_output_row_group_rows"] = dict(applied_output_row_group_rows)
         adaptive_materialize_execution = {
             "schema_version": "smoking-data.adaptive-materialize-execution.v1",
             "status": ("applied" if calibration_tasks else "not_applicable"),
@@ -1048,9 +1045,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 compression=str(output.get("compression") or "zstd"),
                 row_group_rows=min(applied_output_row_group_rows.values(), default=1_000),
             )
-            phase_profile["single_snapshot_compaction_sec"] = (
-                time.perf_counter() - snapshot_started
-            )
+            phase_profile["single_snapshot_compaction_sec"] = time.perf_counter() - snapshot_started
             if transaction.manifest_context is not None:
                 transaction.manifest_context["single_file_output"] = snapshot_profile
         assertion_started = time.perf_counter()
@@ -1078,6 +1073,12 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             phase="before_commit",
         )
         commit_started = time.perf_counter()
+        emit_task_telemetry_event(
+            shared_telemetry_endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": "save_dataset.commit", "total": 1, "unit": "generation"},
+        )
         with task_telemetry_phase(
             shared_telemetry_endpoint,
             "save_dataset.commit",
@@ -1165,17 +1166,18 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         time.perf_counter() - sizing_reconciliation_started
     )
     phase_profile["total_elapsed_sec"] = time.perf_counter() - run_started
-    print(
-        (
-            f"[0201] materialize done job={spec.job_name} "
-            f"dirty_tasks={len(dirty_tasks)} "
-            f"materialize_elapsed={phase_profile.get('materialize_tasks_sec', 0.0):.3f}s "
-            f"assertion_elapsed={phase_profile.get('dataset_assertion_sec', 0.0):.3f}s "
-            f"commit_elapsed={phase_profile.get('transaction_commit_sec', 0.0):.3f}s "
-            f"total_elapsed={phase_profile['total_elapsed_sec']:.3f}s"
-        ),
-        flush=True,
-    )
+    if worker_console_enabled():
+        print(
+            (
+                f"[{asset_code}] materialize done job={spec.job_name} "
+                f"dirty_tasks={len(dirty_tasks)} "
+                f"materialize_elapsed={phase_profile.get('materialize_tasks_sec', 0.0):.3f}s "
+                f"assertion_elapsed={phase_profile.get('dataset_assertion_sec', 0.0):.3f}s "
+                f"commit_elapsed={phase_profile.get('transaction_commit_sec', 0.0):.3f}s "
+                f"total_elapsed={phase_profile['total_elapsed_sec']:.3f}s"
+            ),
+            flush=True,
+        )
     task_results = _remap_transaction_task_outputs(
         task_results,
         staging_root=transaction.staging_root,
@@ -1188,18 +1190,19 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         task_results,
         task_telemetry_profile,
     )
-    print(
-        (
-            f"[0201] task profile job={spec.job_name} "
-            f"tasks={task_phase_profile.get('tasks_profiled', 0)} "
-            f"task_avg={task_phase_profile.get('task_elapsed_sec', {}).get('avg', 0.0):.3f}s "
-            f"write_avg={task_phase_profile.get('write_elapsed_sec', {}).get('avg', 0.0):.3f}s "
-            f"source_files_avg={task_phase_profile.get('coordinate_source_files', {}).get('avg', 0.0):.2f} "
-            f"rust_restore_avg={rust_phase_profile.get('restore_sec', {}).get('avg', 0.0):.3f}s "
-            f"rust_write_avg={rust_phase_profile.get('parquet_write_sec', {}).get('avg', 0.0):.3f}s"
-        ),
-        flush=True,
-    )
+    if worker_console_enabled():
+        print(
+            (
+                f"[{asset_code}] task profile job={spec.job_name} "
+                f"tasks={task_phase_profile.get('tasks_profiled', 0)} "
+                f"task_avg={task_phase_profile.get('task_elapsed_sec', {}).get('avg', 0.0):.3f}s "
+                f"write_avg={task_phase_profile.get('write_elapsed_sec', {}).get('avg', 0.0):.3f}s "
+                f"source_files_avg={task_phase_profile.get('coordinate_source_files', {}).get('avg', 0.0):.2f} "
+                f"rust_restore_avg={rust_phase_profile.get('restore_sec', {}).get('avg', 0.0):.3f}s "
+                f"rust_write_avg={rust_phase_profile.get('parquet_write_sec', {}).get('avg', 0.0):.3f}s"
+            ),
+            flush=True,
+        )
     output_rows = int(sum(item.counters.get("output_rows", 0) for item in task_results))
     actual_output_columns = _actual_output_columns_by_task(task_results)
     explicit_boundary_runtime = _resolved_explicit_boundary_runtime(
@@ -2125,9 +2128,7 @@ def _compact_staged_snapshot_to_single_file(
 ) -> dict[str, Any]:
     """Stream bounded task parts into one schema-unified 0401 snapshot file."""
 
-    source_paths = [
-        path for path in sorted(staging_root.rglob("*.parquet")) if path.is_file()
-    ]
+    source_paths = [path for path in sorted(staging_root.rglob("*.parquet")) if path.is_file()]
     if not source_paths:
         raise RuntimeError("0401 snapshot transaction contains no Parquet task outputs.")
     schemas = [pq.ParquetFile(path).schema_arrow for path in source_paths]
@@ -2415,8 +2416,6 @@ def _build_active_coordinate_snapshot(
     project_root: Path,
     partition_column: str,
     group_keys: list[str],
-    selector_group_key_configs: list[dict[str, Any]],
-    selector_expression_ir: dict[str, Any] | None,
     selector_operation_id: str,
     sort: list[dict[str, Any]],
     rows_per_part: int,
@@ -2477,26 +2476,6 @@ def _build_active_coordinate_snapshot(
     # can remove raw selector columns or request Rust-only calculated columns.
     planner_payload["include_columns"] = []
     planner_payload["exclude_columns"] = []
-    direct_selector_aliases = [
-        {
-            "name": str(item.get("name") or ""),
-            "sql": '"' + str(item.get("column") or "").replace('"', '""') + '"',
-        }
-        for item in selector_group_key_configs
-        if isinstance(item, dict)
-        and str(item.get("column") or "").strip()
-        and str(item.get("name") or "") != str(item.get("column") or "")
-    ]
-    selector_local_expressions = [
-        dict(item)
-        for item in selector_group_key_configs
-        if isinstance(item, dict) and not str(item.get("column") or "").strip()
-    ]
-    planner_payload["add_calc"] = [
-        *(planner_payload.get("add_calc") or []),
-        *direct_selector_aliases,
-        *selector_local_expressions,
-    ]
     reserved_columns = {
         SOURCE_FILE_COLUMN,
         SOURCE_ROW_INDEX_COLUMN,
@@ -2513,7 +2492,6 @@ def _build_active_coordinate_snapshot(
         candidate_root=candidate_root,
         manifest_path=candidate_manifest_path,
         selector_operation_id=selector_operation_id,
-        selector_expression_ir_hash=_expression_ir_hash(selector_expression_ir),
         logical_plan_hash=logical_plan_hash,
         reference_fingerprint=reference_fingerprint,
         selector_columns=selector_columns,
@@ -2550,7 +2528,6 @@ def _build_active_coordinate_snapshot(
     sidecar_profile["compaction"] = compaction_profile
     sidecar_profile["operation_id"] = selector_operation_id
     sidecar_profile["selector_columns"] = selector_columns
-    sidecar_profile["selector_expression_ir_hash"] = _expression_ir_hash(selector_expression_ir)
     previous_active = _read_previous_active_snapshot(
         previous_active_snapshot_path,
         expected_columns=selector_columns,
@@ -2631,6 +2608,20 @@ def _build_active_coordinate_snapshot(
     sidecar_profile["active_sidecar_decision"] = active_sidecar_decision
     selected_active_mode = str(active_sidecar_decision["selected_mode"])
     direct_selector = selected_active_mode == "direct"
+    bucketize_required = sort_first_enabled and unaffected is None and not direct_selector
+    if not bucketize_required:
+        emit_task_telemetry_event(
+            telemetry_endpoint,
+            "phase_planned",
+            task_id=None,
+            details={
+                "phase_name": "build_sidecar.bucketize",
+                "total": 0,
+                "unit": "row_groups",
+                "skipped": True,
+                "reason": selected_active_mode,
+            },
+        )
     if sort_first_enabled and unaffected is None and direct_selector:
         selected_sidecar_lf = pl.concat(
             [pl.scan_parquet(path) for path in candidate_paths],
@@ -3047,7 +3038,6 @@ def _refresh_candidate_sidecars(
     candidate_root: Path,
     manifest_path: Path,
     selector_operation_id: str,
-    selector_expression_ir_hash: str | None,
     logical_plan_hash: str,
     reference_fingerprint: str,
     selector_columns: list[str],
@@ -3069,7 +3059,6 @@ def _refresh_candidate_sidecars(
         "version": CANDIDATE_MANIFEST_VERSION,
         "operation_id": selector_operation_id,
         "logical_plan_hash": logical_plan_hash,
-        "selector_expression_ir_hash": selector_expression_ir_hash,
         "reference_fingerprint": reference_fingerprint,
         "selector_columns": selector_columns,
     }
@@ -3181,14 +3170,36 @@ def _refresh_candidate_sidecars(
     calibrated_workers = max(1, int(workers))
     calibration_peak_rss_mb: float | None = None
     if direct_candidate_build:
+        emit_task_telemetry_event(
+            telemetry_endpoint,
+            "phase_planned",
+            task_id=None,
+            details={
+                "phase_name": "build_sidecar.candidate",
+                "total": len(pending_tasks),
+                "unit": "files",
+                "skipped": not pending_tasks,
+            },
+        )
         candidate_results = []
-        for task in pending_tasks:
+        for task_index, task in enumerate(pending_tasks, start=1):
             with task_telemetry_phase(
                 telemetry_endpoint,
                 "build_sidecar.candidate",
                 task_id=task.task_id,
             ):
                 candidate_results.append(_candidate_sidecar_task_worker(task))
+            emit_task_telemetry_event(
+                telemetry_endpoint,
+                "phase_progress",
+                task_id=task.task_id,
+                details={
+                    "phase_name": "build_sidecar.candidate",
+                    "completed": task_index,
+                    "total": len(pending_tasks),
+                    "unit": "files",
+                },
+            )
     else:
         calibration_results: list[TaskResult] = []
         remaining_candidate_tasks = pending_tasks
@@ -3407,25 +3418,30 @@ def _select_active_rows_in_buckets(
     selector_runner_profile: dict[str, Any] = {}
     try:
         bucket_plan_path = staging / "_bucket-plan.json"
-        bucketizer_task = TaskSpec(
-            task_id="selector-bucketize",
-            partition_value=None,
-            part_index=0,
-            payload={
-                "candidate_paths": [str(path) for path in candidate_paths],
-                "staging": str(staging),
-                "bucket_plan_path": str(bucket_plan_path),
-                "partition_column": partition_column,
-                "selection_group_keys": selection_group_keys,
-                "bucket_count": bucket_count,
-                "__telemetry_phase_name": "build_sidecar.bucketize",
-                "__telemetry_phase_only": True,
-            },
-        )
+        bucketizer_work = _plan_bucketizer_work(candidate_paths, workers=workers)
+        bucketizer_tasks = [
+            TaskSpec(
+                task_id=f"selector-bucketize-{index:04d}",
+                partition_value=None,
+                part_index=index,
+                payload={
+                    "candidate_work": work,
+                    "staging": str(staging),
+                    "bucket_plan_path": str(staging / "_bucket-plans" / f"shard-{index:04d}.json"),
+                    "piece_root": str(staging / "_bucket-shards" / f"shard-{index:04d}"),
+                    "partition_column": partition_column,
+                    "selection_group_keys": selection_group_keys,
+                    "bucket_count": bucket_count,
+                    "__telemetry_phase_name": "build_sidecar.bucketize",
+                    "__telemetry_phase_only": True,
+                },
+            )
+            for index, work in enumerate(bucketizer_work)
+        ]
         bucketizer_results, bucketizer_profile = run_tasks_in_subprocesses(
-            [bucketizer_task],
+            bucketizer_tasks,
             worker=_selector_bucketize_worker,
-            workers=1,
+            workers=min(max(1, int(workers)), len(bucketizer_tasks)),
             max_tasks_per_child=1,
             return_profile=True,
             telemetry_endpoint=telemetry_endpoint,
@@ -3441,7 +3457,12 @@ def _select_active_rows_in_buckets(
                 },
             )
         bucketizer_result = bucketizer_results[0]
-        bucket_plan = json.loads(bucket_plan_path.read_text(encoding="utf-8"))
+        bucket_plan = _merge_bucketizer_plans(
+            [Path(result.output_paths[0]) for result in bucketizer_results],
+            staging=staging,
+            bucket_count=bucket_count,
+        )
+        _atomic_write_json(bucket_plan_path, bucket_plan)
         bucket_entries = list(bucket_plan.get("buckets") or [])
         piece_index = int(bucket_plan.get("candidate_pieces") or 0)
         parent_memory_boundaries.append(_parent_memory_boundary("bucketize_finished"))
@@ -3545,8 +3566,13 @@ def _select_active_rows_in_buckets(
         "parent_memory_boundaries": parent_memory_boundaries,
         "bucketizer": {
             "pid": bucketizer_result.pid,
-            "elapsed_sec": bucketizer_result.counters.get("elapsed_sec"),
-            "peak_rss_mb": bucketizer_result.counters.get("rss_peak_mb"),
+            "pids": sorted({result.pid for result in bucketizer_results if result.pid > 0}),
+            "shards": len(bucketizer_results),
+            "elapsed_sec": bucketizer_profile.get("total_elapsed_sec"),
+            "peak_rss_mb": max(
+                (float(result.counters.get("rss_peak_mb") or 0.0) for result in bucketizer_results),
+                default=0.0,
+            ),
             "runner": bucketizer_profile,
         },
         "selector_pids": sorted({result.pid for result in results if result.pid > 0}),
@@ -3561,6 +3587,84 @@ def _select_active_rows_in_buckets(
             (float(item.counters.get("rss_peak_mb", 0.0)) for item in results),
             default=0.0,
         ),
+    }
+
+
+def _plan_bucketizer_work(
+    candidate_paths: list[Path], *, workers: int
+) -> list[list[dict[str, Any]]]:
+    """Balance immutable Parquet row groups across isolated bucketizer workers."""
+    units: list[tuple[int, str, int]] = []
+    for candidate_path in sorted(candidate_paths, key=lambda item: str(item)):
+        parquet = pq.ParquetFile(candidate_path)
+        for row_group in range(parquet.metadata.num_row_groups):
+            metadata = parquet.metadata.row_group(row_group)
+            estimated_bytes = max(1, int(metadata.total_byte_size or 0))
+            units.append((estimated_bytes, str(candidate_path), row_group))
+    if not units:
+        return [[]]
+    shard_count = min(max(1, int(workers)), len(units))
+    shards: list[list[dict[str, Any]]] = [[] for _ in range(shard_count)]
+    shard_bytes = [0] * shard_count
+    for estimated_bytes, path, row_group in sorted(
+        units, key=lambda item: (-item[0], item[1], item[2])
+    ):
+        shard_index = min(range(shard_count), key=lambda index: (shard_bytes[index], index))
+        shards[shard_index].append(
+            {
+                "path": path,
+                "row_group": row_group,
+                "estimated_bytes": estimated_bytes,
+            }
+        )
+        shard_bytes[shard_index] += estimated_bytes
+    for shard in shards:
+        shard.sort(key=lambda item: (str(item["path"]), int(item["row_group"])))
+    return shards
+
+
+def _merge_bucketizer_plans(
+    plan_paths: list[Path], *, staging: Path, bucket_count: int
+) -> dict[str, Any]:
+    buckets: dict[tuple[str, int], list[str]] = {}
+    candidate_pieces = 0
+    for plan_path in sorted(plan_paths, key=lambda item: str(item)):
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        if plan.get("schema_version") != "smoking-data.selector-bucket-plan.v1":
+            raise TaskExecutionError(
+                "0201 bucketizer returned an unsupported plan.",
+                context={"path": str(plan_path)},
+            )
+        candidate_pieces += int(plan.get("candidate_pieces") or 0)
+        for entry in plan.get("buckets") or []:
+            key = (str(entry["partition_value"]), int(entry["bucket_id"]))
+            for raw_path in entry.get("paths") or []:
+                relative_path = Path(str(raw_path))
+                resolved_path = (staging / relative_path).resolve()
+                if (
+                    relative_path.is_absolute()
+                    or ".." in relative_path.parts
+                    or not resolved_path.is_file()
+                    or staging.resolve() not in resolved_path.parents
+                ):
+                    raise TaskExecutionError(
+                        "0201 bucketizer returned an invalid piece path.",
+                        context={"path": str(relative_path), "plan_path": str(plan_path)},
+                    )
+                buckets.setdefault(key, []).append(str(relative_path))
+    return {
+        "schema_version": "smoking-data.selector-bucket-plan.v1",
+        "path_contract": "staging_relative",
+        "bucket_count": bucket_count,
+        "candidate_pieces": candidate_pieces,
+        "buckets": [
+            {
+                "partition_value": partition_value,
+                "bucket_id": bucket_id,
+                "paths": sorted(paths),
+            }
+            for (partition_value, bucket_id), paths in sorted(buckets.items())
+        ],
     }
 
 
@@ -3840,17 +3944,49 @@ def _build_active_sidecar_pipeline(
 
 def _selector_bucketize_worker(task: TaskSpec) -> TaskResult:
     payload = task.payload
-    candidate_paths = [Path(str(item)) for item in payload["candidate_paths"]]
+    candidate_work = [
+        {
+            "path": Path(str(item["path"])),
+            "row_group": int(item["row_group"]),
+            "estimated_bytes": max(1, int(item.get("estimated_bytes") or 1)),
+        }
+        for item in payload.get("candidate_work") or []
+    ]
+    if not candidate_work:
+        candidate_work = [
+            {
+                "path": candidate_path,
+                "row_group": row_group,
+                "estimated_bytes": max(
+                    1,
+                    int(parquet.metadata.row_group(row_group).total_byte_size or 0),
+                ),
+            }
+            for candidate_path in [Path(str(item)) for item in payload["candidate_paths"]]
+            for parquet in [pq.ParquetFile(candidate_path)]
+            for row_group in range(parquet.metadata.num_row_groups)
+        ]
+    candidate_paths = sorted(
+        {Path(str(item["path"])) for item in candidate_work}, key=lambda item: str(item)
+    )
     staging = Path(str(payload["staging"]))
+    piece_root = Path(str(payload.get("piece_root") or staging))
     bucket_plan_path = Path(str(payload["bucket_plan_path"]))
     partition_column = str(payload["partition_column"])
     selection_group_keys = [str(item) for item in payload["selection_group_keys"]]
     bucket_count = max(1, int(payload["bucket_count"]))
+    total_row_groups = len(candidate_work)
     piece_index = 0
     bucket_files: dict[tuple[str, int], list[Path]] = {}
-    for candidate_path in candidate_paths:
-        parquet = pq.ParquetFile(candidate_path)
-        for batch in parquet.iter_batches(batch_size=65_536):
+    opened_path: Path | None = None
+    parquet: pq.ParquetFile | None = None
+    for work in candidate_work:
+        candidate_path = Path(str(work["path"]))
+        row_group = int(work["row_group"])
+        if parquet is None or candidate_path != opened_path:
+            parquet = pq.ParquetFile(candidate_path)
+            opened_path = candidate_path
+        for batch in parquet.iter_batches(batch_size=65_536, row_groups=[row_group]):
             frame = pl.from_arrow(batch)
             if frame.is_empty():
                 continue
@@ -3866,7 +4002,7 @@ def _selector_bucketize_worker(task: TaskSpec) -> TaskResult:
                 partition_value, bucket_value = key
                 bucket_key = (str(partition_value), int(bucket_value))
                 bucket_dir = ensure_dir(
-                    staging
+                    piece_root
                     / partition_dir_name(partition_value)
                     / f"bucket-{int(bucket_value):05d}"
                 )
@@ -3901,7 +4037,8 @@ def _selector_bucketize_worker(task: TaskSpec) -> TaskResult:
         output_paths=[bucket_plan_path],
         counters={
             "candidate_files": len(candidate_paths),
-            "candidate_bytes": sum(path.stat().st_size for path in candidate_paths),
+            "candidate_bytes": sum(int(item["estimated_bytes"]) for item in candidate_work),
+            "candidate_row_groups": total_row_groups,
             "candidate_pieces": piece_index,
             "selector_buckets": len(bucket_files),
         },
@@ -4595,8 +4732,7 @@ def _write_curated_part_rust_direct(
     required_source_columns.update(
         str(column)
         for column in payload.get("source_projection_columns_hint") or []
-        if str(column) not in generated_columns
-        and str(column) not in post_generated_columns
+        if str(column) not in generated_columns and str(column) not in post_generated_columns
     )
     if restore_enabled:
         required_source_columns.update(
@@ -5527,32 +5663,44 @@ def _list_restore_rust_type(dtype: Any, *, column: str, source: str) -> str:
     if isinstance(dtype, pl.List):
         return _list_restore_rust_type(dtype.inner, column=column, source=source)
     if dtype == pl.Float32:
-        return "FLOAT[]"
+        return "FLOAT32[]"
     if dtype == pl.Float64 or isinstance(dtype, pl.Decimal):
-        return "DOUBLE[]"
-    if dtype in {
-        pl.Int8,
-        pl.Int16,
-        pl.Int32,
-        pl.Int64,
-        pl.UInt8,
-        pl.UInt16,
-        pl.UInt32,
-        pl.UInt64,
-    }:
-        return "INTEGER[]"
+        return "FLOAT64[]"
+    polars_integer_types = {
+        pl.Int8: "INT8[]",
+        pl.Int16: "INT16[]",
+        pl.Int32: "INT32[]",
+        pl.Int64: "INT64[]",
+        pl.UInt8: "UINT8[]",
+        pl.UInt16: "UINT16[]",
+        pl.UInt32: "UINT32[]",
+        pl.UInt64: "UINT64[]",
+    }
+    if dtype in polars_integer_types:
+        return polars_integer_types[dtype]
     if dtype == pl.String:
-        return "TEXT[]"
+        return "STRING[]"
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
         return _list_restore_rust_type(dtype.value_type, column=column, source=source)
+    arrow_integer_types = (
+        (pa.types.is_int8, "INT8[]"),
+        (pa.types.is_int16, "INT16[]"),
+        (pa.types.is_int32, "INT32[]"),
+        (pa.types.is_int64, "INT64[]"),
+        (pa.types.is_uint8, "UINT8[]"),
+        (pa.types.is_uint16, "UINT16[]"),
+        (pa.types.is_uint32, "UINT32[]"),
+        (pa.types.is_uint64, "UINT64[]"),
+    )
+    for predicate, type_name in arrow_integer_types:
+        if predicate(dtype):
+            return type_name
     if pa.types.is_float32(dtype):
-        return "FLOAT[]"
-    if pa.types.is_floating(dtype):
-        return "DOUBLE[]"
-    if pa.types.is_integer(dtype):
-        return "INTEGER[]"
+        return "FLOAT32[]"
+    if pa.types.is_float64(dtype):
+        return "FLOAT64[]"
     if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
-        return "TEXT[]"
+        return "STRING[]"
     raise ValidationError(
         f"list_restore schema auto cannot infer supported list type for {column}: {dtype!r}",
         code="list_restore.schema_inference_unsupported_type",
@@ -5560,9 +5708,7 @@ def _list_restore_rust_type(dtype: Any, *, column: str, source: str) -> str:
     )
 
 
-def _infer_json_list_rust_type(
-    source_path: Path, *, column: str
-) -> str | None:
+def _infer_json_list_rust_type(source_path: Path, *, column: str) -> str | None:
     try:
         values = pq.read_table(source_path, columns=[column]).column(0).to_pylist()
     except Exception:
@@ -5582,11 +5728,11 @@ def _infer_json_list_rust_type(
         if isinstance(item, bool):
             return "TEXT[]"
         if isinstance(item, int):
-            return "INTEGER[]"
+            return "INT64[]"
         if isinstance(item, float):
-            return "DOUBLE[]"
+            return "FLOAT64[]"
         if isinstance(item, str):
-            return "TEXT[]"
+            return "STRING[]"
     return None
 
 
@@ -5642,9 +5788,7 @@ def _resolve_list_restore_schema(
     for column in dict.fromkeys(columns):
         input_dtype = coordinates.schema.get(column)
         if input_dtype is not None and isinstance(input_dtype, pl.List):
-            inferred[column] = _list_restore_rust_type(
-                input_dtype, column=column, source="input"
-            )
+            inferred[column] = _list_restore_rust_type(input_dtype, column=column, source="input")
             continue
         if input_schema is not None and column in input_schema.names:
             input_dtype = input_schema.field(column).type
@@ -5678,7 +5822,9 @@ def _rust_schema_type(type_name: str) -> str:
     normalized = type_name.upper().replace(" ", "")
     if normalized.startswith("DECIMAL(") and normalized.endswith(")"):
         return normalized
-    return RUST_DIRECT_TYPE_MAP[normalized]
+    if normalized in RUST_DIRECT_TYPE_MAP:
+        return RUST_DIRECT_TYPE_MAP[normalized]
+    return normalize_list_restore_type(normalized)
 
 
 def _validate_source_file_unchanged(source_file: Path, source_stats: dict[str, Any]) -> None:

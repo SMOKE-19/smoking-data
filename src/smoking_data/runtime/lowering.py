@@ -282,7 +282,6 @@ def _lower_curated(spec: PipelineSpec) -> dict[str, Any]:
         if selector is not None
         else [],
         "sort": list(selector.config.get("sort") or []) if selector is not None else [],
-        "expression_ir": selector.config.get("expression_ir") if selector is not None else None,
         "tie_policy": "source_path_row_index",
     }
     if selector_payload and (

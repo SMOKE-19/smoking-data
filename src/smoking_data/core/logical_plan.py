@@ -363,14 +363,20 @@ def _compile_pivot_operation(pivot: dict[str, Any]) -> OperationSpec:
             context={"path": "pivot"},
         )
     column_keys = (
-        _string_tuple(pivot.get("column_keys"), path="pivot.column_keys") if value_keys else ()
+        _optional_string_tuple(pivot.get("column_keys"), path="pivot.column_keys")
+        if value_keys
+        else ()
     )
     source_columns = tuple(
         str(item.get("source_column") or "")
         for item in [*value_keys, *value_keys_without_column]
         if isinstance(item, dict) and item.get("source_column")
     )
-    _validate_pivot_value_keys(value_keys, path="pivot.value_keys", has_column=True)
+    _validate_pivot_value_keys(
+        value_keys,
+        path="pivot.value_keys",
+        has_column=bool(column_keys),
+    )
     _validate_pivot_value_keys(
         value_keys_without_column,
         path="pivot.value_keys_without_column",
@@ -608,6 +614,18 @@ def _string_tuple(value: Any, *, path: str) -> tuple[str, ...]:
             f"{path} must be a non-empty list.",
             code="yaml.invalid_type",
             context={"path": path, "expected": "non_empty_string_list"},
+        )
+    return tuple(str(item) for item in value)
+
+
+def _optional_string_tuple(value: Any, *, path: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or not all(str(item).strip() for item in value):
+        raise ValidationError(
+            f"{path} must be a list of non-empty strings.",
+            code="yaml.invalid_type",
+            context={"path": path, "expected": "string_list"},
         )
     return tuple(str(item) for item in value)
 

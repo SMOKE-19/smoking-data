@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
+from smoking_data.runtime.console_progress import worker_console_enabled
+from smoking_data.runtime.task_telemetry import (
+    emit_task_telemetry_event,
+    start_task_telemetry_supervisor,
+    task_telemetry_phase,
+)
 from smoking_data.runtime.test_run import select_final_tasks
 
 from ..adapter_registry import load_source_adapter
@@ -83,6 +89,7 @@ class _SourceRawTaskWorkerArgs:
     startup_delay_sec: float = 0.0
     task_index: int = 1
     total_tasks: int = 1
+    telemetry_endpoint: dict[str, object] | None = None
 
 
 class _CapturedDataApiError(RuntimeError):
@@ -164,6 +171,20 @@ def execute_source_raw_stage(
         _reset_source_run_artifacts(plan.spec)
     log_path = build_source_log_path(log_path=plan.spec.logging.path)
     logger = get_source_logger(log_path=log_path, job_name=plan.spec.job.name)
+    telemetry = start_task_telemetry_supervisor(
+        log_path=(
+            plan.spec.project.log_root
+            / "task-telemetry"
+            / f"0101_{plan.spec.job.name}_{time.time_ns()}.jsonl"
+        ),
+        progress_title=f"smoking-data 0101 · {plan.spec.job.name}",
+    )
+    emit_task_telemetry_event(
+        telemetry.endpoint,
+        "phase_planned",
+        task_id=None,
+        details={"phase_name": "0101.acquire", "total": len(plan.tasks), "unit": "tasks"},
+    )
     _emit_progress(
         f"🧩 [SOURCE] 시작: yaml={Path(yaml_path).resolve()}, job={plan.spec.job.name}, "
         f"tasks={len(plan.tasks)}/{plan.test_run['global_planned_tasks']}, "
@@ -175,18 +196,30 @@ def execute_source_raw_stage(
     metadata_records: list[SourceMetadataRecord] = []
     log_records: list[SourceLogRecord] = []
     should_write_source_profile = bool(plan.spec.execution.write_source_profile_json)
-    if transport is None:
-        adapter = load_source_adapter(plan.spec.request.adapter)
-        adapter.prepare_run(
-            options=plan.spec.request.adapter_options,
-            project_root=plan.spec.project.project_root,
-            temp_root=plan.spec.project.temp_root,
+    try:
+        if transport is None:
+            adapter = load_source_adapter(plan.spec.request.adapter)
+            adapter.prepare_run(
+                options=plan.spec.request.adapter_options,
+                project_root=plan.spec.project.project_root,
+                temp_root=plan.spec.project.temp_root,
+            )
+        task_results = _execute_source_raw_tasks(
+            plan,
+            should_write_source_profile=should_write_source_profile,
+            transport=transport,
+            telemetry_endpoint=telemetry.endpoint,
         )
-    task_results = _execute_source_raw_tasks(
-        plan,
-        should_write_source_profile=should_write_source_profile,
-        transport=transport,
-    )
+        emit_task_telemetry_event(
+            telemetry.endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": "0101.catalog", "total": 1, "unit": "catalog"},
+        )
+        with task_telemetry_phase(telemetry.endpoint, "0101.catalog"):
+            write_source_dataset_catalog(plan.spec.storage.raw_dir)
+    finally:
+        telemetry.stop()
     for item in task_results:
         path_sets.append(item.path_set)
         responses.append(item.response)
@@ -201,7 +234,6 @@ def execute_source_raw_stage(
     ]
     success_tasks = sum(1 for item in task_results if item.response.status == "success")
     error_tasks = sum(1 for item in task_results if item.response.status != "success")
-    write_source_dataset_catalog(plan.spec.storage.raw_dir)
     _emit_progress(
         f"🏁 [SOURCE] 완료: job={plan.spec.job.name}, raw_datasets={len(path_sets)}, success_tasks={success_tasks}, error_tasks={error_tasks}"
     )
@@ -262,6 +294,7 @@ def _execute_source_raw_tasks(
     *,
     should_write_source_profile: bool,
     transport: Callable[..., object] | None,
+    telemetry_endpoint: dict[str, object] | None,
 ) -> list[_SourceRawTaskExecutionResult]:
     worker_count = max(1, int(plan.spec.execution.workers or 1))
     if transport is not None:
@@ -271,6 +304,7 @@ def _execute_source_raw_tasks(
                 task,
                 should_write_source_profile=should_write_source_profile,
                 transport=transport,
+                telemetry_endpoint=telemetry_endpoint,
             )
             for task in plan.tasks
         ]
@@ -287,6 +321,7 @@ def _execute_source_raw_tasks(
                     should_write_source_profile=should_write_source_profile,
                     task_index=1,
                     total_tasks=len(plan.tasks),
+                    telemetry_endpoint=telemetry_endpoint,
                 )
             )
         )
@@ -302,6 +337,7 @@ def _execute_source_raw_tasks(
             startup_delay_sec=(startup_delay * index) if startup_delay > 0 else 0.0,
             task_index=index + 1,
             total_tasks=len(remaining_tasks),
+            telemetry_endpoint=telemetry_endpoint,
         )
         for index, task in enumerate(remaining_tasks)
     ]
@@ -342,6 +378,7 @@ def _execute_source_raw_task_worker(args: _SourceRawTaskWorkerArgs) -> _SourceRa
         startup_delay_sec=args.startup_delay_sec,
         task_index=args.task_index,
         total_tasks=args.total_tasks,
+        telemetry_endpoint=args.telemetry_endpoint,
     )
 
 
@@ -354,14 +391,59 @@ def _execute_single_source_raw_task(
     startup_delay_sec: float = 0.0,
     task_index: int = 1,
     total_tasks: int = 1,
+    telemetry_endpoint: dict[str, object] | None = None,
 ) -> _SourceRawTaskExecutionResult:
     if startup_delay_sec > 0:
         time.sleep(startup_delay_sec)
+    phase_id = f"0101.acquire:{task.file_stem}:{time.time_ns()}"
+    phase_details = {
+        "phase_name": "0101.acquire",
+        "phase_id": phase_id,
+        "counts_completion": True,
+    }
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_started",
+        task_id=task.file_stem,
+        details=phase_details,
+    )
+    try:
+        result = _execute_single_source_raw_task_body(
+            spec,
+            task,
+            should_write_source_profile=should_write_source_profile,
+            transport=transport,
+            task_index=task_index,
+            total_tasks=total_tasks,
+        )
+    except BaseException:
+        emit_task_telemetry_event(
+            telemetry_endpoint,
+            "phase_finished",
+            task_id=task.file_stem,
+            details={**phase_details, "ok": False},
+        )
+        raise
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_finished",
+        task_id=task.file_stem,
+        details={**phase_details, "ok": result.response.status == "success"},
+    )
+    return result
+
+
+def _execute_single_source_raw_task_body(
+    spec: SourceSpec,
+    task: SourceTask,
+    *,
+    should_write_source_profile: bool,
+    transport: Callable[..., object],
+    task_index: int,
+    total_tasks: int,
+) -> _SourceRawTaskExecutionResult:
     path_set = build_source_paths(spec, task)
     task_job_fields = _task_job_fields(task)
-    _emit_progress(
-        f"⚙️ [SOURCE] 태스크 시작: {task_index}/{total_tasks}, pid={os.getpid()}, file_stem={task.file_stem}"
-    )
     max_retries = max(0, int(spec.execution.max_retries))
     retry_backoff_sec = max(0.0, float(spec.execution.retry_backoff_sec))
     max_attempts = max_retries + 1
@@ -632,6 +714,8 @@ def _flatten_error_text(value: object) -> str:
 
 
 def _emit_progress(message: str) -> None:
+    if not worker_console_enabled():
+        return
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
 

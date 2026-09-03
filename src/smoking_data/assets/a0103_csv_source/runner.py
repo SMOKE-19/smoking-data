@@ -5,6 +5,8 @@ import json
 import os
 import re
 import shutil
+import time
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,10 +17,16 @@ import pyarrow.parquet as pq
 from smoking_data.core.exceptions import SmokingDataError
 from smoking_data.core.results import StageResult, to_json_safe, utc_now_iso
 from smoking_data.ops.projection import POLARS_TYPE_MAP, apply_add_calc
+from smoking_data.runtime.config import load_config
 from smoking_data.runtime.dataset_artifacts import describe_dataset_artifacts
 from smoking_data.runtime.naming import partition_dir_name
 from smoking_data.runtime.object_store.publication import publish_committed_dataset
 from smoking_data.runtime.paths import file_sha256
+from smoking_data.runtime.task_telemetry import (
+    emit_task_telemetry_event,
+    start_task_telemetry_supervisor,
+    task_telemetry_phase,
+)
 from smoking_data.runtime.transactions import (
     DATASET_MANIFEST_VERSION,
     DatasetTransaction,
@@ -62,13 +70,34 @@ def run_yaml(
 
 
 def _run(spec: CsvSourceSpec, *, trigger_type: str) -> StageResult:
-    with prepare_csv_source(spec) as prepared:
-        return _run_prepared(
-            spec,
-            source_root=prepared.root,
-            acquisition=prepared.metadata,
-            trigger_type=trigger_type,
+    config = load_config(project_root=spec.project_root, asset_code="0103")
+    telemetry = start_task_telemetry_supervisor(
+        log_path=(
+            config.log_root
+            / "task-telemetry"
+            / f"0103_{spec.job_name}_{time.time_ns()}.jsonl"
+        ),
+        progress_title=f"smoking-data 0103 · {spec.job_name}",
+    )
+    try:
+        emit_task_telemetry_event(
+            telemetry.endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": "0103.acquire_source", "total": 1, "unit": "source"},
         )
+        with ExitStack() as stack:
+            with task_telemetry_phase(telemetry.endpoint, "0103.acquire_source"):
+                prepared = stack.enter_context(prepare_csv_source(spec))
+            return _run_prepared(
+                spec,
+                source_root=prepared.root,
+                acquisition=prepared.metadata,
+                trigger_type=trigger_type,
+                telemetry_endpoint=telemetry.endpoint,
+            )
+    finally:
+        telemetry.stop()
 
 
 def _run_prepared(
@@ -77,6 +106,7 @@ def _run_prepared(
     source_root: Path,
     acquisition: dict[str, Any],
     trigger_type: str,
+    telemetry_endpoint: dict[str, Any] | None,
 ) -> StageResult:
     files = _discover_csv_files(spec, source_root=source_root)
     if not files:
@@ -121,9 +151,33 @@ def _run_prepared(
         "duplicate_route_rows": 0,
         "file_name_overrides": 0,
     }
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_planned",
+        task_id=None,
+        details={"phase_name": "0103.transform", "total": len(files), "unit": "files"},
+    )
+    current_phase_details: dict[str, Any] | None = None
+    current_phase_task_id: str | None = None
+    current_phase_closed = True
     try:
         for csv_path in files:
             relative_path = _relative_path(source_root, csv_path)
+            phase_id = f"0103.transform:{relative_path}:{time.time_ns()}"
+            phase_details = {
+                "phase_name": "0103.transform",
+                "phase_id": phase_id,
+                "counts_completion": True,
+            }
+            current_phase_details = phase_details
+            current_phase_task_id = relative_path
+            current_phase_closed = False
+            emit_task_telemetry_event(
+                telemetry_endpoint,
+                "phase_started",
+                task_id=relative_path,
+                details=phase_details,
+            )
             stat = csv_path.stat()
             prior = previous_entries.get(relative_path)
             reusable, content_hash, same_content = _reusable_entry(
@@ -152,26 +206,50 @@ def _run_prepared(
                 entries.append(entry)
                 counters["reused_files"] += 1
                 counters["same_content_files"] += int(same_content)
+                emit_task_telemetry_event(
+                    telemetry_endpoint,
+                    "phase_finished",
+                    task_id=relative_path,
+                    details={**phase_details, "ok": True},
+                )
+                current_phase_closed = True
                 continue
 
-            entry, file_catalog, file_warnings, file_counters = _process_file(
-                spec,
-                csv_path=csv_path,
-                relative_path=relative_path,
-                source_stat=stat,
-                source_sha256=content_hash or file_sha256(csv_path),
-                contract_hash=contract_hash,
-                staging_root=transaction.staging_root,
-                run_date=run_date,
-                now=now,
-                first_seen_at=str((prior or {}).get("first_seen_at") or now),
-            )
+            try:
+                entry, file_catalog, file_warnings, file_counters = _process_file(
+                    spec,
+                    csv_path=csv_path,
+                    relative_path=relative_path,
+                    source_stat=stat,
+                    source_sha256=content_hash or file_sha256(csv_path),
+                    contract_hash=contract_hash,
+                    staging_root=transaction.staging_root,
+                    run_date=run_date,
+                    now=now,
+                    first_seen_at=str((prior or {}).get("first_seen_at") or now),
+                )
+            except BaseException:
+                emit_task_telemetry_event(
+                    telemetry_endpoint,
+                    "phase_finished",
+                    task_id=relative_path,
+                    details={**phase_details, "ok": False},
+                )
+                current_phase_closed = True
+                raise
             entries.append(entry)
             catalog.extend(file_catalog)
             warnings.extend(file_warnings)
             counters["processed_files"] += 1
             for key, value in file_counters.items():
                 counters[key] += value
+            emit_task_telemetry_event(
+                telemetry_endpoint,
+                "phase_finished",
+                task_id=relative_path,
+                details={**phase_details, "ok": True},
+            )
+            current_phase_closed = True
 
         # Reused entries are normalized into fresh child manifests/catalog entries.
         for entry in entries:
@@ -211,7 +289,14 @@ def _run_prepared(
         _write_json(transaction.staging_root / _SOURCE_MANIFEST, source_manifest)
         _write_json(transaction.staging_root / _DATASET_CATALOG, dataset_catalog)
         _write_json(transaction.staging_root / _METADATA, metadata)
-        output_paths, transaction_profile = transaction.commit()
+        emit_task_telemetry_event(
+            telemetry_endpoint,
+            "phase_planned",
+            task_id=None,
+            details={"phase_name": "0103.commit", "total": 1, "unit": "generation"},
+        )
+        with task_telemetry_phase(telemetry_endpoint, "0103.commit"):
+            output_paths, transaction_profile = transaction.commit()
         refresh_dataset_manifest_provenance(spec.output_root)
         publication_result = (
             publish_committed_dataset(
@@ -226,6 +311,13 @@ def _run_prepared(
             else None
         )
     except BaseException:
+        if not current_phase_closed and current_phase_details is not None:
+            emit_task_telemetry_event(
+                telemetry_endpoint,
+                "phase_finished",
+                task_id=current_phase_task_id,
+                details={**current_phase_details, "ok": False},
+            )
         transaction.abort()
         raise
 

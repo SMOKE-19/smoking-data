@@ -47,6 +47,17 @@ def execute_curated_task(
     drop_cache_hint: bool = ...,
     print_timing: bool = ...,
 ) -> dict[str, float]: ...
+def execute_coordinate_materialize_task(
+    coord_path: str,
+    output_dir: str,
+    lookup_path: str,
+    schema: dict[str, str],
+    config: Mapping[str, object],
+    writer_config: Mapping[str, object] | None = ...,
+    batch_size: int | None = ...,
+    drop_cache_hint: bool = ...,
+    print_timing: bool = ...,
+) -> dict[str, float]: ...
 def restore_dataset_to_dataset(
     input_dataset_dir: str,
     output_dataset_dir: str,

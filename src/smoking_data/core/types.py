@@ -9,6 +9,13 @@ class DatasetFile:
     path: Path
     size_bytes: int
     modified_ns: int
+    dataset_root: Path | None = None
+    dataset_id: str | None = None
+    source_kind: str = "local"
+    file_id: str | None = None
+    relative_path: str | None = None
+    content_sha256: str | None = None
+    object_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

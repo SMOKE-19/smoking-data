@@ -34,7 +34,12 @@ class RestoreParquetRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class CuratedTaskRequest:
+class BoundedWriterOptions:
+    queue_capacity_batches: int = 2
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinateMaterializeRequest:
     coordinate_path: Path
     output_dir: Path
     output_file_name: str
@@ -60,7 +65,12 @@ class CuratedTaskRequest:
     batch_size: int | None = None
     drop_cache_hint: bool = False
     print_timing: bool = False
-    writer_queue_capacity_batches: int = 2
+    writer: BoundedWriterOptions | None = None
+    # Compatibility input for callers predating the shared writer contract.
+    writer_queue_capacity_batches: int | None = None
+
+
+CuratedTaskRequest = CoordinateMaterializeRequest
 
 
 def execute_join_task(task: dict[str, Any]) -> dict[str, float]:
@@ -118,10 +128,17 @@ def restore_list_dataset(request: RestoreListRequest) -> dict[str, float]:
     )
 
 
-def execute_curated_task(request: CuratedTaskRequest) -> dict[str, float]:
-    from smoking_data_engine_rs import execute_curated_task as execute
+def execute_coordinate_materialize(
+    request: CoordinateMaterializeRequest,
+) -> dict[str, float]:
+    from smoking_data_engine_rs import execute_coordinate_materialize_task as execute
 
     ensure_dir(request.output_dir)
+    queue_capacity = (
+        request.writer_queue_capacity_batches
+        if request.writer_queue_capacity_batches is not None
+        else (request.writer or BoundedWriterOptions()).queue_capacity_batches
+    )
     return execute(
         coord_path=str(request.coordinate_path),
         output_dir=str(request.output_dir),
@@ -147,10 +164,15 @@ def execute_curated_task(request: CuratedTaskRequest) -> dict[str, float]:
             "compression": request.compression,
             "output_row_group_rows": request.output_row_group_rows,
             "writer_queue_capacity_batches": max(
-                1, int(request.writer_queue_capacity_batches)
+                1, int(queue_capacity)
             ),
         },
         batch_size=request.batch_size,
         drop_cache_hint=request.drop_cache_hint,
         print_timing=request.print_timing,
     )
+
+
+def execute_curated_task(request: CuratedTaskRequest) -> dict[str, float]:
+    """Compatibility alias for the shared coordinate materialization API."""
+    return execute_coordinate_materialize(request)

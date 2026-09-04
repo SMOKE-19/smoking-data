@@ -26,6 +26,14 @@ class RemoteGenerationHandle:
     pointer_etag: str | None
 
     @property
+    def manifest_sha256(self) -> str:
+        return str(self.pointer.get("manifest_sha256") or "")
+
+    @property
+    def dataset_id(self) -> str:
+        return str(self.manifest.get("dataset_id") or self.dataset_prefix)
+
+    @property
     def dataset_uri(self) -> str:
         return f"s3://{self.target.bucket}/{self.target.object_key(self.dataset_prefix)}"
 
@@ -465,6 +473,152 @@ def _parquet_data_by_file_id(handle: RemoteGenerationHandle) -> dict[str, dict[s
         ).hexdigest()
         result[file_id] = {**item, "relative_path": relative}
     return result
+
+
+def remote_parquet_objects(handle: RemoteGenerationHandle) -> list[dict[str, Any]]:
+    """Return stable identities for Parquet objects in a pinned generation."""
+    dataset_prefix = str(getattr(handle, "dataset_prefix", "") or "")
+    dataset_id = str(
+        getattr(handle, "dataset_id", "")
+        or handle.manifest.get("dataset_id")
+        or dataset_prefix
+    )
+    manifest_sha256 = str(
+        getattr(handle, "manifest_sha256", "")
+        or getattr(handle, "pointer", {}).get("manifest_sha256")
+        or ""
+    )
+    result = []
+    for file_id, item in _parquet_data_by_file_id(handle).items():
+        result.append(
+            {
+                **item,
+                "source_kind": "s3",
+                "dataset_id": dataset_id,
+                "dataset_prefix": dataset_prefix,
+                "generation_id": handle.generation_id,
+                "manifest_sha256": manifest_sha256,
+                "file_id": file_id,
+                "content_sha256": str(item.get("sha256") or ""),
+            }
+        )
+    return sorted(result, key=lambda item: str(item["relative_path"]))
+
+
+def read_remote_parquet_file_index(
+    handle: RemoteGenerationHandle,
+) -> tuple[pa.Table, dict[str, int]]:
+    """Read the small published file index without fetching Parquet payload objects."""
+    objects = _remote_parquet_index_objects(handle, section="files")
+    tables = [_read_remote_manifest_parquet_object(handle, item) for item in objects]
+    table = pa.concat_tables(tables, promote_options="default") if tables else pa.table({})
+    return table, {
+        "index_objects": len(objects),
+        "index_bytes": sum(int(item.get("size_bytes") or 0) for item in objects),
+        "rows": table.num_rows,
+    }
+
+
+def read_remote_parquet_row_group_index(
+    handle: RemoteGenerationHandle,
+    *,
+    file_ids: set[str] | None = None,
+) -> tuple[pa.Table, dict[str, int]]:
+    """Read published row-group metadata without fetching Parquet payload objects."""
+    objects = _remote_parquet_index_objects(handle, section="row_groups")
+    if not objects:
+        raise SmokingDataError(
+            "Pinned generation has no published Parquet row-group index.",
+            code="remote.row_group_index_unavailable",
+        )
+    tables = [_read_remote_manifest_parquet_object(handle, item) for item in objects]
+    table = pa.concat_tables(tables, promote_options="default")
+    if file_ids is not None:
+        import pyarrow.compute as pc
+
+        accepted = pa.array(sorted(file_ids), type=pa.string())
+        table = table.filter(pc.is_in(table["file_id"], value_set=accepted))
+    required = ["file_id", "row_group_id", "first_row_index", "row_count"]
+    missing = sorted(set(required) - set(table.column_names))
+    if missing:
+        raise SmokingDataError(
+            "Published Parquet row-group index is incomplete.",
+            code="remote.row_group_index_incomplete",
+            context={"columns": missing},
+        )
+    return table.select(required), {
+        "index_objects": len(objects),
+        "index_bytes": sum(int(item.get("size_bytes") or 0) for item in objects),
+        "rows": table.num_rows,
+    }
+
+
+def read_remote_parquet_planning_index(
+    handle: RemoteGenerationHandle,
+    *,
+    required_columns: list[str] | tuple[str, ...],
+    file_ids: set[str] | None = None,
+) -> tuple[pa.Table, dict[str, int]]:
+    """Read published key/planning rows for selector planning.
+
+    This is deliberately strict: a caller may bypass Parquet candidate reads only
+    when every requested selector column is present in the published key index.
+    """
+    sidecar = dict((handle.manifest.get("sidecars") or {}).get("parquet") or {})
+    available = {
+        *[str(value) for value in sidecar.get("key_columns") or []],
+        *[str(value) for value in sidecar.get("planning_columns") or []],
+    }
+    required = list(dict.fromkeys(str(value) for value in required_columns))
+    missing = sorted(set(required) - available)
+    if missing:
+        raise SmokingDataError(
+            "Published Parquet key index does not cover the selector contract.",
+            code="remote.planning_index_columns_missing",
+            context={"columns": missing},
+        )
+    objects = _remote_parquet_index_objects(handle, section="keys")
+    if not objects:
+        raise SmokingDataError(
+            "Pinned generation has no published Parquet planning index.",
+            code="remote.planning_index_unavailable",
+        )
+    tables = [_read_remote_manifest_parquet_object(handle, item) for item in objects]
+    table = pa.concat_tables(tables, promote_options="default")
+    if file_ids is not None:
+        import pyarrow.compute as pc
+
+        accepted = pa.array(sorted(file_ids), type=pa.string())
+        table = table.filter(pc.is_in(table["file_id"], value_set=accepted))
+    projection = [
+        *required,
+        "file_id",
+        "row_group_id",
+        "row_offset_in_group",
+        "source_row_index",
+    ]
+    projection = list(dict.fromkeys(column for column in projection if column in table.column_names))
+    return table.select(projection), {
+        "index_objects": len(objects),
+        "index_bytes": sum(int(item.get("size_bytes") or 0) for item in objects),
+        "rows": table.num_rows,
+    }
+
+
+def _remote_parquet_index_objects(
+    handle: RemoteGenerationHandle, *, section: str
+) -> list[dict[str, Any]]:
+    marker = f"/generations/{handle.generation_id}/indexes/parquet/{section}/"
+    return sorted(
+        [
+            item
+            for item in handle.manifest.get("objects") or []
+            if isinstance(item, dict)
+            and item.get("role") == "parquet_index"
+            and marker in str(item.get("object_key") or "")
+        ],
+        key=lambda item: str(item.get("object_key") or ""),
+    )
 
 
 def _typed_key_hash(

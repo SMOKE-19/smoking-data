@@ -20,6 +20,8 @@ from smoking_data.runtime.transactions import (
     validate_committed_dataset,
 )
 
+_DATASET_BOUNDARY_MARKER = ".smoking-data-dataset-boundary.json"
+
 
 def prepare_combined_sources(
     spec: PipelineSpec,
@@ -104,6 +106,7 @@ def _materialize_combined_source(
                     "size_bytes": item.size_bytes,
                     "modified_ns": item.modified_ns,
                     "source_identity": str(member["source_identity"]),
+                    "dataset_shard_id": str(item.dataset_id or ""),
                 }
             )
         members.append({**dict(member), "files": files})
@@ -149,17 +152,44 @@ def _materialize_combined_source(
     try:
         for member_index, member in enumerate(members):
             identity = str(member["source_identity"])
+            dataset_roots: dict[str, Path] = {}
             for file_index, item in enumerate(member["files"]):
                 frame = pl.read_parquet(item.path).with_columns(
                     pl.lit(identity, dtype=pl.String).alias(column_name)
                 )
-                output = (
+                original_shard_id = str(item.dataset_id or f"flat:{member_index}")
+                dataset_shard_id = _combined_dataset_shard_id(
+                    member_alias=str(member.get("alias") or member_index),
+                    source_identity=identity,
+                    original_shard_id=original_shard_id,
+                )
+                shard_token = dataset_shard_id.rsplit(":", 1)[-1]
+                dataset_root = (
                     transaction.staging_root
                     / f"source={member_index:04d}"
+                    / f"dataset={shard_token}"
+                )
+                dataset_roots.setdefault(dataset_shard_id, dataset_root)
+                output = (
+                    dataset_root
                     / f"data_{file_index:06d}.parquet"
                 )
                 output.parent.mkdir(parents=True, exist_ok=True)
                 frame.write_parquet(output, compression="zstd")
+            for dataset_shard_id, dataset_root in dataset_roots.items():
+                (dataset_root / _DATASET_BOUNDARY_MARKER).write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "smoking-data.dataset-boundary.v1",
+                            "dataset_shard_id": dataset_shard_id,
+                            "upstream_alias": str(member.get("alias") or ""),
+                            "source_identity": identity,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
         metadata = transaction.staging_root / "_smoking_data" / "upstream-union.json"
         metadata.parent.mkdir(parents=True, exist_ok=True)
         metadata.write_text(
@@ -238,3 +268,17 @@ def _profile(
             for member in members
         ],
     }
+
+
+def _combined_dataset_shard_id(
+    *, member_alias: str, source_identity: str, original_shard_id: str
+) -> str:
+    document = {
+        "member_alias": member_alias,
+        "source_identity": source_identity,
+        "original_shard_id": original_shard_id,
+    }
+    digest = hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"combined:{member_alias}:{digest}"

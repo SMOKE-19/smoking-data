@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import time
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -19,8 +20,8 @@ import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
 from smoking_data.backends.rust_engine import (
-    CuratedTaskRequest,
-    execute_curated_task,
+    CoordinateMaterializeRequest,
+    execute_coordinate_materialize,
     validate_dataset_assertions,
 )
 from smoking_data.backends.streaming_sbdf import SbdfExportRequest, export_sbdf_with_result
@@ -54,7 +55,11 @@ from smoking_data.core.tasks import TaskResult, TaskSpec
 from smoking_data.ops.coordinates import (
     ACTIVE_ORDER_COLUMN,
     PART_INDEX_COLUMN,
+    SOURCE_DATASET_ID_COLUMN,
     SOURCE_FILE_COLUMN,
+    SOURCE_FILE_ID_COLUMN,
+    SOURCE_KIND_COLUMN,
+    SOURCE_RELATIVE_PATH_COLUMN,
     SOURCE_ROW_GROUP_COLUMN,
     SOURCE_ROW_INDEX_COLUMN,
     attach_row_group_ids,
@@ -78,6 +83,15 @@ from smoking_data.planners.active_sidecar import (
 from smoking_data.planners.active_sidecar import (
     build_active_sidecar_decision,
     profile_selector_shape,
+)
+from smoking_data.planners.dataset_shard import (
+    CANDIDATE_OCCUPANCY_VERSION,
+    assign_subbucket,
+    build_adaptive_subbucket_plan,
+    build_candidate_occupancy,
+    build_planning_cohorts,
+    canonical_scalar,
+    partition_plan_for_value,
 )
 from smoking_data.planners.phase_memory import build_phase_memory_admission
 from smoking_data.planners.pivot_shape import build_pivot_shape_profile
@@ -110,6 +124,17 @@ from smoking_data.runtime.artifacts import (
     candidate_manifest_path_for,
     candidate_sidecar_root_for,
 )
+from smoking_data.runtime.bounded_writer import BoundedWriterPipeline
+from smoking_data.runtime.cohort_cache import (
+    cohort_partition_cache_key,
+    global_winner_cache_key,
+    load_cohort_partition_cache,
+    load_global_winner_cache,
+    prune_cohort_partition_cache,
+    prune_global_winner_cache,
+    publish_cohort_partition_cache,
+    publish_global_winner_cache,
+)
 from smoking_data.runtime.config import RuntimeConfig
 from smoking_data.runtime.console_progress import worker_console_enabled
 from smoking_data.runtime.intermediate import write_sorted_intermediate
@@ -121,7 +146,13 @@ from smoking_data.runtime.naming import (
     partition_dir_name,
     task_id,
 )
-from smoking_data.runtime.object_store.remote_upstream import materialize_remote_parquet_files
+from smoking_data.runtime.object_store.remote_upstream import (
+    RemoteSelectorContext,
+    materialize_remote_active_payload,
+    materialize_remote_parquet_files,
+    materialize_remote_projected_selector_proxies,
+    materialize_remote_selector_proxies,
+)
 from smoking_data.runtime.output_contract import resolve_physical_writer_output
 from smoking_data.runtime.output_physical_layout import (
     TASK_ADAPTIVE,
@@ -190,7 +221,7 @@ RUST_DIRECT_TYPE_MAP = {
 }
 ESTIMATED_PAYLOAD_BYTES_COLUMN = "__estimated_payload_bytes"
 SPILL_REQUIRED_COLUMN = "__spill_required"
-CANDIDATE_MANIFEST_VERSION = "smoking-data.0201-candidates.v2"
+CANDIDATE_MANIFEST_VERSION = "smoking-data.0201-candidates.v4"
 SOURCE_SNAPSHOT_CHANGED_MARKER = "SOURCE_SNAPSHOT_CHANGED "
 INTERNAL_DISABLE_TASK_TELEMETRY_ENV = "SMOKING_DATA_INTERNAL_DISABLE_TASK_TELEMETRY"
 INTERNAL_DISABLE_ACTIVE_SIDECAR_PLAN_ENV = "SMOKING_DATA_INTERNAL_DISABLE_ACTIVE_SIDECAR_PLAN"
@@ -235,15 +266,109 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         expression_ir=expression_ir,
     )
 
+    partition_column = str(output.get("partition_column") or "").strip()
+    output_dir_raw = output.get("output_dir")
+    if not partition_column:
+        raise ValidationError("output.partition_column is required.")
+    if not output_dir_raw:
+        raise ValidationError("output.output_dir is required.")
+    sort_first = _mapping(
+        row_selection.get("sort_first"), section="row_selection.sort_first", allow_missing=True
+    )
+    sort_first_enabled = bool(sort_first.get("enabled", False))
+    selector_operation_id = str(sort_first.get("operation_id") or "active_row_selection")
+    selector_group_keys = [str(item) for item in (sort_first.get("group_keys") or [])]
+    selector_payload_configured = "payload" in sort_first
+    selector_payload = _mapping(
+        sort_first.get("payload"),
+        section="row_selection.sort_first.payload",
+        allow_missing=True,
+    )
+    selector_payload_expression_ir = _compile_expression_ir(selector_payload.get("add_calc"))
+
     remote = upstream.get("remote")
+    remote_transfer_profile: dict[str, Any] | None = None
+    remote_selector_context: RemoteSelectorContext | None = None
     if isinstance(remote, dict):
-        files = materialize_remote_parquet_files(
-            config.project_root,
-            target_name=str(remote.get("target") or ""),
-            dataset_prefix=str(remote.get("dataset_prefix") or ""),
-            relative_paths=[str(value) for value in remote.get("relative_paths") or []],
-            recursive=bool(remote.get("recursive", True)),
+        effective_selector_payload = selector_payload if selector_payload_configured else payload
+        effective_selector_ir = (
+            selector_payload_expression_ir if selector_payload_configured else expression_ir
         )
+        try:
+            files, remote_selector_context = materialize_remote_selector_proxies(
+                config.project_root,
+                target_name=str(remote.get("target") or ""),
+                dataset_prefix=str(remote.get("dataset_prefix") or ""),
+                required_columns=_remote_selector_source_columns(
+                    payload=effective_selector_payload,
+                    expression_ir=effective_selector_ir,
+                    partition_column=partition_column,
+                    group_keys=selector_group_keys if sort_first_enabled else [partition_column],
+                    sort=list(sort_first.get("sort") or []),
+                    pivot=pivot,
+                ),
+                relative_paths=[str(value) for value in remote.get("relative_paths") or []],
+                recursive=bool(remote.get("recursive", True)),
+            )
+            remote_transfer_profile = remote_selector_context.profile
+        except SmokingDataError as error:
+            if getattr(error, "code", "") not in {
+                "remote.planning_index_unavailable",
+                "remote.planning_index_columns_missing",
+                "remote.planning_index_incomplete",
+            }:
+                raise
+            selective_fallback_reason = getattr(error, "code", type(error).__name__)
+            try:
+                files, remote_selector_context = materialize_remote_projected_selector_proxies(
+                    config.project_root,
+                    target_name=str(remote.get("target") or ""),
+                    dataset_prefix=str(remote.get("dataset_prefix") or ""),
+                    required_columns=_remote_selector_source_columns(
+                        payload=effective_selector_payload,
+                        expression_ir=effective_selector_ir,
+                        partition_column=partition_column,
+                        group_keys=(
+                            selector_group_keys if sort_first_enabled else [partition_column]
+                        ),
+                        sort=list(sort_first.get("sort") or []),
+                        pivot=pivot,
+                    ),
+                    relative_paths=[str(value) for value in remote.get("relative_paths") or []],
+                    recursive=bool(remote.get("recursive", True)),
+                )
+                remote_selector_context.profile["planning_index_fallback_reason"] = (
+                    selective_fallback_reason
+                )
+                remote_transfer_profile = remote_selector_context.profile
+            except SmokingDataError as projected_error:
+                if getattr(projected_error, "code", "") not in {
+                    "remote.range_reader_unavailable",
+                    "remote.row_group_index_unavailable",
+                    "remote.row_group_index_incomplete",
+                    "remote.projected_selector_columns_missing",
+                    "remote.projected_selector_range_read_failed",
+                    "remote.projected_selector_row_mismatch",
+                    "remote.projected_selector_empty",
+                }:
+                    raise
+                projected_fallback_reason = getattr(
+                    projected_error, "code", type(projected_error).__name__
+                )
+                remote_transfer_profile = {
+                    "mode": "content_addressed_whole_object",
+                    "selective_fallback_reason": selective_fallback_reason,
+                    "projected_fallback_reason": projected_fallback_reason,
+                }
+                files = materialize_remote_parquet_files(
+                    config.project_root,
+                    target_name=str(remote.get("target") or ""),
+                    dataset_prefix=str(remote.get("dataset_prefix") or ""),
+                    relative_paths=[str(value) for value in remote.get("relative_paths") or []],
+                    recursive=bool(remote.get("recursive", True)),
+                    transfer_profile=remote_transfer_profile,
+                )
+                remote_transfer_profile["fallback_reason"] = projected_fallback_reason
         source_paths = [str(item.path) for item in files]
         source_recursive = False
     else:
@@ -299,32 +424,22 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         )
     )
     if skipped_result is not None:
+        if remote_transfer_profile is not None:
+            skipped_result.details.setdefault("candidate_sidecar", {})[
+                "s3_selective_fetch"
+            ] = remote_transfer_profile
+            skipped_result.metadata_path = write_metadata(
+                spec=spec,
+                config=config,
+                result=skipped_result.to_dict(),
+            )
         return skipped_result
 
-    partition_column = str(output.get("partition_column") or "").strip()
-    output_dir_raw = output.get("output_dir")
-    if not partition_column:
-        raise ValidationError("output.partition_column is required.")
-    if not output_dir_raw:
-        raise ValidationError("output.output_dir is required.")
     output_dir = resolve_project_path(str(output_dir_raw), project_root=config.project_root)
     recovery_profile = recover_orphan_transactions(output_dir)
     run_started = time.perf_counter()
     phase_profile: dict[str, Any] = {}
 
-    sort_first = _mapping(
-        row_selection.get("sort_first"), section="row_selection.sort_first", allow_missing=True
-    )
-    sort_first_enabled = bool(sort_first.get("enabled", False))
-    selector_operation_id = str(sort_first.get("operation_id") or "active_row_selection")
-    selector_group_keys = [str(item) for item in (sort_first.get("group_keys") or [])]
-    selector_payload_configured = "payload" in sort_first
-    selector_payload = _mapping(
-        sort_first.get("payload"),
-        section="row_selection.sort_first.payload",
-        allow_missing=True,
-    )
-    selector_payload_expression_ir = _compile_expression_ir(selector_payload.get("add_calc"))
     previous_metadata = read_metadata(spec, config=config) or {}
     pipeline_graph = (raw.get("__pipeline") or {}).get("graph") or {}
     canonical_node_keys = sorted(
@@ -553,6 +668,8 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
     }
     sidecar_profile["memory_history"] = sidecar_memory_history
     sidecar_profile["effective_max_projected_bytes_mb"] = sidecar_projected_limit_mb
+    if remote_transfer_profile is not None:
+        sidecar_profile["s3_selective_fetch"] = remote_transfer_profile
     phase_profile["active_row_selection_sec"] = sidecar_profile["phase_elapsed_sec"]
     active_plan = sidecar_profile.get("active_sidecar_plan")
     if isinstance(active_plan, dict):
@@ -572,11 +689,42 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
             )
             for item in active_plan["coordinate_tasks"]
         ]
+        if remote_selector_context is not None:
+            remote_payload_files = []
+            for task in coordinate_tasks:
+                coordinates = read_sidecar_frame(Path(str(task.payload["coordinate_path"])))
+                remapped, materialized_files = materialize_remote_active_payload(
+                    remote_selector_context,
+                    coordinates,
+                    output_root=(
+                        artifact_root_for(spec, config=config)
+                        / "remote-active-payload"
+                        / task.task_id
+                    ),
+                    source_file_column=SOURCE_FILE_COLUMN,
+                    source_row_group_column=SOURCE_ROW_GROUP_COLUMN,
+                    source_row_index_column=SOURCE_ROW_INDEX_COLUMN,
+                )
+                write_ipc_frame_atomic(remapped, Path(str(task.payload["coordinate_path"])))
+                write_rust_coordinate_file(
+                    remapped, Path(str(task.payload["rust_coordinate_path"]))
+                )
+                remote_payload_files.extend(materialized_files)
+            files = remote_payload_files
         phase_profile["pivot_shape_profile_sec"] = 0.0
         phase_profile["coordinate_snapshot_write_sec"] = float(
             active_plan.get("worker", {}).get("elapsed_sec") or 0.0
         )
     else:
+        if remote_selector_context is not None:
+            active_snapshot, files = materialize_remote_active_payload(
+                remote_selector_context,
+                active_snapshot,
+                output_root=artifact_root_for(spec, config=config) / "remote-active-payload",
+                source_file_column=SOURCE_FILE_COLUMN,
+                source_row_group_column=SOURCE_ROW_GROUP_COLUMN,
+                source_row_index_column=SOURCE_ROW_INDEX_COLUMN,
+            )
         pivot_shape_started = time.perf_counter()
         pivot_shape_profile = build_pivot_shape_profile(active_snapshot, pivot)
         phase_profile["pivot_shape_profile_sec"] = time.perf_counter() - pivot_shape_started
@@ -598,6 +746,12 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
         )
         phase_profile["coordinate_snapshot_write_sec"] = (
             time.perf_counter() - selector_started - phase_profile["active_row_selection_sec"]
+        )
+    if remote_selector_context is not None:
+        remote_selector_context.profile["estimated_bytes_avoided"] = max(
+            0,
+            int(remote_selector_context.profile.get("estimated_bytes_avoided") or 0)
+            - int(remote_selector_context.profile.get("bytes_fetched") or 0),
         )
     page_range_plans: dict[str, dict[str, Any]] = {}
     if probe_profile is not None:
@@ -2165,6 +2319,39 @@ def _remap_transaction_task_outputs(
     return remapped
 
 
+class _SnapshotParquetWriterSession:
+    def __init__(
+        self,
+        *,
+        temporary: Path,
+        output_path: Path,
+        schema: pa.Schema,
+        compression: str,
+        row_group_rows: int,
+    ) -> None:
+        self.temporary = temporary
+        self.output_path = output_path
+        self.row_group_rows = max(1, row_group_rows)
+        self.writer = pq.ParquetWriter(
+            temporary,
+            schema,
+            compression=None if compression == "uncompressed" else compression,
+        )
+
+    def write(self, table: pa.Table) -> None:
+        self.writer.write_table(table, row_group_size=self.row_group_rows)
+
+    def finish(self) -> None:
+        self.writer.close()
+        os.replace(self.temporary, self.output_path)
+
+    def abort(self) -> None:
+        try:
+            self.writer.close()
+        finally:
+            self.temporary.unlink(missing_ok=True)
+
+
 def _compact_staged_snapshot_to_single_file(
     staging_root: Path,
     *,
@@ -2183,14 +2370,19 @@ def _compact_staged_snapshot_to_single_file(
         schema = pa.unify_schemas(schemas)
     temporary = staging_root / ".snapshot.parquet.tmp"
     output_path = staging_root / "snapshot.parquet"
-    writer: pq.ParquetWriter | None = None
     rows = 0
+    pipeline = BoundedWriterPipeline[pa.Table, None](
+        lambda: _SnapshotParquetWriterSession(
+            temporary=temporary,
+            output_path=output_path,
+            schema=schema,
+            compression=compression,
+            row_group_rows=row_group_rows,
+        ),
+        capacity_batches=2,
+        thread_name="smoking-0401-snapshot-writer",
+    )
     try:
-        writer = pq.ParquetWriter(
-            temporary,
-            schema,
-            compression=None if compression == "uncompressed" else compression,
-        )
         for source_path in source_paths:
             parquet = pq.ParquetFile(source_path)
             for batch in parquet.iter_batches(batch_size=max(1, row_group_rows)):
@@ -2207,11 +2399,9 @@ def _compact_staged_snapshot_to_single_file(
                         else pc.cast(column, target_type=field.type, safe=True)
                     )
                 aligned = pa.Table.from_arrays(arrays, schema=schema)
-                writer.write_table(aligned, row_group_size=max(1, row_group_rows))
+                pipeline.submit(aligned, rows=aligned.num_rows)
                 rows += aligned.num_rows
-        writer.close()
-        writer = None
-        os.replace(temporary, output_path)
+        writer_result = pipeline.finish()
         for source_path in source_paths:
             source_path.unlink()
         for directory in sorted(
@@ -2224,9 +2414,7 @@ def _compact_staged_snapshot_to_single_file(
             except OSError:
                 pass
     except BaseException:
-        if writer is not None:
-            writer.close()
-        temporary.unlink(missing_ok=True)
+        pipeline.abort()
         raise
     return {
         "mode": "streaming_parquet_single_file",
@@ -2236,6 +2424,7 @@ def _compact_staged_snapshot_to_single_file(
         "relative_path": output_path.relative_to(staging_root).as_posix(),
         "row_group_rows": max(1, row_group_rows),
         "schema_unified_by_name": True,
+        "writer_pipeline": writer_result.profile.to_dict(),
     }
 
 
@@ -2527,6 +2716,10 @@ def _build_active_coordinate_snapshot(
         SOURCE_FILE_COLUMN,
         SOURCE_ROW_INDEX_COLUMN,
         SOURCE_ROW_GROUP_COLUMN,
+        SOURCE_KIND_COLUMN,
+        SOURCE_DATASET_ID_COLUMN,
+        SOURCE_FILE_ID_COLUMN,
+        SOURCE_RELATIVE_PATH_COLUMN,
         ACTIVE_ORDER_COLUMN,
         PART_INDEX_COLUMN,
         ESTIMATED_PAYLOAD_BYTES_COLUMN,
@@ -2542,6 +2735,7 @@ def _build_active_coordinate_snapshot(
         logical_plan_hash=logical_plan_hash,
         reference_fingerprint=reference_fingerprint,
         selector_columns=selector_columns,
+        partition_column=partition_column,
         selection_group_keys=selection_group_keys,
         sort=sort,
         local_winner_enabled=sort_first_enabled,
@@ -2557,6 +2751,7 @@ def _build_active_coordinate_snapshot(
         telemetry_endpoint=telemetry_endpoint,
         calibrate_workers=calibrate_workers,
     )
+    source_entries = dict(sidecar_profile.pop("_source_entries", {}))
     sidecar_profile["parent_memory_boundaries"] = [_parent_memory_boundary("candidate_ready")]
     if not candidate_paths:
         raise ValidationError("0201 coordinate sidecar has no source files.")
@@ -2593,6 +2788,30 @@ def _build_active_coordinate_snapshot(
         impacted_keys = (
             pl.concat(impacted_frames, how="diagonal_relaxed").select(selection_group_keys).unique()
         )
+        impacted_partition_keys = {
+            str(canonical_scalar(value, dtype=str(impacted_keys.schema[partition_column]))["key"])
+            for value in impacted_keys.get_column(partition_column).unique().to_list()
+        }
+        impacted_subbuckets = _count_impacted_subbuckets(
+            impacted_keys,
+            source_entries=source_entries,
+            partition_column=partition_column,
+            selection_group_keys=selection_group_keys,
+            target_rows=rows_per_part,
+            target_bytes=candidate_target_bytes,
+        )
+        incremental_candidate_paths = _candidate_paths_for_partition_keys(
+            candidate_paths,
+            source_entries=source_entries,
+            partition_keys=impacted_partition_keys,
+        )
+        incremental_candidate_frames, record_batch_scope = (
+            _candidate_frames_for_partition_keys(
+                incremental_candidate_paths,
+                source_entries=source_entries,
+                partition_keys=impacted_partition_keys,
+            )
+        )
         previous_base = previous_active.drop(
             [ACTIVE_ORDER_COLUMN, PART_INDEX_COLUMN, SPILL_REQUIRED_COLUMN],
             strict=False,
@@ -2603,9 +2822,7 @@ def _build_active_coordinate_snapshot(
             how="anti",
             nulls_equal=True,
         )
-        candidate_lf = pl.concat(
-            [scan_sidecar(path) for path in candidate_paths], how="diagonal_relaxed"
-        )
+        candidate_lf = pl.concat(incremental_candidate_frames, how="diagonal_relaxed")
         selected_sidecar_lf = candidate_lf.join(
             impacted_keys.lazy(),
             on=selection_group_keys,
@@ -2614,11 +2831,41 @@ def _build_active_coordinate_snapshot(
         )
         sidecar_profile["active_recompute_mode"] = "impacted_groups"
         sidecar_profile["impacted_groups"] = impacted_keys.height
+        sidecar_profile["incremental_scope"] = {
+            "source_files": {
+                "added_or_changed": int(sidecar_profile.get("rebuilt_source_files") or 0),
+                "deleted": int(sidecar_profile.get("deleted_source_files") or 0),
+                "unchanged": int(sidecar_profile.get("reused_source_files") or 0),
+            },
+            "impacted_groups": impacted_keys.height,
+            "impacted_partitions": len(impacted_partition_keys),
+            "impacted_subbuckets": impacted_subbuckets,
+            "physical_candidate_files_scanned": len(incremental_candidate_paths),
+            "physical_candidate_files_avoided": len(candidate_paths)
+            - len(incremental_candidate_paths),
+            **record_batch_scope,
+            "fallback_reason": None,
+        }
     else:
         unaffected = None
         selected_sidecar_lf = None
         sidecar_profile["active_recompute_mode"] = "full"
         sidecar_profile["impacted_groups"] = None
+        sidecar_profile["incremental_scope"] = {
+            "source_files": {
+                "added_or_changed": int(sidecar_profile.get("rebuilt_source_files") or 0),
+                "deleted": int(sidecar_profile.get("deleted_source_files") or 0),
+                "unchanged": int(sidecar_profile.get("reused_source_files") or 0),
+            },
+            "impacted_groups": None,
+            "impacted_partitions": None,
+            "impacted_subbuckets": None,
+            "physical_candidate_files_scanned": len(candidate_paths),
+            "physical_candidate_files_avoided": 0,
+            "physical_candidate_record_batches_scanned": None,
+            "physical_candidate_record_batches_avoided": None,
+            "fallback_reason": sidecar_profile.get("incremental_fallback_reason"),
+        }
     candidate_bytes = sum(path.stat().st_size for path in candidate_paths)
     spill_profile: dict[str, Any] | None = None
     active_from_spill: pl.DataFrame | None = None
@@ -2703,18 +2950,23 @@ def _build_active_coordinate_snapshot(
     ):
         del impacted_frames
         gc.collect()
-        active_piece_result, bucket_profile = _select_active_rows_in_buckets(
+        active_piece_result, bucket_profile = _select_active_rows_in_dataset_shards(
             candidate_paths,
-            root=candidate_root / "_selector_buckets",
+            source_entries=source_entries,
+            root=candidate_root / "_selector_cohorts",
             partition_column=partition_column,
             selection_group_keys=selection_group_keys,
             sort=sort,
+            rows_per_part=rows_per_part,
+            candidate_target_bytes=candidate_target_bytes,
             memory_budget_mb=memory_budget_mb,
-            bucketize_workers=bucketize_workers,
+            max_source_files=sidecar_max_source_files,
+            max_source_row_groups=max_source_row_groups_per_task,
+            writer_workers=bucketize_workers,
             active_selection_workers=active_selection_workers,
             telemetry_endpoint=telemetry_endpoint,
             return_piece_paths=True,
-            candidate_rows_hint=int(sidecar_profile["candidate_rows"]),
+            allow_small_input_bypass=False,
         )
         if not isinstance(active_piece_result, list):
             raise TaskExecutionError("0201 selector did not return an active piece dataset.")
@@ -2751,23 +3003,29 @@ def _build_active_coordinate_snapshot(
             spill_profile.get("avg_rows_per_selector_group", 0.0)
         )
         sidecar_profile["intermediate_spill"] = spill_profile
+        sidecar_profile["dataset_shard_routing"] = spill_profile
         sidecar_profile["parent_memory_boundaries"].append(
             _parent_memory_boundary("active_sidecar_plan_ready")
         )
         return None, sidecar_profile
     elif sort_first_enabled and unaffected is None:
-        active_from_spill, bucket_profile = _select_active_rows_in_buckets(
+        active_from_spill, bucket_profile = _select_active_rows_in_dataset_shards(
             candidate_paths,
-            root=candidate_root / "_selector_buckets",
+            source_entries=source_entries,
+            root=candidate_root / "_selector_cohorts",
             partition_column=partition_column,
             selection_group_keys=selection_group_keys,
             sort=sort,
+            rows_per_part=rows_per_part,
+            candidate_target_bytes=candidate_target_bytes,
             memory_budget_mb=memory_budget_mb,
-            bucketize_workers=bucketize_workers,
+            max_source_files=sidecar_max_source_files,
+            max_source_row_groups=max_source_row_groups_per_task,
+            writer_workers=bucketize_workers,
             active_selection_workers=active_selection_workers,
             telemetry_endpoint=telemetry_endpoint,
             return_piece_paths=False,
-            candidate_rows_hint=int(sidecar_profile["candidate_rows"]),
+            allow_small_input_bypass=True,
         )
         if not isinstance(active_from_spill, pl.DataFrame):
             raise TaskExecutionError("0201 benchmark selector did not return active rows.")
@@ -2816,6 +3074,10 @@ def _build_active_coordinate_snapshot(
         sidecar = selected_sidecar_lf.collect(engine="streaming")
         group_sizes = sidecar.group_by(selection_group_keys).len()
     sidecar_profile["intermediate_spill"] = spill_profile
+    if isinstance(spill_profile, dict) and spill_profile.get("mode") == (
+        "dataset_shard_adaptive_radix"
+    ):
+        sidecar_profile["dataset_shard_routing"] = spill_profile
     sidecar_profile["selector_key_cardinality"] = (
         int(spill_profile.get("selector_key_cardinality", 0))
         if group_sizes is None and spill_profile is not None
@@ -3057,6 +3319,68 @@ def _candidate_projected_source_columns(
     return tuple(sorted(column for column in required if column in available))
 
 
+def _remote_selector_source_columns(
+    *,
+    payload: dict[str, Any],
+    expression_ir: dict[str, Any] | None,
+    partition_column: str,
+    group_keys: list[str],
+    sort: list[dict[str, Any]],
+    pivot: dict[str, Any],
+) -> list[str]:
+    generated = {
+        str(item.get("name") or "")
+        for item in payload.get("add_calc") or []
+        if isinstance(item, dict)
+    }
+    required = {
+        partition_column,
+        *group_keys,
+        *[str(item.get("column") or "") for item in sort],
+        *[column for keys in _expression_ir_window_partitions(expression_ir) for column in keys],
+        *[str(item) for item in pivot.get("row_keys") or []],
+        *[str(item) for item in pivot.get("column_keys") or []],
+        *[
+            str(item.get("source_column") or "")
+            for item in [
+                *(pivot.get("value_keys") or []),
+                *(pivot.get("value_keys_without_column") or []),
+            ]
+            if isinstance(item, dict)
+        ],
+        *[
+            str(item.get("name") or item.get("column") or "")
+            for item in payload.get("type_casts") or []
+            if isinstance(item, dict)
+        ],
+    }
+    expressions: list[str] = []
+    filter_sql = str(payload.get("filter_sql") or "").strip()
+    if filter_sql:
+        expressions.append(filter_sql)
+    if payload.get("add_calc"):
+        from spotfire_expr_normalizer import normalize_expression
+
+        for index, item in enumerate(payload.get("add_calc") or []):
+            if not isinstance(item, dict):
+                continue
+            dialect, expression = resolve_add_calc_expression(item, index=index)
+            expressions.append(
+                normalize_expression(expression) if dialect == "spotfire_expression" else expression
+            )
+    for expression in expressions:
+        required.update(pl.sql_expr(expression).meta.root_names())
+    reference_configs = payload.get("reference_replace") or []
+    if isinstance(reference_configs, dict):
+        reference_configs = [reference_configs]
+    required.update(
+        str(item.get("source_column") or "")
+        for item in reference_configs
+        if isinstance(item, dict) and bool(item.get("enabled", True))
+    )
+    return sorted(column for column in required if column and column not in generated)
+
+
 def _refresh_candidate_sidecars(
     files,
     *,
@@ -3066,6 +3390,7 @@ def _refresh_candidate_sidecars(
     logical_plan_hash: str,
     reference_fingerprint: str,
     selector_columns: list[str],
+    partition_column: str,
     selection_group_keys: list[str],
     sort: list[dict[str, Any]],
     local_winner_enabled: bool,
@@ -3088,11 +3413,15 @@ def _refresh_candidate_sidecars(
         "logical_plan_hash": logical_plan_hash,
         "reference_fingerprint": reference_fingerprint,
         "selector_columns": selector_columns,
+        "partition_column": partition_column,
         "selection_group_keys": selection_group_keys,
         "sort": sort,
         "storage": "arrow_ipc_file",
         "local_winner_enabled": local_winner_enabled,
     }
+    selector_contract_hash = hashlib.sha256(
+        json.dumps(expected_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     full_rebuild = any(previous.get(key) != value for key, value in expected_contract.items())
     if full_rebuild:
         reset_path(candidate_root)
@@ -3101,15 +3430,17 @@ def _refresh_candidate_sidecars(
     else:
         previous_sources = previous.get("sources") or {}
 
-    current_paths = {str(Path(item.path).resolve()) for item in files}
-    deleted_paths = sorted(set(previous_sources) - current_paths)
+    current_source_ids = {_dataset_file_identity(item) for item in files}
+    deleted_source_ids = sorted(set(previous_sources) - current_source_ids)
     impacted_frames: list[pl.DataFrame] = []
-    for source_path in deleted_paths:
-        entry = previous_sources.get(source_path) or {}
+    for source_id in deleted_source_ids:
+        entry = previous_sources.get(source_id) or {}
         candidate_path = Path(str(entry.get("candidate_path") or ""))
+        occupancy_path = Path(str(entry.get("occupancy_path") or ""))
         if candidate_path.is_file():
             impacted_frames.append(read_sidecar_frame(candidate_path).select(selection_group_keys))
             reset_path(candidate_path)
+        reset_path(occupancy_path)
 
     source_entries: dict[str, Any] = {}
     candidate_paths: list[Path] = []
@@ -3122,19 +3453,30 @@ def _refresh_candidate_sidecars(
     )
     source_states: list[dict[str, Any]] = []
     reused = 0
-    for source_file in files:
+    for source_sequence, source_file in enumerate(files):
         source_path = Path(source_file.path)
         resolved_path = str(source_path.resolve())
+        source_id = _dataset_file_identity(source_file)
         fingerprint = file_fingerprint(source_file)
         candidate_path = (
-            candidate_root / f"{hashlib.sha256(resolved_path.encode('utf-8')).hexdigest()}.arrow"
+            candidate_root / f"{hashlib.sha256(source_id.encode('utf-8')).hexdigest()}.arrow"
         )
-        old_entry = previous_sources.get(resolved_path) or {}
+        occupancy_path = candidate_path.with_suffix(".occupancy.json")
+        old_entry = previous_sources.get(source_id) or {}
         can_reuse = (
             not full_rebuild
             and old_entry.get("fingerprint") == fingerprint
             and Path(str(old_entry.get("candidate_path") or "")) == candidate_path
             and ipc_file_is_valid(candidate_path)
+            and Path(str(old_entry.get("occupancy_path") or "")) == occupancy_path
+            and _candidate_occupancy_is_valid(
+                occupancy_path,
+                partition_column=partition_column,
+                group_keys=selection_group_keys,
+                source_fingerprint=fingerprint,
+                logical_plan_hash=logical_plan_hash,
+                selector_contract_hash=selector_contract_hash,
+            )
         )
         if can_reuse:
             rows = int(old_entry.get("rows") or 0)
@@ -3156,11 +3498,23 @@ def _refresh_candidate_sidecars(
             )
             pending_tasks.append(
                 TaskSpec(
-                    task_id=f"candidate-{hashlib.sha256(resolved_path.encode()).hexdigest()[:16]}",
+                    task_id=f"candidate-{hashlib.sha256(source_id.encode()).hexdigest()[:16]}",
                     payload={
                         "source_path": str(source_path),
+                        "source_kind": str(getattr(source_file, "source_kind", "local")),
+                        "source_dataset_id": str(source_file.dataset_id or ""),
+                        "source_file_id": str(source_file.file_id or source_id),
+                        "source_relative_path": str(
+                            source_file.relative_path
+                            or source_path_relative_to(
+                                source_path,
+                                Path(source_file.dataset_root or source_path.parent),
+                            )
+                        ),
                         "candidate_path": str(candidate_path),
+                        "occupancy_path": str(occupancy_path),
                         "selector_columns": selector_columns,
+                        "partition_column": partition_column,
                         "selection_group_keys": selection_group_keys,
                         "sort": sort,
                         "local_winner_enabled": local_winner_enabled,
@@ -3169,6 +3523,10 @@ def _refresh_candidate_sidecars(
                         "project_root": str(project_root),
                         "average_payload_bytes": average_payload_bytes,
                         "projected_source_bytes": projected_bytes,
+                        "source_sequence": source_sequence,
+                        "source_fingerprint": fingerprint,
+                        "logical_plan_hash": logical_plan_hash,
+                        "selector_contract_hash": selector_contract_hash,
                         "__telemetry_phase_name": "build_sidecar.01_candidate",
                         "__telemetry_phase_only": True,
                     },
@@ -3179,8 +3537,22 @@ def _refresh_candidate_sidecars(
         source_states.append(
             {
                 "resolved_path": resolved_path,
+                "source_id": source_id,
+                "relative_path": str(
+                    source_file.relative_path
+                    or source_path_relative_to(
+                        source_path, Path(source_file.dataset_root or source_path.parent)
+                    )
+                ),
                 "fingerprint": fingerprint,
                 "candidate_path": candidate_path,
+                "occupancy_path": occupancy_path,
+                "dataset_root": Path(source_file.dataset_root or source_path.parent),
+                "dataset_shard_id": str(
+                    source_file.dataset_id
+                    or f"path:{hashlib.sha256(str(source_path.parent).encode()).hexdigest()[:16]}"
+                ),
+                "source_sequence": source_sequence,
                 "rows": rows,
                 "source_rows": source_rows,
                 "rebuilt": not can_reuse,
@@ -3334,6 +3706,7 @@ def _refresh_candidate_sidecars(
     for state in source_states:
         resolved_path = str(state["resolved_path"])
         candidate_path = Path(state["candidate_path"])
+        occupancy_path = Path(state["occupancy_path"])
         rows = state["rows"]
         source_rows = state["source_rows"]
         if state["rebuilt"]:
@@ -3342,15 +3715,23 @@ def _refresh_candidate_sidecars(
             impacted_frames.append(read_sidecar_frame(candidate_path).select(selection_group_keys))
         candidate_paths.append(candidate_path)
         candidate_schema = sidecar_schema(candidate_path)
-        schema_by_source[resolved_path] = {
+        schema_by_source[str(state["source_id"])] = {
             name: str(dtype) for name, dtype in candidate_schema.items()
         }
-        source_entries[resolved_path] = {
+        source_entries[str(state["source_id"])] = {
             "fingerprint": state["fingerprint"],
+            "logical_plan_hash": logical_plan_hash,
+            "selector_contract_hash": selector_contract_hash,
             "candidate_path": str(candidate_path),
+            "occupancy_path": str(occupancy_path),
+            "dataset_root": str(state["dataset_root"]),
+            "dataset_shard_id": state["dataset_shard_id"],
+            "relative_path": str(state["relative_path"]),
             "rows": rows,
             "source_rows": source_rows,
             "size_bytes": candidate_path.stat().st_size,
+            "row_groups": len(parquet_profiles[resolved_path].row_groups),
+            "source_sequence": int(state["source_sequence"]),
         }
 
     schema_hash = hashlib.sha256(
@@ -3370,7 +3751,7 @@ def _refresh_candidate_sidecars(
         "full_rebuild": full_rebuild,
         "rebuilt_source_files": len(pending_tasks),
         "reused_source_files": reused,
-        "deleted_source_files": len(deleted_paths),
+        "deleted_source_files": len(deleted_source_ids),
         "candidate_files": len(source_entries),
         "candidate_rows": sum(int(item["rows"]) for item in source_entries.values()),
         "source_candidate_rows": sum(
@@ -3381,6 +3762,30 @@ def _refresh_candidate_sidecars(
             for item in source_entries.values()
         ),
         "candidate_bytes": sum(int(item["size_bytes"]) for item in source_entries.values()),
+        "dataset_shards": len(
+            {str(item["dataset_shard_id"]) for item in source_entries.values()}
+        ),
+        "rebuilt_dataset_shards": len(
+            {
+                str(state["dataset_shard_id"])
+                for state in source_states
+                if bool(state["rebuilt"])
+            }
+        ),
+        "reused_dataset_shards": len(
+            {
+                str(state["dataset_shard_id"])
+                for state in source_states
+                if not bool(state["rebuilt"])
+            }
+        ),
+        "deleted_dataset_shards": len(
+            {
+                str((previous_sources.get(source_id) or {}).get("dataset_shard_id") or "unknown")
+                for source_id in deleted_source_ids
+            }
+        ),
+        "_source_entries": source_entries,
         "candidate_task_processes": len(
             {
                 result.pid
@@ -3417,6 +3822,14 @@ def _refresh_candidate_sidecars(
         },
     }
     return candidate_paths, impacted_frames, profile
+
+
+def _dataset_file_identity(file: Any) -> str:
+    file_id = str(getattr(file, "file_id", "") or "")
+    dataset_id = str(getattr(file, "dataset_id", "") or "")
+    if file_id:
+        return f"{getattr(file, 'source_kind', 'local')}:{dataset_id}:{file_id}"
+    return str(Path(file.path).resolve())
 
 
 def _select_active_rows_in_buckets(
@@ -3632,6 +4045,1303 @@ def _select_active_rows_in_buckets(
             default=0.0,
         ),
     }
+
+
+def _candidate_paths_for_partition_keys(
+    candidate_paths: list[Path],
+    *,
+    source_entries: dict[str, dict[str, Any]],
+    partition_keys: set[str],
+) -> list[Path]:
+    if not partition_keys:
+        return list(candidate_paths)
+    accepted: set[Path] = set()
+    for entry in source_entries.values():
+        candidate_path = Path(str(entry.get("candidate_path") or "")).resolve()
+        occupancy_path = Path(str(entry.get("occupancy_path") or ""))
+        if not occupancy_path.is_file():
+            accepted.add(candidate_path)
+            continue
+        try:
+            occupancy = json.loads(occupancy_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            accepted.add(candidate_path)
+            continue
+        occupied = {
+            str(item.get("partition", {}).get("key") or "")
+            for item in occupancy.get("partitions") or []
+            if isinstance(item, dict)
+        }
+        if occupied.intersection(partition_keys):
+            accepted.add(candidate_path)
+    selected = [path for path in candidate_paths if path.resolve() in accepted]
+    # Missing or stale occupancy must never turn into a false-negative selection.
+    return selected or list(candidate_paths)
+
+
+def _candidate_frames_for_partition_keys(
+    candidate_paths: list[Path],
+    *,
+    source_entries: dict[str, dict[str, Any]],
+    partition_keys: set[str],
+) -> tuple[list[pl.LazyFrame], dict[str, int]]:
+    occupancy_by_candidate = {
+        str(Path(str(entry.get("candidate_path") or "")).resolve()): Path(
+            str(entry.get("occupancy_path") or "")
+        )
+        for entry in source_entries.values()
+    }
+    frames: list[pl.LazyFrame] = []
+    total_batches = 0
+    scanned_batches = 0
+    for path in candidate_paths:
+        occupancy_path = occupancy_by_candidate.get(str(path.resolve()))
+        if path.suffix != ".arrow" or occupancy_path is None or not occupancy_path.is_file():
+            frames.append(scan_sidecar(path))
+            continue
+        try:
+            occupancy = json.loads(occupancy_path.read_text(encoding="utf-8"))
+            batches = list(occupancy.get("record_batches") or [])
+            if not batches or any("partition_keys" not in item for item in batches):
+                frames.append(scan_sidecar(path))
+                continue
+            selected_indices = [
+                int(item["index"])
+                for item in batches
+                if partition_keys.intersection(str(value) for value in item["partition_keys"])
+            ]
+            total_batches += len(batches)
+            scanned_batches += len(selected_indices)
+            if selected_indices:
+                frames.append(read_ipc_frame(path, batch_indices=selected_indices).lazy())
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, pa.ArrowException):
+            frames.append(scan_sidecar(path))
+    if not frames:
+        frames = [scan_sidecar(path) for path in candidate_paths]
+        return frames, {
+            "physical_candidate_record_batches_scanned": total_batches,
+            "physical_candidate_record_batches_avoided": 0,
+        }
+    return frames, {
+        "physical_candidate_record_batches_scanned": scanned_batches,
+        "physical_candidate_record_batches_avoided": max(0, total_batches - scanned_batches),
+    }
+
+
+def _count_impacted_subbuckets(
+    impacted_keys: pl.DataFrame,
+    *,
+    source_entries: dict[str, dict[str, Any]],
+    partition_column: str,
+    selection_group_keys: list[str],
+    target_rows: int,
+    target_bytes: int,
+) -> int | None:
+    try:
+        occupancies = [
+            json.loads(Path(str(entry["occupancy_path"])).read_text(encoding="utf-8"))
+            for entry in source_entries.values()
+        ]
+        plan = build_adaptive_subbucket_plan(
+            occupancies,
+            partition_column=partition_column,
+            group_keys=selection_group_keys,
+            target_rows=max(1, int(target_rows)),
+            target_bytes=max(1, int(target_bytes)),
+        )
+        routed: list[pl.DataFrame] = []
+        dtype = str(impacted_keys.schema[partition_column])
+        for raw_partition, frame in impacted_keys.partition_by(
+            partition_column, as_dict=True, maintain_order=False
+        ).items():
+            partition_value = (
+                raw_partition[0] if isinstance(raw_partition, tuple) else raw_partition
+            )
+            partition_plan = partition_plan_for_value(plan, partition_value, dtype=dtype)
+            routed.append(
+                frame.select(partition_column).with_columns(
+                    assign_subbucket(
+                        frame,
+                        partition_plan=partition_plan,
+                        group_keys=selection_group_keys,
+                    )
+                )
+            )
+        if not routed:
+            return 0
+        return pl.concat(routed).select([partition_column, "__subbucket"]).unique().height
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _select_active_rows_in_dataset_shards(
+    candidate_paths: list[Path],
+    *,
+    source_entries: dict[str, dict[str, Any]],
+    root: Path,
+    partition_column: str,
+    selection_group_keys: list[str],
+    sort: list[dict[str, Any]],
+    rows_per_part: int,
+    candidate_target_bytes: int,
+    memory_budget_mb: int,
+    max_source_files: int,
+    max_source_row_groups: int,
+    writer_workers: int,
+    active_selection_workers: int,
+    telemetry_endpoint: dict[str, Any] | None = None,
+    return_piece_paths: bool = False,
+    allow_small_input_bypass: bool = False,
+) -> tuple[pl.DataFrame | list[Path], dict[str, Any]]:
+    """Route dynamic dataset cohorts to partition IPC, then run local/global winners."""
+    candidate_set = {str(path.resolve()) for path in candidate_paths}
+    sources = [
+        {
+            "path": source_path,
+            **entry,
+        }
+        for source_path, entry in source_entries.items()
+        if str(Path(str(entry["candidate_path"])).resolve()) in candidate_set
+    ]
+    total_rows = sum(int(source.get("rows") or 0) for source in sources)
+    total_bytes = sum(int(source.get("size_bytes") or 0) for source in sources)
+    small_input_bypass = bool(
+        allow_small_input_bypass
+        and total_bytes <= max(1, int(memory_budget_mb)) * 1024 * 1024 // 4
+    )
+    if small_input_bypass:
+        selected, profile = _select_active_rows_in_buckets(
+            candidate_paths,
+            root=root,
+            partition_column=partition_column,
+            selection_group_keys=selection_group_keys,
+            sort=sort,
+            memory_budget_mb=memory_budget_mb,
+            bucketize_workers=1,
+            active_selection_workers=active_selection_workers,
+            telemetry_endpoint=telemetry_endpoint,
+            return_piece_paths=return_piece_paths,
+            candidate_rows_hint=total_rows,
+        )
+        return selected, {
+            **profile,
+            "mode": "small_input_single_ipc_bypass",
+            "bypass_reason": "candidate_bytes_within_single_ipc_memory_contract",
+            "dataset_shards": len(
+                {str(source["dataset_shard_id"]) for source in sources}
+            ),
+            "dataset_slices": len(sources),
+            "planning_cohorts": 1,
+            "candidate_bytes": total_bytes,
+        }
+    previous_cohort_plan: dict[str, Any] | None = None
+    previous_cohort_plan_path = root / "cohort-plan.json"
+    if previous_cohort_plan_path.is_file():
+        try:
+            loaded_previous_plan = json.loads(
+                previous_cohort_plan_path.read_text(encoding="utf-8")
+            )
+            if isinstance(loaded_previous_plan, dict):
+                previous_cohort_plan = loaded_previous_plan
+        except (OSError, json.JSONDecodeError):
+            previous_cohort_plan = None
+    cohort_target_rows = max(
+        SELECTOR_TARGET_ROWS_PER_BUCKET,
+        max(1, int(rows_per_part)) * 4,
+    )
+    cohort_target_bytes = max(8 * 1024 * 1024, int(candidate_target_bytes))
+    cohort_plan = build_planning_cohorts(
+        sources,
+        target_rows=cohort_target_rows,
+        target_bytes=cohort_target_bytes,
+        max_files=max(1, int(max_source_files)),
+        max_row_groups=max(1, int(max_source_row_groups)),
+        previous_plan=previous_cohort_plan,
+    )
+    occupancies = [
+        json.loads(Path(str(source["occupancy_path"])).read_text(encoding="utf-8"))
+        for source in sources
+    ]
+    subbucket_plan = build_adaptive_subbucket_plan(
+        occupancies,
+        partition_column=partition_column,
+        group_keys=selection_group_keys,
+        target_rows=max(1, int(rows_per_part)),
+        target_bytes=max(1, int(candidate_target_bytes)),
+    )
+    cohort_cache_root = root.parent / "_cohort-local-cache"
+    cohort_cache_index_path = cohort_cache_root / "index.json"
+    try:
+        previous_cache_index = json.loads(cohort_cache_index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous_cache_index = {}
+    previous_cache_keys = dict(previous_cache_index.get("routes") or {})
+    cache_hits: dict[tuple[str, str], tuple[Path, dict[str, Any]]] = {}
+    cache_keys: dict[tuple[str, str], str] = {}
+    missing_partitions_by_cohort: dict[str, set[str]] = defaultdict(set)
+    for cohort in cohort_plan["cohorts"]:
+        cohort_id = str(cohort["cohort_id"])
+        partition_keys: set[str] = set()
+        for occupancy_path in cohort.get("occupancy_paths") or []:
+            occupancy = json.loads(Path(str(occupancy_path)).read_text(encoding="utf-8"))
+            partition_keys.update(
+                str(item["partition"]["key"])
+                for item in occupancy.get("partitions") or []
+            )
+        for partition_key in sorted(partition_keys):
+            cache_key = cohort_partition_cache_key(
+                cohort,
+                partition_key=partition_key,
+                selection_group_keys=selection_group_keys,
+                sort=sort,
+            )
+            route_key = (cohort_id, partition_key)
+            cache_keys[route_key] = cache_key
+            cached = load_cohort_partition_cache(cohort_cache_root, cache_key)
+            if cached is None:
+                missing_partitions_by_cohort[cohort_id].add(partition_key)
+            else:
+                cache_hits[route_key] = cached
+    current_cache_keys = {
+        f"{cohort_id}\0{partition_key}": cache_key
+        for (cohort_id, partition_key), cache_key in cache_keys.items()
+    }
+    invalidated_cache_routes = sum(
+        1
+        for route, cache_key in current_cache_keys.items()
+        if previous_cache_keys.get(route) not in {None, cache_key}
+    )
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_planned",
+        task_id=None,
+        details={
+            "phase_name": "build_sidecar.02_cohort_plan",
+            "total": 1,
+            "unit": "plan",
+        },
+    )
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_progress",
+        task_id=None,
+        details={
+            "phase_name": "build_sidecar.02_cohort_plan",
+            "completed": 1,
+            "total": 1,
+            "unit": "plan",
+        },
+    )
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_planned",
+        task_id=None,
+        details={
+            "phase_name": "build_sidecar.03_subbucket_plan",
+            "total": 1,
+            "unit": "plan",
+        },
+    )
+    emit_task_telemetry_event(
+        telemetry_endpoint,
+        "phase_progress",
+        task_id=None,
+        details={
+            "phase_name": "build_sidecar.03_subbucket_plan",
+            "completed": 1,
+            "total": 1,
+            "unit": "plan",
+        },
+    )
+    staging = root.parent / f".{root.name}.{os.getpid()}.tmp"
+    backup = root.parent / f".{root.name}.{os.getpid()}.backup"
+    reset_path(staging)
+    reset_path(backup)
+    ensure_dir(staging)
+    generation_id = f"cohort-route-{time.time_ns()}"
+    writer_profile: dict[str, Any] = {}
+    local_profile: dict[str, Any] = {}
+    global_profile: dict[str, Any] = {}
+    try:
+        _atomic_write_json(staging / "cohort-plan.json", cohort_plan)
+        _atomic_write_json(staging / "subbucket-plan.json", subbucket_plan)
+        writer_tasks = [
+            TaskSpec(
+                task_id=f"cohort-writer-{index:06d}",
+                part_index=index,
+                payload={
+                    "cohort": cohort,
+                    "cohort_root": str(staging / "cohorts" / str(cohort["cohort_id"])),
+                    "partition_column": partition_column,
+                    "segment_target_bytes": max(8 * 1024 * 1024, candidate_target_bytes),
+                    "max_open_writers": max(2, min(32, max_source_files)),
+                    "generation_id": generation_id,
+                    "required_partition_keys": sorted(
+                        missing_partitions_by_cohort[str(cohort["cohort_id"])]
+                    ),
+                    "__telemetry_phase_name": "build_sidecar.04_partition_ipc",
+                    "__telemetry_phase_only": True,
+                },
+            )
+            for index, cohort in enumerate(cohort_plan["cohorts"])
+            if missing_partitions_by_cohort.get(str(cohort["cohort_id"]))
+        ]
+        if writer_tasks:
+            writer_results, writer_profile = run_tasks_in_subprocesses(
+                writer_tasks,
+                worker=_cohort_partition_ipc_writer_worker,
+                workers=max(1, min(int(writer_workers), len(writer_tasks))),
+                max_tasks_per_child=max(
+                    1, math.ceil(len(writer_tasks) / max(1, int(writer_workers)))
+                ),
+                return_profile=True,
+                telemetry_endpoint=telemetry_endpoint,
+            )
+        else:
+            writer_results, writer_profile = [], {"skipped": True, "reason": "all_cache_hits"}
+        _raise_selector_failures(writer_results, phase="cohort partition IPC writer")
+        cohort_manifests = [
+            json.loads(result.output_paths[0].read_text(encoding="utf-8"))
+            for result in writer_results
+        ]
+
+        local_routes: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for manifest in cohort_manifests:
+            cohort_root = staging / "cohorts" / str(manifest["cohort_id"])
+            for route in manifest.get("routes") or []:
+                route_key = (
+                    str(manifest["cohort_id"]),
+                    str(route["partition_key"]),
+                )
+                local_routes[route_key].append(
+                    {
+                        "path": str(cohort_root / str(route["segment_path"])),
+                        "batch_indices": [int(item) for item in route["record_batch_indices"]],
+                    }
+                )
+        local_tasks = []
+        for index, ((cohort_id, partition_key), routes) in enumerate(sorted(local_routes.items())):
+            local_tasks.append(
+                TaskSpec(
+                    task_id=f"cohort-local-{index:06d}",
+                    partition_value=partition_key,
+                    part_index=index,
+                    payload={
+                        "routes": routes,
+                        "output_path": str(
+                            staging
+                            / "local-active"
+                            / cohort_id
+                            / f"partition-{_safe_route_id(partition_key, 'all')}.arrow"
+                        ),
+                        "manifest_path": str(
+                            staging
+                            / "local-active"
+                            / cohort_id
+                            / f"partition-{_safe_route_id(partition_key, 'all')}.json"
+                        ),
+                        "selection_group_keys": selection_group_keys,
+                        "sort": sort,
+                        "memory_budget_bytes": memory_budget_mb * 1024 * 1024,
+                        "partition_plan": dict(
+                            (subbucket_plan.get("partitions") or {})[partition_key]
+                        ),
+                        "partition_key": partition_key,
+                        "cohort_id": cohort_id,
+                        "__telemetry_phase_name": "build_sidecar.05_cohort_local_selection",
+                        "__telemetry_phase_only": True,
+                    },
+                )
+            )
+        if local_tasks:
+            local_results, local_profile = run_tasks_in_subprocesses(
+                local_tasks,
+                worker=_cohort_local_selector_worker,
+                workers=max(1, min(int(active_selection_workers), len(local_tasks))),
+                max_tasks_per_child=max(
+                    1, math.ceil(len(local_tasks) / max(1, int(active_selection_workers)))
+                ),
+                return_profile=True,
+                telemetry_endpoint=telemetry_endpoint,
+            )
+        else:
+            local_results, local_profile = [], {"skipped": True, "reason": "all_cache_hits"}
+        _raise_selector_failures(local_results, phase="cohort local winner")
+
+        global_routes: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        local_cache_entries: dict[tuple[str, str], tuple[Path, dict[str, Any]]] = {}
+        cache_route_rebuilds = 0
+        for (cohort_id, partition_key), (cached_path, cached_manifest) in cache_hits.items():
+            partition_plan = dict((subbucket_plan.get("partitions") or {})[partition_key])
+            current_plan_hash = hashlib.sha256(
+                json.dumps(
+                    partition_plan,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if cached_manifest.get("partition_plan_hash") == current_plan_hash:
+                local_cache_entries[(cohort_id, partition_key)] = (
+                    cached_path,
+                    cached_manifest,
+                )
+                continue
+            cache_route_rebuilds += 1
+            local_cache_entries[(cohort_id, partition_key)] = _reroute_cached_local_winner(
+                cached_path,
+                output_path=(
+                    staging
+                    / "local-routes"
+                    / cohort_id
+                    / f"partition-{_safe_route_id(partition_key, 'reroute')}.arrow"
+                ),
+                manifest_path=(
+                    staging
+                    / "local-routes"
+                    / cohort_id
+                    / f"partition-{_safe_route_id(partition_key, 'reroute')}.json"
+                ),
+                partition_plan=partition_plan,
+                group_keys=selection_group_keys,
+                cohort_id=cohort_id,
+                partition_key=partition_key,
+            )
+        for result in local_results:
+            manifest = json.loads(result.output_paths[0].read_text(encoding="utf-8"))
+            local_ipc_path = result.output_paths[0].parent / str(manifest["ipc_path"])
+            route_key = (str(manifest["cohort_id"]), str(manifest["partition_key"]))
+            local_cache_entries[route_key] = publish_cohort_partition_cache(
+                cohort_cache_root,
+                cache_keys[route_key],
+                ipc_path=local_ipc_path,
+                local_manifest=manifest,
+            )
+        for (_cohort_id, _partition_key), (local_ipc_path, manifest) in sorted(
+            local_cache_entries.items()
+        ):
+            for route in manifest.get("routes") or []:
+                global_routes[(str(manifest["partition_key"]), str(route["subbucket"]))].append(
+                    {
+                        "path": str(local_ipc_path),
+                        "local_cache_key": cache_keys[(_cohort_id, _partition_key)],
+                        "batch_indices": [int(item) for item in route["record_batch_indices"]],
+                        "estimated_rows": int(route.get("rows") or 0),
+                    }
+                )
+        global_bundles = _bundle_global_selector_routes(
+            global_routes,
+            target_rows=max(1, int(rows_per_part)),
+        )
+        global_cache_root = root.parent / "_global-winner-cache"
+        global_tasks: list[TaskSpec] = []
+        global_cache_keys: dict[str, str] = {}
+        global_cache_hits = 0
+        global_cache_rows_reused = 0
+        planned_global_relative_paths: list[Path] = []
+        for index, (partition_key, bundle_id, routes) in enumerate(global_bundles):
+            cache_key = global_winner_cache_key(
+                partition_key=partition_key,
+                bundle_id=bundle_id,
+                selection_group_keys=selection_group_keys,
+                sort=sort,
+                routes=routes,
+            )
+            output_path = (
+                staging
+                / "active"
+                / f"winner-{_safe_route_id(partition_key, bundle_id)}.arrow"
+            )
+            planned_global_relative_paths.append(output_path.relative_to(staging))
+            cached = load_global_winner_cache(global_cache_root, cache_key)
+            if cached is not None:
+                ensure_dir(output_path.parent)
+                try:
+                    os.link(cached[0], output_path)
+                except OSError:
+                    shutil.copy2(cached[0], output_path)
+                global_cache_hits += 1
+                global_cache_rows_reused += int(cached[1].get("rows") or 0)
+                continue
+            task = TaskSpec(
+                task_id=f"global-winner-{index:06d}",
+                partition_value=partition_key,
+                part_index=index,
+                payload={
+                    "routes": routes,
+                    "output_path": str(output_path),
+                    "selection_group_keys": selection_group_keys,
+                    "sort": sort,
+                    "memory_budget_bytes": memory_budget_mb * 1024 * 1024,
+                    "partition_key": partition_key,
+                    "subbucket": bundle_id,
+                    "cohort_id": None,
+                    "global_cache_key": cache_key,
+                    "__telemetry_phase_name": "build_sidecar.06_global_selection",
+                    "__telemetry_phase_only": True,
+                },
+            )
+            global_cache_keys[task.task_id] = cache_key
+            global_tasks.append(task)
+        if global_tasks:
+            global_results, global_profile = run_tasks_in_subprocesses(
+                global_tasks,
+                worker=_active_selector_route_worker,
+                workers=max(1, min(int(active_selection_workers), len(global_tasks))),
+                max_tasks_per_child=max(
+                    1, math.ceil(len(global_tasks) / max(1, int(active_selection_workers)))
+                ),
+                return_profile=True,
+                telemetry_endpoint=telemetry_endpoint,
+            )
+        else:
+            global_results, global_profile = [], {
+                "skipped": True,
+                "reason": "all_global_cache_hits",
+            }
+        _raise_selector_failures(global_results, phase="global winner")
+        for result in global_results:
+            publish_global_winner_cache(
+                global_cache_root,
+                global_cache_keys[result.task_id],
+                ipc_path=result.output_paths[0],
+                metadata={
+                    "partition_key": result.partition_value,
+                    "part_index": result.part_index,
+                    "rows": int(result.counters.get("selector_groups") or 0),
+                },
+            )
+        active_relative_paths = planned_global_relative_paths
+        if not active_relative_paths:
+            empty_active_path = staging / "active" / "empty.arrow"
+            write_ipc_frame_atomic(read_sidecar_frame(candidate_paths[0]).head(0), empty_active_path)
+            active_relative_paths = [empty_active_path.relative_to(staging)]
+        _atomic_write_json(
+            staging / "active-route-manifest.json",
+            {
+                "schema_version": "smoking-data.0201-cohort-active-routes.v1",
+                "cohort_plan": "cohort-plan.json",
+                "subbucket_plan": "subbucket-plan.json",
+                "active_pieces": [path.as_posix() for path in active_relative_paths],
+            },
+        )
+        ensure_dir(cohort_cache_root)
+        _atomic_write_json(
+            cohort_cache_index_path,
+            {
+                "schema_version": "smoking-data.0201-cohort-cache-index.v1",
+                "routes": current_cache_keys,
+            },
+        )
+        cache_entries_pruned = prune_cohort_partition_cache(
+            cohort_cache_root,
+            protected_keys=set(current_cache_keys.values()),
+        )
+        global_cache_entries_pruned = prune_global_winner_cache(
+            global_cache_root,
+            protected_keys={
+                global_winner_cache_key(
+                    partition_key=partition_key,
+                    bundle_id=bundle_id,
+                    selection_group_keys=selection_group_keys,
+                    sort=sort,
+                    routes=routes,
+                )
+                for partition_key, bundle_id, routes in global_bundles
+            },
+        )
+        moved_existing = False
+        if root.exists():
+            os.replace(root, backup)
+            moved_existing = True
+        try:
+            os.replace(staging, root)
+        except BaseException:
+            if moved_existing and backup.exists() and not root.exists():
+                os.replace(backup, root)
+            raise
+        reset_path(backup)
+    except BaseException:
+        reset_path(staging)
+        raise
+
+    active_paths = [root / path for path in active_relative_paths]
+    if return_piece_paths:
+        selected: pl.DataFrame | list[Path] = active_paths
+    elif active_paths:
+        selected = pl.concat([scan_sidecar(path) for path in active_paths], how="diagonal_relaxed").collect(
+            engine="streaming"
+        )
+    else:
+        selected = read_sidecar_frame(candidate_paths[0]).head(0)
+    writer_counters = _sum_task_counters(writer_results)
+    local_counters = _sum_task_counters(local_results)
+    global_counters = _sum_task_counters(global_results)
+    segment_sizes = [
+        int(segment.get("bytes") or 0)
+        for manifest in cohort_manifests
+        for segment in manifest.get("segments") or []
+    ]
+    subbucket_methods: dict[str, int] = defaultdict(int)
+    estimated_subbucket_leaves = 0
+    for plan in (subbucket_plan.get("partitions") or {}).values():
+        subbucket_methods[str(plan.get("method") or "unknown")] += 1
+        estimated_subbucket_leaves += int(plan.get("estimated_leaves") or 1)
+    return selected, {
+        "mode": "dataset_shard_adaptive_radix",
+        "execution_mode": "dynamic_cohort_partition_ipc_local_global_winner",
+        "cohort_plan_path": str(root / "cohort-plan.json"),
+        "subbucket_plan_path": str(root / "subbucket-plan.json"),
+        "dataset_shards": int(cohort_plan["dataset_shards"]),
+        "dataset_slices": int(cohort_plan["dataset_slices"]),
+        "planning_cohorts": int(cohort_plan["planning_cohorts"]),
+        "split_dataset_shards": int(cohort_plan["split_dataset_shards"]),
+        "merged_small_dataset_shards": int(cohort_plan["merged_small_dataset_shards"]),
+        "oversized_source_files": int(cohort_plan["oversized_source_files"]),
+        "reused_cohort_memberships": int(cohort_plan["reused_cohort_memberships"]),
+        "partition_ipc_segments": int(writer_counters.get("segments", 0)),
+        "partition_count": len(subbucket_plan.get("partitions") or {}),
+        "subbucket_methods": dict(sorted(subbucket_methods.items())),
+        "estimated_subbucket_leaves": estimated_subbucket_leaves,
+        "route_record_batches": int(writer_counters.get("record_batches", 0)),
+        "segment_bytes": {
+            "total": sum(segment_sizes),
+            "min": min(segment_sizes, default=0),
+            "max": max(segment_sizes, default=0),
+            "avg": sum(segment_sizes) / len(segment_sizes) if segment_sizes else 0.0,
+        },
+        "writer_open_count": int(writer_counters.get("writer_open_count", 0)),
+        "writer_close_count": int(writer_counters.get("writer_close_count", 0)),
+        "writer_rollover_count": int(writer_counters.get("writer_rollover_count", 0)),
+        "max_open_writers": max(
+            (int(result.counters.get("max_open_writers", 0)) for result in writer_results),
+            default=0,
+        ),
+        "cohort_local_input_rows": int(local_counters.get("selector_input_rows", 0)),
+        "cohort_local_winner_rows": (
+            int(local_counters.get("selector_groups", 0))
+            + sum(int(manifest.get("rows") or 0) for _, manifest in cache_hits.values())
+        ),
+        "cohort_local_reuse": {
+            "hits": len(cache_hits),
+            "misses": len(cache_keys) - len(cache_hits),
+            "invalidated": invalidated_cache_routes,
+            "rows_reused": sum(
+                int(manifest.get("rows") or 0) for _, manifest in cache_hits.values()
+            ),
+            "rows_rebuilt": int(local_counters.get("selector_groups", 0)),
+            "bytes_reused": sum(path.stat().st_size for path, _ in cache_hits.values()),
+            "bytes_rebuilt": sum(
+                path.stat().st_size
+                for result in local_results
+                for path in result.output_paths
+                if path.suffix == ".arrow" and path.is_file()
+            ),
+            "invalidation_reasons": (
+                ["source_or_selector_contract_changed"] if invalidated_cache_routes else []
+            ),
+            "route_indexes_rebuilt": cache_route_rebuilds,
+            "entries_pruned": cache_entries_pruned,
+        },
+        "global_input_rows": int(global_counters.get("selector_input_rows", 0)),
+        "global_winner_reuse": {
+            "hits": global_cache_hits,
+            "misses": len(global_tasks),
+            "rows_reused": global_cache_rows_reused,
+            "entries_pruned": global_cache_entries_pruned,
+        },
+        "selector_key_cardinality": (
+            int(global_counters.get("selector_groups", 0)) + global_cache_rows_reused
+        ),
+        "max_rows_per_selector_group": max(
+            (int(result.counters.get("max_rows_per_selector_group", 0)) for result in global_results),
+            default=0,
+        ),
+        "avg_rows_per_selector_group": (
+            float(global_counters.get("selector_input_rows", 0))
+            / max(1, int(global_counters.get("selector_groups", 0)))
+        ),
+        "writer_runner": writer_profile,
+        "writer_pids": sorted({result.pid for result in writer_results if result.pid > 0}),
+        "local_selector_runner": local_profile,
+        "selector_runner": global_profile,
+        "selector_pids": sorted({result.pid for result in [*local_results, *global_results] if result.pid > 0}),
+        "phase_contract": {
+            "candidate": "build_sidecar.01_candidate",
+            "cohort_plan": "build_sidecar.02_cohort_plan",
+            "subbucket_plan": "build_sidecar.03_subbucket_plan",
+            "partition_ipc": "build_sidecar.04_partition_ipc",
+            "cohort_local_selection": "build_sidecar.05_cohort_local_selection",
+            "global_selection": "build_sidecar.06_global_selection",
+        },
+        "parent_memory_boundaries": [_parent_memory_boundary("dataset_shard_selector_finished")],
+    }
+
+
+def _cohort_partition_ipc_writer_worker(task: TaskSpec) -> TaskResult:
+    payload = task.payload
+    cohort = dict(payload["cohort"])
+    cohort_root = Path(str(payload["cohort_root"]))
+    partition_column = str(payload["partition_column"])
+    segment_target_bytes = max(1, int(payload["segment_target_bytes"]))
+    max_open_writers = max(1, int(payload["max_open_writers"]))
+    generation_id = str(payload["generation_id"])
+    required_partition_keys = {
+        str(value) for value in payload.get("required_partition_keys") or []
+    }
+    candidate_paths = [Path(str(item)) for item in cohort["candidate_paths"]]
+    occupancy_paths = [Path(str(item)) for item in cohort["occupancy_paths"]]
+    cohort_root.mkdir(parents=True, exist_ok=True)
+    partition_positions: dict[str, list[int]] = defaultdict(list)
+    for index, occupancy_path in enumerate(occupancy_paths):
+        occupancy = json.loads(occupancy_path.read_text(encoding="utf-8"))
+        for item in occupancy.get("partitions") or []:
+            partition_positions[str(item["partition"]["key"])].append(index)
+    open_states: dict[str, dict[str, Any]] = {}
+    segment_indices: dict[str, int] = defaultdict(int)
+    segment_routes: dict[tuple[str, str], list[int]] = defaultdict(list)
+    completed_segments: list[dict[str, Any]] = []
+    writer_open_count = 0
+    writer_close_count = 0
+    writer_rollover_count = 0
+    peak_open = 0
+    total_rows = 0
+    total_batches = 0
+
+    def next_use(partition_key: str, current_index: int) -> int:
+        return next(
+            (value for value in partition_positions.get(partition_key, []) if value > current_index),
+            len(candidate_paths) + 1,
+        )
+
+    def close_state(partition_key: str) -> None:
+        nonlocal writer_close_count
+        state = open_states.pop(partition_key, None)
+        if state is None:
+            return
+        state["writer"].close()
+        state["sink"].close()
+        with open_ipc_file(state["path"]) as reader:
+            if reader.num_record_batches != state["record_batches"]:
+                raise TaskExecutionError("0201 cohort IPC footer does not match route index.")
+        physical_bytes = state["path"].stat().st_size
+        completed_segments.append(
+            {
+                "partition": state["partition"],
+                "partition_key": partition_key,
+                "segment_path": state["path"].relative_to(cohort_root).as_posix(),
+                "rows": state["rows"],
+                "estimated_bytes": state["bytes"],
+                "bytes": physical_bytes,
+                "record_batches": state["record_batches"],
+                "schema_hash": state["schema_hash"],
+                "generation_id": generation_id,
+            }
+        )
+        writer_close_count += 1
+
+    def open_state(partition: dict[str, Any], schema: pa.Schema, current_index: int) -> dict[str, Any]:
+        nonlocal writer_open_count, peak_open
+        partition_key = str(partition["key"])
+        if partition_key in open_states:
+            return open_states[partition_key]
+        if len(open_states) >= max_open_writers:
+            victim = max(open_states, key=lambda key: next_use(key, current_index))
+            close_state(victim)
+        segment_index = segment_indices[partition_key]
+        segment_indices[partition_key] += 1
+        output_path = (
+            cohort_root
+            / "partitions"
+            / partition_key
+            / f"segment-{segment_index:05d}.arrow"
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sink = pa.OSFile(str(output_path), "wb")
+        writer = pa_ipc.new_file(sink, schema)
+        state = {
+            "partition": partition,
+            "path": output_path,
+            "sink": sink,
+            "writer": writer,
+            "rows": 0,
+            "bytes": 0,
+            "record_batches": 0,
+            "schema_hash": hashlib.sha256(str(schema).encode("utf-8")).hexdigest(),
+        }
+        open_states[partition_key] = state
+        writer_open_count += 1
+        peak_open = max(peak_open, len(open_states))
+        return state
+
+    try:
+        for source_index, candidate_path in enumerate(candidate_paths):
+            for batch in _iter_sidecar_record_batches(candidate_path):
+                frame = pl.from_arrow(batch)
+                if frame.is_empty():
+                    continue
+                dtype = str(frame.schema[partition_column])
+                for raw_partition, partition_frame in frame.partition_by(
+                    partition_column, as_dict=True, maintain_order=False
+                ).items():
+                    partition_value = (
+                        raw_partition[0] if isinstance(raw_partition, tuple) else raw_partition
+                    )
+                    partition = canonical_scalar(partition_value, dtype=dtype)
+                    if (
+                        required_partition_keys
+                        and str(partition["key"]) not in required_partition_keys
+                    ):
+                        continue
+                    output = partition_frame.to_arrow()
+                    for output_batch in output.to_batches(max_chunksize=65_536):
+                        partition_key = str(partition["key"])
+                        state = open_state(partition, output_batch.schema, source_index)
+                        if (
+                            state["bytes"]
+                            and state["bytes"] + output_batch.nbytes > segment_target_bytes
+                        ):
+                            close_state(partition_key)
+                            writer_rollover_count += 1
+                            state = open_state(partition, output_batch.schema, source_index)
+                        batch_index = int(state["record_batches"])
+                        state["writer"].write_batch(output_batch)
+                        state["rows"] += output_batch.num_rows
+                        state["bytes"] += output_batch.nbytes
+                        state["record_batches"] += 1
+                        segment_routes[(partition_key, str(state["path"]))].append(batch_index)
+                        total_rows += output_batch.num_rows
+                        total_batches += 1
+            for partition_key, positions in partition_positions.items():
+                if positions and positions[-1] == source_index:
+                    close_state(partition_key)
+    finally:
+        for partition_key in list(open_states):
+            close_state(partition_key)
+
+    routes = [
+        {
+            "partition_key": partition_key,
+            "segment_path": Path(segment_path).relative_to(cohort_root).as_posix(),
+            "record_batch_indices": indices,
+        }
+        for (partition_key, segment_path), indices in sorted(segment_routes.items())
+    ]
+    manifest_path = cohort_root / "partition-manifest.json"
+    _atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": "smoking-data.0201-cohort-partition-ipc.v1",
+            "generation_id": generation_id,
+            "cohort_id": cohort["cohort_id"],
+            "slices": [
+                {
+                    "slice_id": item["slice_id"],
+                    "dataset_shard_id": item["dataset_shard_id"],
+                    "source_paths": [str(source["path"]) for source in item["sources"]],
+                }
+                for item in cohort["slices"]
+            ],
+            "segments": completed_segments,
+            "routes": routes,
+        },
+    )
+    return TaskResult(
+        task_id=task.task_id,
+        ok=True,
+        pid=os.getpid(),
+        output_paths=[manifest_path],
+        counters={
+            "segments": len(completed_segments),
+            "record_batches": total_batches,
+            "candidate_rows": total_rows,
+            "writer_open_count": writer_open_count,
+            "writer_close_count": writer_close_count,
+            "writer_rollover_count": writer_rollover_count,
+            "max_open_writers": peak_open,
+        },
+    )
+
+
+def _cohort_local_selector_worker(task: TaskSpec) -> TaskResult:
+    payload = task.payload
+    routes = list(payload.get("routes") or [])
+    output_path = Path(str(payload["output_path"]))
+    manifest_path = Path(str(payload["manifest_path"]))
+    group_keys = [str(item) for item in payload["selection_group_keys"]]
+    sort = list(payload.get("sort") or [])
+    partition_plan = dict(payload["partition_plan"])
+    memory_budget_bytes = max(1, int(payload["memory_budget_bytes"]))
+    if not routes:
+        raise ValidationError("0201 cohort local selector has no IPC route.")
+
+    batch_routes: dict[str, set[int]] = defaultdict(set)
+    for route in routes:
+        source_path = str(route["path"])
+        for batch_index in route.get("batch_indices") or []:
+            batch_routes[source_path].add(int(batch_index))
+
+    pending_frames: list[pl.DataFrame] = []
+    pending_bytes = 0
+    active_partition: pl.DataFrame | None = None
+    selector_input_rows = 0
+    max_rows_per_group = 0
+    scanned_segments = 0
+    scanned_record_batches = 0
+    for source_path, batch_indices in sorted(batch_routes.items()):
+        scanned_segments += 1
+        with open_ipc_file(Path(source_path)) as reader:
+            for batch_index in sorted(batch_indices):
+                frame = pl.from_arrow(reader.get_batch(batch_index))
+                selector_input_rows += frame.height
+                scanned_record_batches += 1
+                pending_frames.append(frame)
+                pending_bytes += max(1, int(frame.estimated_size()))
+                if pending_bytes >= memory_budget_bytes // 2:
+                    active_partition, group_size = _reduce_selector_rows(
+                        active_partition,
+                        pl.concat(pending_frames, how="diagonal_relaxed"),
+                        group_keys=group_keys,
+                        sort=sort,
+                    )
+                    max_rows_per_group = max(max_rows_per_group, group_size)
+                    pending_frames = []
+                    pending_bytes = 0
+
+    if pending_frames:
+        active_partition, group_size = _reduce_selector_rows(
+            active_partition,
+            pl.concat(pending_frames, how="diagonal_relaxed"),
+            group_keys=group_keys,
+            sort=sort,
+        )
+        max_rows_per_group = max(max_rows_per_group, group_size)
+    if active_partition is None:
+        raise ValidationError("0201 cohort local selector resolved no IPC frame.")
+    routed_active = active_partition.with_columns(
+        assign_subbucket(
+            active_partition,
+            partition_plan=partition_plan,
+            group_keys=group_keys,
+        )
+    )
+    active_by_subbucket = {
+        str(raw_subbucket[0] if isinstance(raw_subbucket, tuple) else raw_subbucket): frame.drop(
+            "__subbucket"
+        )
+        for raw_subbucket, frame in routed_active.partition_by(
+            "__subbucket", as_dict=True, maintain_order=False
+        ).items()
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+    route_entries = []
+    batch_index = 0
+    schema: pa.Schema | None = None
+    try:
+        for frame in active_by_subbucket.values():
+            current_schema = frame.to_arrow().schema
+            schema = current_schema if schema is None else schema
+            if not current_schema.equals(schema, check_metadata=False):
+                raise ValidationError("0201 cohort local winner schemas differ by subbucket.")
+        if schema is None:
+            raise ValidationError("0201 cohort local selector has no output schema.")
+        with pa.OSFile(str(temporary), "wb") as sink:
+            with pa_ipc.new_file(sink, schema) as writer:
+                for subbucket, frame in sorted(active_by_subbucket.items()):
+                    indices = []
+                    for batch in frame.to_arrow().to_batches(max_chunksize=65_536):
+                        writer.write_batch(batch)
+                        indices.append(batch_index)
+                        batch_index += 1
+                    route_entries.append(
+                        {
+                            "subbucket": subbucket,
+                            "record_batch_indices": indices,
+                            "rows": frame.height,
+                            "estimated_bytes": max(1, int(frame.estimated_size())),
+                        }
+                    )
+        with open_ipc_file(temporary) as reader:
+            if reader.num_record_batches != batch_index:
+                raise TaskExecutionError(
+                    "0201 cohort local IPC footer does not match route index."
+                )
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    _atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": "smoking-data.0201-cohort-local-active.v1",
+            "cohort_id": str(payload["cohort_id"]),
+            "partition_key": str(payload["partition_key"]),
+            "ipc_path": output_path.name,
+            "schema_hash": hashlib.sha256(str(schema).encode("utf-8")).hexdigest(),
+            "partition_plan_hash": hashlib.sha256(
+                json.dumps(
+                    partition_plan,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "rows": active_partition.height,
+            "routes": route_entries,
+        },
+    )
+    return TaskResult(
+        task_id=task.task_id,
+        ok=True,
+        pid=os.getpid(),
+        partition_value=task.partition_value,
+        part_index=task.part_index,
+        output_paths=[manifest_path, output_path],
+        counters={
+            "selector_input_rows": selector_input_rows,
+            "selector_groups": sum(frame.height for frame in active_by_subbucket.values()),
+            "max_rows_per_selector_group": max_rows_per_group,
+            "scanned_segments": scanned_segments,
+            "record_batches": scanned_record_batches,
+            "subbuckets": len(active_by_subbucket),
+        },
+    )
+
+
+def _active_selector_route_worker(task: TaskSpec) -> TaskResult:
+    payload = task.payload
+    routes = list(payload.get("routes") or [])
+    output_path = Path(str(payload["output_path"]))
+    group_keys = [str(item) for item in payload["selection_group_keys"]]
+    sort = list(payload.get("sort") or [])
+    if not routes:
+        raise ValidationError("0201 active selector route has no IPC input.")
+    active: pl.DataFrame | None = None
+    selector_input_rows = 0
+    max_rows_per_group = 0
+    merge_rounds = 0
+    for route in routes:
+        frame = read_ipc_frame(
+            Path(str(route["path"])),
+            batch_indices=(
+                None
+                if route.get("batch_indices") is None
+                else [int(item) for item in route["batch_indices"]]
+            ),
+        )
+        selector_input_rows += frame.height
+        active, group_size = _reduce_selector_rows(
+            active,
+            frame,
+            group_keys=group_keys,
+            sort=sort,
+        )
+        max_rows_per_group = max(max_rows_per_group, group_size)
+        merge_rounds += 1
+    if active is None:
+        raise ValidationError("0201 active selector route resolved no IPC frame.")
+    write_ipc_frame_atomic(active, output_path)
+    return TaskResult(
+        task_id=task.task_id,
+        ok=True,
+        pid=os.getpid(),
+        partition_value=task.partition_value,
+        part_index=task.part_index,
+        output_paths=[output_path],
+        counters={
+            "selector_input_rows": selector_input_rows,
+            "selector_groups": active.height,
+            "max_rows_per_selector_group": max_rows_per_group,
+            "merge_rounds": merge_rounds,
+            "partition_key": str(payload["partition_key"]),
+            "subbucket": str(payload["subbucket"]),
+            "cohort_id": payload.get("cohort_id"),
+        },
+    )
+
+
+def _reroute_cached_local_winner(
+    source_path: Path,
+    *,
+    output_path: Path,
+    manifest_path: Path,
+    partition_plan: dict[str, Any],
+    group_keys: list[str],
+    cohort_id: str,
+    partition_key: str,
+) -> tuple[Path, dict[str, Any]]:
+    active = read_ipc_frame(source_path)
+    routed = active.with_columns(
+        assign_subbucket(active, partition_plan=partition_plan, group_keys=group_keys)
+    )
+    by_subbucket = {
+        str(raw[0] if isinstance(raw, tuple) else raw): frame.drop("__subbucket")
+        for raw, frame in routed.partition_by(
+            "__subbucket", as_dict=True, maintain_order=False
+        ).items()
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+    schema = active.to_arrow().schema
+    route_entries = []
+    batch_index = 0
+    try:
+        with pa.OSFile(str(temporary), "wb") as sink:
+            with pa_ipc.new_file(sink, schema) as writer:
+                for subbucket, frame in sorted(by_subbucket.items()):
+                    indices = []
+                    for batch in frame.to_arrow().to_batches(max_chunksize=65_536):
+                        writer.write_batch(batch)
+                        indices.append(batch_index)
+                        batch_index += 1
+                    route_entries.append(
+                        {
+                            "subbucket": subbucket,
+                            "record_batch_indices": indices,
+                            "rows": frame.height,
+                            "estimated_bytes": max(1, int(frame.estimated_size())),
+                        }
+                    )
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    manifest = {
+        "schema_version": "smoking-data.0201-cohort-local-route.v1",
+        "cohort_id": cohort_id,
+        "partition_key": partition_key,
+        "ipc_path": output_path.name,
+        "schema_hash": hashlib.sha256(str(schema).encode("utf-8")).hexdigest(),
+        "partition_plan_hash": hashlib.sha256(
+            json.dumps(
+                partition_plan,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "rows": active.height,
+        "routes": route_entries,
+    }
+    _atomic_write_json(manifest_path, manifest)
+    return output_path, manifest
+
+
+def _reduce_selector_rows(
+    active: pl.DataFrame | None,
+    frame: pl.DataFrame,
+    *,
+    group_keys: list[str],
+    sort: list[dict[str, Any]],
+) -> tuple[pl.DataFrame, int]:
+    if active is not None:
+        frame = pl.concat([active, frame], how="diagonal_relaxed")
+    sort_columns = [str(item.get("column") or "") for item in sort]
+    descending = [str(item.get("direction") or "asc").lower() == "desc" for item in sort]
+    nulls_last = [str(item.get("nulls") or "last").lower() == "last" for item in sort]
+    selected = (
+        frame.sort(
+            [
+                *sort_columns,
+                SOURCE_FILE_COLUMN,
+                SOURCE_ROW_GROUP_COLUMN,
+                SOURCE_ROW_INDEX_COLUMN,
+            ],
+            descending=[*descending, False, False, False],
+            nulls_last=[*nulls_last, False, False, False],
+        )
+        .group_by(group_keys, maintain_order=True)
+        .agg(
+            pl.all().first(),
+            pl.len().alias("__smoking_data_selector_group_size"),
+        )
+    )
+    group_sizes = selected.get_column("__smoking_data_selector_group_size")
+    return selected.drop("__smoking_data_selector_group_size"), int(group_sizes.max() or 0)
+
+
+def _bundle_global_selector_routes(
+    routes: dict[tuple[str, str], list[dict[str, Any]]],
+    *,
+    target_rows: int,
+) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    by_partition: dict[str, list[tuple[str, list[dict[str, Any]], int]]] = defaultdict(list)
+    for (partition_key, subbucket), items in sorted(routes.items()):
+        estimated_rows = sum(int(item.get("estimated_rows") or 0) for item in items)
+        by_partition[partition_key].append((subbucket, items, estimated_rows))
+    bundles = []
+    for partition_key, entries in sorted(by_partition.items()):
+        current_routes: list[dict[str, Any]] = []
+        current_subbuckets: list[str] = []
+        current_rows = 0
+        for subbucket, items, estimated_rows in entries:
+            if current_routes and current_rows + estimated_rows > target_rows:
+                bundle_id = hashlib.sha256(
+                    "\0".join(current_subbuckets).encode("utf-8")
+                ).hexdigest()[:16]
+                bundles.append(
+                    (partition_key, bundle_id, _merge_route_batch_indices(current_routes))
+                )
+                current_routes = []
+                current_subbuckets = []
+                current_rows = 0
+            current_routes.extend(items)
+            current_subbuckets.append(subbucket)
+            current_rows += estimated_rows
+        if current_routes:
+            bundle_id = hashlib.sha256(
+                "\0".join(current_subbuckets).encode("utf-8")
+            ).hexdigest()[:16]
+            bundles.append((partition_key, bundle_id, _merge_route_batch_indices(current_routes)))
+    return bundles
+
+
+def _merge_route_batch_indices(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_path: dict[str, set[int]] = defaultdict(set)
+    full_paths: set[str] = set()
+    for route in routes:
+        path = str(route["path"])
+        indices = route.get("batch_indices")
+        if indices is None:
+            full_paths.add(path)
+            continue
+        by_path[path].update(int(item) for item in indices)
+    merged = [
+        {"path": path, "batch_indices": None}
+        for path in sorted(full_paths)
+    ]
+    merged.extend(
+        {"path": path, "batch_indices": sorted(indices)}
+        for path, indices in sorted(by_path.items())
+        if path not in full_paths
+    )
+    return merged
+
+
+def _raise_selector_failures(results: list[TaskResult], *, phase: str) -> None:
+    failure = next((item for item in results if not item.ok), None)
+    if failure is None:
+        return
+    raise TaskExecutionError(
+        f"0201 {phase} failed: {failure.error_message}",
+        context={
+            "task_id": failure.task_id,
+            "error_type": failure.error_type,
+            "traceback_tail": failure.traceback_tail,
+        },
+    )
+
+
+def _safe_route_id(partition_key: str, subbucket: str) -> str:
+    return hashlib.sha256(f"{partition_key}\0{subbucket}".encode("utf-8")).hexdigest()[:24]
+
+
+def _sum_task_counters(results: list[TaskResult]) -> dict[str, int]:
+    totals: dict[str, int] = defaultdict(int)
+    for result in results:
+        for key, value in result.counters.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[key] += int(value)
+    return dict(totals)
 
 
 def _iter_sidecar_record_batches(path: Path):
@@ -3983,6 +5693,10 @@ def _build_source_candidate_sidecar(
     planner_payload: dict[str, Any],
     project_root: Path,
     average_payload_bytes: int,
+    source_kind: str = "local",
+    source_dataset_id: str = "",
+    source_file_id: str = "",
+    source_relative_path: str = "",
 ) -> pl.DataFrame:
     raw_lf = pl.scan_parquet(source_path)
     source_names = raw_lf.collect_schema().names()
@@ -4010,7 +5724,11 @@ def _build_source_candidate_sidecar(
             f"reference mappings must be unique: {source_path}"
         )
     candidate = attach_row_group_ids(thin, source_path).with_columns(
-        pl.lit(average_payload_bytes, dtype=pl.Int64).alias(ESTIMATED_PAYLOAD_BYTES_COLUMN)
+        pl.lit(average_payload_bytes, dtype=pl.Int64).alias(ESTIMATED_PAYLOAD_BYTES_COLUMN),
+        pl.lit(source_kind, dtype=pl.String).alias(SOURCE_KIND_COLUMN),
+        pl.lit(source_dataset_id, dtype=pl.String).alias(SOURCE_DATASET_ID_COLUMN),
+        pl.lit(source_file_id, dtype=pl.String).alias(SOURCE_FILE_ID_COLUMN),
+        pl.lit(source_relative_path, dtype=pl.String).alias(SOURCE_RELATIVE_PATH_COLUMN),
     )
     if not local_winner_enabled or candidate.is_empty():
         return candidate
@@ -4037,6 +5755,7 @@ def _candidate_sidecar_task_worker(task: TaskSpec) -> TaskResult:
     payload = task.payload
     source_path = Path(str(payload["source_path"]))
     candidate_path = Path(str(payload["candidate_path"]))
+    occupancy_path = Path(str(payload["occupancy_path"]))
     source_rows = int(pq.ParquetFile(source_path).metadata.num_rows)
     thin = _build_source_candidate_sidecar(
         source_path,
@@ -4048,18 +5767,33 @@ def _candidate_sidecar_task_worker(task: TaskSpec) -> TaskResult:
         planner_payload=dict(payload["planner_payload"]),
         project_root=Path(str(payload["project_root"])),
         average_payload_bytes=int(payload["average_payload_bytes"]),
+        source_kind=str(payload.get("source_kind") or "local"),
+        source_dataset_id=str(payload.get("source_dataset_id") or ""),
+        source_file_id=str(payload.get("source_file_id") or ""),
+        source_relative_path=str(payload.get("source_relative_path") or ""),
     )
     write_ipc_frame_atomic(thin, candidate_path)
+    occupancy = build_candidate_occupancy(
+        thin,
+        partition_column=str(payload["partition_column"]),
+        group_keys=[str(item) for item in payload["selection_group_keys"]],
+        source_sequence=int(payload["source_sequence"]),
+        source_fingerprint=str(payload["source_fingerprint"]),
+        logical_plan_hash=str(payload["logical_plan_hash"]),
+        selector_contract_hash=str(payload["selector_contract_hash"]),
+    )
+    _atomic_write_json(occupancy_path, occupancy)
     return TaskResult(
         task_id=task.task_id,
         ok=True,
         pid=os.getpid(),
-        output_paths=[candidate_path],
+        output_paths=[candidate_path, occupancy_path],
         counters={
             "candidate_rows": thin.height,
             "source_candidate_rows": source_rows,
             "local_winner_rows_removed": max(0, source_rows - thin.height),
             "candidate_bytes": candidate_path.stat().st_size,
+            "candidate_partitions": len(occupancy["partitions"]),
             "source_files_touched": 1,
             "row_groups_touched": pq.ParquetFile(source_path).metadata.num_row_groups,
         },
@@ -4074,6 +5808,40 @@ def _read_candidate_manifest(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _candidate_occupancy_is_valid(
+    path: Path,
+    *,
+    partition_column: str,
+    group_keys: list[str],
+    source_fingerprint: str,
+    logical_plan_hash: str,
+    selector_contract_hash: str,
+) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        payload.get("schema_version") == CANDIDATE_OCCUPANCY_VERSION
+        and payload.get("partition_column") == partition_column
+        and payload.get("group_keys") == group_keys
+        and payload.get("source_fingerprint") == source_fingerprint
+        and payload.get("logical_plan_hash") == logical_plan_hash
+        and payload.get("selector_contract_hash") == selector_contract_hash
+        and isinstance(payload.get("record_batches"), list)
+        and isinstance(payload.get("partitions"), list)
+    )
+
+
+def source_path_relative_to(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
@@ -4169,6 +5937,16 @@ def _write_active_coordinate_snapshot(
         SOURCE_FILE_COLUMN,
         SOURCE_ROW_GROUP_COLUMN,
         SOURCE_ROW_INDEX_COLUMN,
+        *[
+            column
+            for column in (
+                SOURCE_KIND_COLUMN,
+                SOURCE_DATASET_ID_COLUMN,
+                SOURCE_FILE_ID_COLUMN,
+                SOURCE_RELATIVE_PATH_COLUMN,
+            )
+            if column in active_snapshot.columns
+        ],
         ACTIVE_ORDER_COLUMN,
     ]
     task_keys = (
@@ -4515,8 +6293,8 @@ def _write_curated_part_rust_direct(
         {"name": pre_rename_mapping.get(column, column), "source": column}
         for column in sorted(required_source_columns)
     ]
-    rust_stats = execute_curated_task(
-        CuratedTaskRequest(
+    rust_stats = execute_coordinate_materialize(
+        CoordinateMaterializeRequest(
             coordinate_path=rust_coordinate_path,
             output_dir=partition_dir,
             output_file_name=output_path.name,
@@ -5389,6 +7167,10 @@ def _validate_reserved_payload_columns(payload: dict[str, Any]) -> None:
         SOURCE_FILE_COLUMN,
         SOURCE_ROW_INDEX_COLUMN,
         SOURCE_ROW_GROUP_COLUMN,
+        SOURCE_KIND_COLUMN,
+        SOURCE_DATASET_ID_COLUMN,
+        SOURCE_FILE_ID_COLUMN,
+        SOURCE_RELATIVE_PATH_COLUMN,
         ACTIVE_ORDER_COLUMN,
         PART_INDEX_COLUMN,
         ESTIMATED_PAYLOAD_BYTES_COLUMN,

@@ -8,7 +8,7 @@ from typing import Any
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
 
-from smoking_data.backends.rust_engine import CuratedTaskRequest
+from smoking_data.backends.rust_engine import CoordinateMaterializeRequest
 from smoking_data.core.exceptions import ValidationError
 
 from .external_files import load_column_alias_registry
@@ -88,9 +88,9 @@ def build_calculated_fact_task_request(
     source_fingerprint: str,
     calculated_at: datetime | None = None,
     available_columns: Sequence[str] | None = None,
-) -> CuratedTaskRequest:
+) -> CoordinateMaterializeRequest:
     wide_output = plan.output_mode == "wide_calculated_v1"
-    return CuratedTaskRequest(
+    return CoordinateMaterializeRequest(
         coordinate_path=coordinate_path,
         output_dir=output_dir,
         output_file_name=f"part-{task_index:06d}.parquet",

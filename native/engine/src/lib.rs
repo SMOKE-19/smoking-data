@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+mod bounded_pipeline;
 mod converter;
 mod coord;
 mod expression_executor;
@@ -113,6 +114,35 @@ fn execute_curated_task(
 
 #[pyfunction]
 #[pyo3(
+    text_signature = "(coord_path, output_dir, lookup_path, schema, config_json, writer_config_json=None, batch_size=None, drop_cache_hint=False, print_timing=False)"
+)]
+#[allow(clippy::too_many_arguments)]
+fn execute_coordinate_materialize_task(
+    coord_path: String,
+    output_dir: String,
+    lookup_path: String,
+    schema: HashMap<String, String>,
+    config_json: String,
+    writer_config_json: Option<String>,
+    batch_size: Option<usize>,
+    drop_cache_hint: bool,
+    print_timing: bool,
+) -> PyResult<HashMap<String, f64>> {
+    converter::execute_curated_task_impl(
+        coord_path,
+        output_dir,
+        lookup_path,
+        schema,
+        config_json,
+        writer_config_json,
+        batch_size,
+        drop_cache_hint,
+        print_timing,
+    )
+}
+
+#[pyfunction]
+#[pyo3(
     text_signature = "(input_parquet_paths, coord_output_dir, filter_config_json=None, planner_config_json=None)"
 )]
 fn plan_coordinates(
@@ -181,6 +211,10 @@ fn smoking_data_engine_rs(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyRe
         module
     )?)?;
     module.add_function(wrap_pyfunction!(execute_curated_task, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        execute_coordinate_materialize_task,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(plan_coordinates, module)?)?;
     module.add_function(wrap_pyfunction!(execute_join_task, module)?)?;
     module.add_function(wrap_pyfunction!(join_backend_capabilities, module)?)?;

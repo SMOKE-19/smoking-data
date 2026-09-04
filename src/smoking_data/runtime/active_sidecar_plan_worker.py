@@ -15,7 +15,11 @@ from smoking_data.core.barriers import BarrierState, ensure_complete_group_withi
 from smoking_data.ops.coordinates import (
     ACTIVE_ORDER_COLUMN,
     PART_INDEX_COLUMN,
+    SOURCE_DATASET_ID_COLUMN,
     SOURCE_FILE_COLUMN,
+    SOURCE_FILE_ID_COLUMN,
+    SOURCE_KIND_COLUMN,
+    SOURCE_RELATIVE_PATH_COLUMN,
     SOURCE_ROW_GROUP_COLUMN,
     SOURCE_ROW_INDEX_COLUMN,
     write_rust_coordinate_file,
@@ -220,11 +224,22 @@ def _build_plan(request: dict[str, Any]) -> dict[str, Any]:
                 partition_value = str(raw_partition_value)
                 part_index = int(values[PART_INDEX_COLUMN])
                 task_frame = resolved.filter(pl.col(PART_INDEX_COLUMN) == part_index)
+                stable_identity_columns = [
+                    column
+                    for column in (
+                        SOURCE_KIND_COLUMN,
+                        SOURCE_DATASET_ID_COLUMN,
+                        SOURCE_FILE_ID_COLUMN,
+                        SOURCE_RELATIVE_PATH_COLUMN,
+                    )
+                    if column in task_frame.columns
+                ]
                 coordinates = task_frame.select(
                     [
                         SOURCE_FILE_COLUMN,
                         SOURCE_ROW_GROUP_COLUMN,
                         SOURCE_ROW_INDEX_COLUMN,
+                        *stable_identity_columns,
                         ACTIVE_ORDER_COLUMN,
                     ]
                 )

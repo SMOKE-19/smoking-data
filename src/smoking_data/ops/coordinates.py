@@ -11,6 +11,10 @@ import pyarrow.parquet as pq
 SOURCE_FILE_COLUMN = "__source_file"
 SOURCE_ROW_INDEX_COLUMN = "__source_row_index"
 SOURCE_ROW_GROUP_COLUMN = "__source_row_group"
+SOURCE_KIND_COLUMN = "__source_kind"
+SOURCE_DATASET_ID_COLUMN = "__source_dataset_id"
+SOURCE_FILE_ID_COLUMN = "__source_file_id"
+SOURCE_RELATIVE_PATH_COLUMN = "__source_relative_path"
 ACTIVE_ORDER_COLUMN = "__active_order"
 PART_INDEX_COLUMN = "__part_index"
 

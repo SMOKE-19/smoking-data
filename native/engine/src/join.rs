@@ -1,3 +1,4 @@
+use crate::bounded_pipeline::BoundedPipeline;
 #[cfg(feature = "polars-join-experiment")]
 use crate::polars_bridge::{apache_to_polars, polars_to_apache};
 use crate::post_operations::{execute_post_operations, requires_complete_input, PostOperation};
@@ -26,6 +27,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,6 +52,8 @@ struct JoinTaskConfig {
     output_row_group_rows: Option<usize>,
     input_batch_rows: Option<usize>,
     bounded_join: Option<bool>,
+    #[serde(default = "default_writer_queue_capacity_batches")]
+    writer_queue_capacity_batches: usize,
     compression: Option<String>,
     #[serde(default)]
     ordered_operations: Vec<OrderedOperation>,
@@ -63,6 +67,10 @@ struct JoinTaskConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_writer_queue_capacity_batches() -> usize {
+    2
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -920,11 +928,41 @@ fn execute_join_task_bounded(config: &JoinTaskConfig) -> Result<HashMap<String, 
             .saturating_mul(config.left_files.len()),
     });
     let left_schema_sec = left_schema_started.elapsed().as_secs_f64();
-    let mut writer = AtomicParquetBatchWriter::new(
-        Path::new(&config.output_path),
-        config.output_row_group_rows,
-        config.compression.as_deref(),
+    let output_path = PathBuf::from(&config.output_path);
+    let output_row_group_rows = config.output_row_group_rows;
+    let compression = config.compression.clone();
+    let writer_pipeline = BoundedPipeline::start(
+        "smoking-join-parquet-writer",
+        config.writer_queue_capacity_batches,
+        move |receiver, commit| {
+            let mut writer = AtomicParquetBatchWriter::new(
+                &output_path,
+                output_row_group_rows,
+                compression.as_deref(),
+            )?;
+            let mut write_sec = 0.0f64;
+            let mut batches_written = 0usize;
+            let mut rows_written = 0usize;
+            for batch in receiver {
+                let write_started = Instant::now();
+                writer.write(&batch)?;
+                write_sec += write_started.elapsed().as_secs_f64();
+                batches_written += 1;
+                rows_written += batch.num_rows();
+            }
+            if !commit.load(Ordering::Acquire) {
+                return Err("join writer pipeline aborted".to_string());
+            }
+            let finish = writer.finish()?;
+            Ok(JoinWriterPipelineProfile {
+                finish,
+                write_sec,
+                batches_written,
+                rows_written,
+            })
+        },
     )?;
+    let writer_queue_capacity = writer_pipeline.capacity;
     let mut left_rows = 0usize;
     let mut output_rows = 0usize;
     let mut matched_rows = 0usize;
@@ -942,7 +980,8 @@ fn execute_join_task_bounded(config: &JoinTaskConfig) -> Result<HashMap<String, 
     let mut join_compute_sec = 0.0;
     let mut join_kernel_profile = JoinKernelProfile::default();
     let mut post_operation_sec = 0.0;
-    let mut parquet_write_sec = 0.0;
+    let mut writer_queue_send_wait_sec = 0.0;
+    let mut writer_batches_produced = 0usize;
 
     let left_stream_started = Instant::now();
     let left_read_profile = for_each_parquet_batch(
@@ -1023,15 +1062,25 @@ fn execute_join_task_bounded(config: &JoinTaskConfig) -> Result<HashMap<String, 
             peak_output_batch_rows = peak_output_batch_rows.max(current.num_rows());
             output_rows += current.num_rows();
             let write_started = Instant::now();
-            writer.write(&current)?;
-            parquet_write_sec += write_started.elapsed().as_secs_f64();
+            writer_pipeline.send(current)?;
+            writer_queue_send_wait_sec += write_started.elapsed().as_secs_f64();
+            writer_batches_produced += 1;
             callback_sec += callback_started.elapsed().as_secs_f64();
             Ok(())
         },
     )?;
     let left_stream_sec = left_stream_started.elapsed().as_secs_f64();
     let left_read_sec = (left_stream_sec - callback_sec).max(0.0);
-    let finish_profile = writer.finish()?;
+    let writer_profile = writer_pipeline.finish()?;
+    if writer_profile.batches_written != writer_batches_produced
+        || writer_profile.rows_written != output_rows
+    {
+        return Err(format!(
+            "join writer count mismatch: produced_batches={writer_batches_produced} written_batches={} produced_rows={output_rows} written_rows={}",
+            writer_profile.batches_written, writer_profile.rows_written
+        ));
+    }
+    let finish_profile = writer_profile.finish;
 
     let mut counters = task_counters(
         config,
@@ -1255,7 +1304,25 @@ fn execute_join_task_bounded(config: &JoinTaskConfig) -> Result<HashMap<String, 
         join_kernel_profile.right_identity_reuse_batches as f64,
     );
     counters.insert("post_operation_sec".to_string(), post_operation_sec);
-    counters.insert("parquet_write_sec".to_string(), parquet_write_sec);
+    counters.insert("parquet_write_sec".to_string(), writer_profile.write_sec);
+    counters.insert("writer_pipeline_enabled".to_string(), 1.0);
+    counters.insert("writer_thread_count".to_string(), 1.0);
+    counters.insert(
+        "writer_queue_capacity_batches".to_string(),
+        writer_queue_capacity as f64,
+    );
+    counters.insert(
+        "writer_batches_produced".to_string(),
+        writer_batches_produced as f64,
+    );
+    counters.insert(
+        "writer_batches_written".to_string(),
+        writer_profile.batches_written as f64,
+    );
+    counters.insert(
+        "writer_queue_send_wait_sec".to_string(),
+        writer_queue_send_wait_sec,
+    );
     counters.insert("writer_close_sec".to_string(), finish_profile.close_sec);
     counters.insert("output_commit_sec".to_string(), finish_profile.commit_sec);
     counters.insert(
@@ -2381,7 +2448,14 @@ struct AtomicParquetBatchWriter {
     dictionary_disabled_columns: usize,
 }
 
-#[derive(Debug, Default)]
+struct JoinWriterPipelineProfile {
+    finish: WriterFinishProfile,
+    write_sec: f64,
+    batches_written: usize,
+    rows_written: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct WriterFinishProfile {
     close_sec: f64,
     commit_sec: f64,
@@ -2448,6 +2522,13 @@ impl AtomicParquetBatchWriter {
             commit_sec: commit_started.elapsed().as_secs_f64(),
             dictionary_disabled_columns: self.dictionary_disabled_columns,
         })
+    }
+}
+
+impl Drop for AtomicParquetBatchWriter {
+    fn drop(&mut self) {
+        self.writer.take();
+        let _ = fs::remove_file(&self.temp_path);
     }
 }
 

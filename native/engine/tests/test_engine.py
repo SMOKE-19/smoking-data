@@ -17,7 +17,7 @@ def test_public_package_version_matches_distribution_metadata() -> None:
 
 
 def test_native_engine_exposes_its_component_version() -> None:
-    assert engine.__version__ == "2.1.0"
+    assert engine.__version__ == "2.1.1"
 
 
 def test_validate_expression_ir_accepts_compiler_v1_contract() -> None:
@@ -255,6 +255,10 @@ def test_curated_task_selects_only_coord_rows(tmp_path: Path) -> None:
     assert stats["rows_written"] == 2.0
     assert stats["source_file_count"] == 1.0
     assert stats["row_group_count"] == 2.0
+    assert stats["writer_pipeline_enabled"] == 1.0
+    assert stats["writer_thread_count"] == 1.0
+    assert stats["writer_queue_capacity_batches"] == 2.0
+    assert stats["writer_batches_produced"] == stats["writer_batches_written"]
 
 
 def test_curated_task_executes_expression_ir(tmp_path: Path) -> None:
@@ -296,7 +300,7 @@ def test_curated_task_executes_expression_ir(tmp_path: Path) -> None:
         ],
     }
 
-    engine.execute_curated_task(
+    stats = engine.execute_curated_task(
         str(coord),
         str(output_dir),
         "",
@@ -305,12 +309,45 @@ def test_curated_task_executes_expression_ir(tmp_path: Path) -> None:
         {
             "output_file_name": "part-expression.parquet",
             "expression_ir": expression_ir,
+            "writer_queue_capacity_batches": 1,
         },
     )
 
     output = pl.read_parquet(output_dir / "part-expression.parquet").sort("id")
     assert output.get_column("id").to_list() == ["r1", "r3"]
     assert output.get_column("amount_x2").to_list() == [4, 14]
+    assert stats["writer_queue_capacity_batches"] == 1.0
+    assert stats["writer_batches_produced"] == stats["writer_batches_written"]
+
+
+def test_curated_writer_failure_removes_temporary_output(tmp_path: Path) -> None:
+    source = tmp_path / "source_writer_failure.parquet"
+    coord = tmp_path / "coord_writer_failure.arrow"
+    output_dir = tmp_path / "out_writer_failure"
+    blocked_output = output_dir / "part-blocked.parquet"
+    pl.DataFrame({"id": [0, 1, 2, 3]}).write_parquet(source, row_group_size=2)
+    _write_coord_file(coord, source)
+    blocked_output.mkdir(parents=True)
+
+    try:
+        engine.execute_curated_task(
+            str(coord),
+            str(output_dir),
+            "",
+            {},
+            {"enabled": False},
+            {
+                "output_file_name": blocked_output.name,
+                "writer_queue_capacity_batches": 1,
+            },
+        )
+    except RuntimeError as error:
+        assert "failed to replace existing output parquet" in str(error)
+    else:
+        raise AssertionError("writer finalization must reject a directory output target")
+
+    assert blocked_output.is_dir()
+    assert not (output_dir / ".part-blocked.parquet.tmp").exists()
 
 
 def test_wheel_round_trips_timestamp_list_and_decimal(tmp_path: Path) -> None:

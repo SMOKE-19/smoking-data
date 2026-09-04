@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 from smoking_data.core.exceptions import SmokingDataError
 from smoking_data.core.results import StageResult, to_json_safe, utc_now_iso
 from smoking_data.ops.projection import POLARS_TYPE_MAP, apply_add_calc
+from smoking_data.runtime.bounded_writer import BoundedWriterPipeline
 from smoking_data.runtime.config import load_config
 from smoking_data.runtime.dataset_artifacts import describe_dataset_artifacts
 from smoking_data.runtime.naming import partition_dir_name
@@ -150,6 +151,11 @@ def _run_prepared(
         "unmatched_rows": 0,
         "duplicate_route_rows": 0,
         "file_name_overrides": 0,
+        "writer_batches_produced": 0,
+        "writer_batches_written": 0,
+        "writer_queue_send_wait_sec": 0.0,
+        "writer_write_sec": 0.0,
+        "writer_finalize_sec": 0.0,
     }
     emit_task_telemetry_event(
         telemetry_endpoint,
@@ -439,7 +445,12 @@ def _process_file(
     run_date: str,
     now: str,
     first_seen_at: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, int | float],
+]:
     before = csv_path.stat()
     frame = pl.read_csv(
         csv_path,
@@ -484,6 +495,13 @@ def _process_file(
     catalog: list[dict[str, Any]] = []
     matched_rows = pl.Series("__matched", [False] * frame.height, dtype=pl.Boolean)
     route_match_total = 0
+    writer_profile = {
+        "writer_batches_produced": 0,
+        "writer_batches_written": 0,
+        "writer_queue_send_wait_sec": 0.0,
+        "writer_write_sec": 0.0,
+        "writer_finalize_sec": 0.0,
+    }
     for route in spec.routes:
         route_frame = _filter_route(frame, route["filtering"])
         route_rows = route_frame.height
@@ -491,7 +509,7 @@ def _process_file(
             route_mask = _route_mask(frame, route["filtering"])
             matched_rows = matched_rows | route_mask
             route_match_total += int(route_mask.sum())
-            dataset_relative, route_outputs = _write_route_dataset(
+            dataset_relative, route_outputs, route_writer_profile = _write_route_dataset(
                 spec,
                 route_frame,
                 staging_root=staging_root,
@@ -501,6 +519,8 @@ def _process_file(
                 contract_hash=contract_hash,
             )
             outputs.extend(route_outputs)
+            for key in writer_profile:
+                writer_profile[key] += route_writer_profile[key]
             catalog.append(
                 {
                     "relative_path": dataset_relative,
@@ -535,6 +555,7 @@ def _process_file(
         "unmatched_rows": unmatched_rows,
         "duplicate_route_rows": duplicate_rows,
         "file_name_overrides": len(warnings),
+        **writer_profile,
     }
 
 
@@ -653,6 +674,57 @@ def _filter_expression(item: dict[str, str]) -> pl.Expr:
     return pl.sql_expr(normalize_expression(item["spotfire_expression"]))
 
 
+class _RouteParquetWriterSession:
+    def __init__(
+        self,
+        *,
+        spec: CsvSourceSpec,
+        dataset_root: Path,
+        dataset_relative: Path,
+        staging_root: Path,
+        values: dict[str, Any],
+    ) -> None:
+        self.spec = spec
+        self.dataset_root = dataset_root
+        self.dataset_relative = dataset_relative
+        self.staging_root = staging_root
+        self.values = dict(values)
+        self.outputs: list[dict[str, Any]] = []
+        self.created_paths: list[Path] = []
+
+    def write(self, item: tuple[int, pl.DataFrame]) -> None:
+        part_index, part = item
+        self.values["part_index"] = part_index
+        parquet_name = _render_filename(self.spec.parquet_rule, self.values, suffix=".parquet")
+        path = self.dataset_root / parquet_name
+        part.write_parquet(
+            path,
+            compression=self.spec.compression,
+            row_group_size=self.spec.row_group_size,
+            statistics=True,
+            use_pyarrow=True,
+            pyarrow_options={"write_page_index": True},
+        )
+        self.created_paths.append(path)
+        self.outputs.append(
+            {
+                "route": self.values["route_name"],
+                "dataset_relative_path": self.dataset_relative.as_posix(),
+                "relative_path": path.relative_to(self.staging_root).as_posix(),
+                "rows": part.height,
+                "size_bytes": path.stat().st_size,
+                "sha256": file_sha256(path),
+            }
+        )
+
+    def finish(self) -> list[dict[str, Any]]:
+        return self.outputs
+
+    def abort(self) -> None:
+        for path in self.created_paths:
+            path.unlink(missing_ok=True)
+
+
 def _write_route_dataset(
     spec: CsvSourceSpec,
     frame: pl.DataFrame,
@@ -662,7 +734,7 @@ def _write_route_dataset(
     source_token: str,
     run_date: str,
     contract_hash: str,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], dict[str, int | float]]:
     values = {
         "run_date": run_date,
         "source_file_flat": source_token,
@@ -675,31 +747,42 @@ def _write_route_dataset(
     dataset_relative = Path(f"route={partition_dir_name(route_name)}") / dataset_name
     dataset_root = staging_root / dataset_relative
     dataset_root.mkdir(parents=True, exist_ok=True)
-    outputs: list[dict[str, Any]] = []
-    for part_index, offset in enumerate(range(0, frame.height, spec.target_rows_per_part), start=1):
-        values["part_index"] = part_index
-        parquet_name = _render_filename(spec.parquet_rule, values, suffix=".parquet")
-        path = dataset_root / parquet_name
-        part = frame.slice(offset, spec.target_rows_per_part)
-        part.write_parquet(
-            path,
-            compression=spec.compression,
-            row_group_size=spec.row_group_size,
-            statistics=True,
-            use_pyarrow=True,
-            pyarrow_options={"write_page_index": True},
-        )
-        outputs.append(
-            {
-                "route": route_name,
-                "dataset_relative_path": dataset_relative.as_posix(),
-                "relative_path": path.relative_to(staging_root).as_posix(),
-                "rows": part.height,
-                "size_bytes": path.stat().st_size,
-                "sha256": file_sha256(path),
-            }
-        )
-    return dataset_relative.as_posix(), outputs
+    pipeline = BoundedWriterPipeline[tuple[int, pl.DataFrame], list[dict[str, Any]]](
+        lambda: _RouteParquetWriterSession(
+            spec=spec,
+            dataset_root=dataset_root,
+            dataset_relative=dataset_relative,
+            staging_root=staging_root,
+            values=values,
+        ),
+        capacity_batches=2,
+        thread_name="smoking-0103-route-writer",
+    )
+    try:
+        for part_index, offset in enumerate(
+            range(0, frame.height, spec.target_rows_per_part), start=1
+        ):
+            part = frame.slice(offset, spec.target_rows_per_part)
+            pipeline.submit((part_index, part), rows=part.height)
+        result = pipeline.finish()
+    except BaseException:
+        pipeline.abort()
+        raise
+    profile = result.profile.to_dict()
+    return (
+        dataset_relative.as_posix(),
+        result.value,
+        {
+            key: profile[key]
+            for key in (
+                "writer_batches_produced",
+                "writer_batches_written",
+                "writer_queue_send_wait_sec",
+                "writer_write_sec",
+                "writer_finalize_sec",
+            )
+        },
+    )
 
 
 def _write_child_manifests(staging_root: Path, entries: list[dict[str, Any]]) -> None:

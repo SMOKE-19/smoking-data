@@ -10,6 +10,13 @@ from pathlib import Path
 from .smoking_data_engine_rs import (
     execute_curated_task as _execute_curated_task_impl,
 )
+
+try:
+    from .smoking_data_engine_rs import (
+        execute_coordinate_materialize_task as _execute_coordinate_materialize_task_impl,
+    )
+except ImportError:  # Editable trees may still contain an older native build.
+    _execute_coordinate_materialize_task_impl = _execute_curated_task_impl
 from .smoking_data_engine_rs import (
     execute_join_task as _execute_join_task_impl,
 )
@@ -50,6 +57,7 @@ from .smoking_data_engine_rs import (
 __all__ = [
     "__version__",
     "execute_curated_task",
+    "execute_coordinate_materialize_task",
     "execute_join_task",
     "inspect_parquet_pages",
     "join_backend_capabilities",
@@ -258,7 +266,32 @@ def execute_curated_task(
     drop_cache_hint: bool = False,
     print_timing: bool = False,
 ) -> dict[str, float]:
-    return _execute_curated_task_impl(
+    return execute_coordinate_materialize_task(
+        coord_path,
+        output_dir,
+        lookup_path,
+        schema,
+        config,
+        writer_config,
+        batch_size,
+        drop_cache_hint,
+        print_timing,
+    )
+
+
+def execute_coordinate_materialize_task(
+    coord_path: str,
+    output_dir: str,
+    lookup_path: str,
+    schema: dict[str, str],
+    config: Mapping[str, object],
+    writer_config: Mapping[str, object] | None = None,
+    batch_size: int | None = None,
+    drop_cache_hint: bool = False,
+    print_timing: bool = False,
+) -> dict[str, float]:
+    """Execute the shared coordinate-selected transform and writer pipeline."""
+    return _execute_coordinate_materialize_task_impl(
         coord_path,
         output_dir,
         lookup_path,

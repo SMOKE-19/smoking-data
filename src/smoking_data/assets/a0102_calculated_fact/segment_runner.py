@@ -15,7 +15,10 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from smoking_data.backends.rust_engine import CuratedTaskRequest, execute_curated_task
+from smoking_data.backends.rust_engine import (
+    CoordinateMaterializeRequest,
+    execute_coordinate_materialize,
+)
 from smoking_data.core.exceptions import ValidationError
 from smoking_data.core.results import StageResult
 from smoking_data.runtime.config import load_config
@@ -40,7 +43,7 @@ _DEFAULT_TASK_PEAK_MEMORY_MB = 512.0
 @dataclass(frozen=True, slots=True)
 class _PendingMaterializeTask:
     future: Future[dict[str, float]]
-    request: CuratedTaskRequest
+    request: CoordinateMaterializeRequest
     task_id: str
     coordinate_index: int
     source_segment_id: str
@@ -67,7 +70,7 @@ class _BoundedMaterializeExecutor:
 
     def submit(
         self,
-        request: CuratedTaskRequest,
+        request: CoordinateMaterializeRequest,
         *,
         task_id: str,
         coordinate_index: int,
@@ -143,7 +146,7 @@ class _BoundedMaterializeExecutor:
 
 
 def _execute_materialize_task(
-    request: CuratedTaskRequest,
+    request: CoordinateMaterializeRequest,
     *,
     telemetry_endpoint: dict[str, Any] | None,
     task_id: str,
@@ -153,7 +156,7 @@ def _execute_materialize_task(
         "0102.calculate_unpivot_write",
         task_id=task_id,
     ):
-        return execute_curated_task(request)
+        return execute_coordinate_materialize(request)
 
 
 def _materialize_admission(

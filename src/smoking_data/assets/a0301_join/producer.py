@@ -71,7 +71,8 @@ RIGHT_INDEX_MANIFEST_VERSION = "smoking-data.0301-right-index.v2"
 INTERNAL_JOIN_BACKEND_ENV = "SMOKING_DATA_0301_JOIN_BACKEND"
 INTERNAL_DISABLE_BOUNDED_JOIN_ENV = "SMOKING_DATA_DISABLE_0301_BOUNDED_JOIN"
 INTERNAL_RIGHT_STAGING_ENV = "SMOKING_DATA_0301_RIGHT_STAGING"
-BOUNDED_JOIN_STRATEGY_VERSION = "smoking-data.0301-adaptive-parallel-join.v6"
+BOUNDED_JOIN_STRATEGY_VERSION = "smoking-data.0301-adaptive-parallel-join.v7"
+WRITER_QUEUE_CAPACITY_BATCHES = 2
 
 
 def can_run(preset: str) -> bool:
@@ -444,6 +445,7 @@ def run(spec: PresetSpec, *, config: RuntimeConfig) -> StageResult:
                 ),
                 "bounded_join": bounded_join,
                 "bounded_join_strategy_version": BOUNDED_JOIN_STRATEGY_VERSION,
+                "writer_queue_capacity_batches": WRITER_QUEUE_CAPACITY_BATCHES,
                 "right_staging_mode": right_staging_mode,
             },
         )
@@ -841,6 +843,9 @@ def join_partition_task_worker(task: TaskSpec) -> TaskResult:
             "output_row_group_rows": payload.get("output_row_group_rows"),
             "input_batch_rows": payload.get("input_batch_rows"),
             "bounded_join": payload.get("bounded_join", True),
+            "writer_queue_capacity_batches": payload.get(
+                "writer_queue_capacity_batches", WRITER_QUEUE_CAPACITY_BATCHES
+            ),
             "ordered_operations": payload.get("ordered_operations") or [],
             "post_operations": payload.get("post_operations") or [],
             "compression": payload.get("compression") or "zstd",
@@ -903,6 +908,9 @@ def _join_task_fingerprint(task: TaskSpec, *, logical_plan_hash: str) -> str:
         ),
         "input_batch_rows": payload.get("input_batch_rows"),
         "bounded_join": payload.get("bounded_join", True),
+        "writer_queue_capacity_batches": payload.get(
+            "writer_queue_capacity_batches", WRITER_QUEUE_CAPACITY_BATCHES
+        ),
         "bounded_join_strategy_version": payload.get("bounded_join_strategy_version"),
         "compression": payload.get("compression"),
         "ordered_operations": payload.get("ordered_operations") or [],
@@ -2477,6 +2485,24 @@ def _summarize_bounded_join(task_results: list[TaskResult]) -> dict[str, Any]:
         "writer_dictionary_disabled_columns": _summarize_task_metric(
             enabled, "writer_dictionary_disabled_columns"
         ),
+        "writer_pipeline": {
+            "enabled_tasks": sum(
+                int(float(result.counters.get("writer_pipeline_enabled", 0)) > 0)
+                for result in enabled
+            ),
+            "queue_capacity_batches": _summarize_task_metric(
+                enabled, "writer_queue_capacity_batches"
+            ),
+            "batches_produced": _summarize_task_metric(
+                enabled, "writer_batches_produced"
+            ),
+            "batches_written": _summarize_task_metric(
+                enabled, "writer_batches_written"
+            ),
+            "queue_send_wait_sec": _summarize_task_counter(
+                enabled, "writer_queue_send_wait_sec"
+            ),
+        },
         "right_key_index_builds": _summarize_task_metric(enabled, "right_key_index_builds"),
         "right_key_index_unique_keys": _summarize_task_metric(
             enabled, "right_key_index_unique_keys"

@@ -54,6 +54,25 @@ def get_capabilities() -> dict[str, Any]:
             SNAPSHOT_PIPELINE_SCHEMA_VERSION,
         ],
         "operations": operations,
+        "execution_primitives": {
+            "bounded_writer_pipeline": {
+                "status": "supported",
+                "backpressure": "bounded_batch_queue",
+                "writer_state_ownership": "dedicated_writer_thread",
+                "atomic_finalize": True,
+                "python_api": "smoking_data.runtime.bounded_writer.BoundedWriterPipeline",
+                "native_coordinate_api": (
+                    "smoking_data_engine_rs.execute_coordinate_materialize_task"
+                ),
+                "asset_paths": {
+                    "0102": "coordinate_materialize",
+                    "0103": "route_parquet_writer",
+                    "0201": "coordinate_materialize",
+                    "0301": "bounded_join_writer",
+                    "0401": "snapshot_compaction_writer",
+                },
+            }
+        },
         "expression_features": expressions,
         "baseline_contracts": {
             "group_aggregate": {

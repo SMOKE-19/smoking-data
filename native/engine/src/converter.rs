@@ -29,12 +29,11 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::bounded_pipeline::BoundedPipeline;
 use crate::coord::read_coord_groups;
 use crate::expression_executor::execute_expression_ir_retaining;
 use crate::expression_ir::{validate_expression_ir, ExpressionIrDocument};
@@ -338,26 +337,20 @@ struct WriterPipelineResult {
     writer_finalize_sec: f64,
 }
 
-struct MaterializeWriterPipeline {
-    sender: Option<SyncSender<WriterBatch>>,
-    handle: Option<JoinHandle<Result<WriterPipelineResult, String>>>,
-    commit: Arc<AtomicBool>,
-    capacity: usize,
+struct ParquetWriterPipeline {
+    pipeline: BoundedPipeline<WriterBatch, WriterPipelineResult>,
 }
 
-impl MaterializeWriterPipeline {
+impl ParquetWriterPipeline {
     fn start(
         output_dir: String,
         config: ParquetOutputConfig,
         capacity: usize,
     ) -> pyo3::PyResult<Self> {
-        let capacity = capacity.max(1);
-        let (sender, receiver) = sync_channel::<WriterBatch>(capacity);
-        let commit = Arc::new(AtomicBool::new(false));
-        let writer_commit = Arc::clone(&commit);
-        let handle = thread::Builder::new()
-            .name("smoking-materialize-writer".to_string())
-            .spawn(move || {
+        let pipeline: BoundedPipeline<WriterBatch, WriterPipelineResult> = BoundedPipeline::start(
+            "smoking-parquet-writer",
+            capacity,
+            move |receiver: std::sync::mpsc::Receiver<WriterBatch>, writer_commit| {
                 let mut writers: HashMap<String, ManagedParquetWriter> = HashMap::new();
                 let mut output_file_write_touches = 0usize;
                 let mut batches_written = 0usize;
@@ -400,57 +393,26 @@ impl MaterializeWriterPipeline {
                     writer_write_sec,
                     writer_finalize_sec: finalize_started.elapsed().as_secs_f64(),
                 })
-            })
-            .map_err(|error| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "failed to spawn materialize writer thread: {error}"
-                ))
-            })?;
-        Ok(Self {
-            sender: Some(sender),
-            handle: Some(handle),
-            commit,
-            capacity,
-        })
+            },
+        )
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Ok(Self { pipeline })
     }
 
     fn send(&self, message: WriterBatch) -> pyo3::PyResult<()> {
-        self.sender
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "materialize writer channel is already closed",
-                )
-            })?
+        self.pipeline
             .send(message)
-            .map_err(|error| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "materialize writer channel failed: {error}"
-                ))
-            })
-    }
-
-    fn finish(mut self) -> pyo3::PyResult<WriterPipelineResult> {
-        self.commit.store(true, AtomicOrdering::Release);
-        self.sender.take();
-        let handle = self.handle.take().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("materialize writer thread is missing")
-        })?;
-        handle
-            .join()
-            .map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("materialize writer thread panicked")
-            })?
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
-}
 
-impl Drop for MaterializeWriterPipeline {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+    fn finish(self) -> pyo3::PyResult<WriterPipelineResult> {
+        self.pipeline
+            .finish()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn capacity(&self) -> usize {
+        self.pipeline.capacity
     }
 }
 
@@ -2792,12 +2754,12 @@ pub fn execute_curated_task_impl(
             "failed to create output dir {output_dir}: {err}"
         ))
     })?;
-    let writer_pipeline = MaterializeWriterPipeline::start(
+    let writer_pipeline = ParquetWriterPipeline::start(
         output_dir.clone(),
         ParquetOutputConfig::from(&writer_config),
         writer_config.writer_queue_capacity_batches,
     )?;
-    let writer_queue_capacity = writer_pipeline.capacity;
+    let writer_queue_capacity = writer_pipeline.capacity();
     let mut writer_queue_send_wait_sec = 0.0f64;
     let mut writer_batches_produced = 0usize;
     let mut output_schema: Option<Arc<Schema>> = None;
